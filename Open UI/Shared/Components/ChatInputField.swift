@@ -491,8 +491,11 @@ struct ChatInputField: View {
                 : Color.black.opacity(isFocused ? 0.14 : 0.08),
             isDark: theme.isDark
         ))
-        .modifier(ComposerPressFeedback(isEnabled: isEnabled && !composerIsExpanded))
         .gesture(composerExpandGesture)
+        // Outermost + simultaneous: press feedback runs alongside the expand drag
+        // (and the text view/buttons) instead of pre-empting it. Attached inside the
+        // expand gesture, its zero-distance drag won the touch and blocked expanding.
+        .modifier(ComposerPressFeedback(isEnabled: isEnabled && !composerIsExpanded))
         .animation(.spring(response: 0.35, dampingFraction: 0.78), value: composerIsExpanded)
         .animation(.interactiveSpring(), value: composerExpandDrag)
     }
