@@ -28,6 +28,77 @@ final class NetworkManager: NSObject, Sendable {
     private var _tokenExpiredFired = false
     var onTokenExpired: (() -> Void)?
 
+    /// Async session-recovery hook consulted on a 401 from an authenticated
+    /// request BEFORE the failure surfaces (native-SSO silent refresh). Returns
+    /// `true` when a fresh JWT was installed — `authToken` then reflects it and
+    /// the request is transparently retried once, so callers (view models,
+    /// background validation) never observe the 401. `false` keeps the existing
+    /// sign-out behaviour. Concurrent 401s share one in-flight recovery attempt
+    /// so a burst of expiring requests triggers a single refresh round-trip.
+    var onUnauthorizedRecover: (@Sendable () async -> Bool)? {
+        get {
+            _recoverLock.lock()
+            defer { _recoverLock.unlock() }
+            return _onUnauthorizedRecover
+        }
+        set {
+            _recoverLock.lock()
+            _onUnauthorizedRecover = newValue
+            _recoverLock.unlock()
+        }
+    }
+
+    private let _recoverLock = NSLock()
+    private var _onUnauthorizedRecover: (@Sendable () async -> Bool)?
+    private var _recoveryTask: Task<Bool, Never>?
+    private var _recoveryID = 0
+
+    /// Lock handling is kept in these synchronous helpers — `NSLock` must not
+    /// be used directly from async contexts (Swift 6).
+    private enum RecoveryStart {
+        /// Task to await plus its identity token — either freshly started or
+        /// the in-flight shared one.
+        case shared(id: Int, task: Task<Bool, Never>)
+        /// No recovery hook registered; caller should surface the 401.
+        case unavailable
+    }
+
+    private func beginRecovery() -> RecoveryStart {
+        _recoverLock.lock()
+        defer { _recoverLock.unlock() }
+        if let existing = _recoveryTask {
+            return .shared(id: _recoveryID, task: existing)
+        }
+        guard let callback = _onUnauthorizedRecover else {
+            return .unavailable
+        }
+        _recoveryID += 1
+        let task = Task<Bool, Never> { await callback() }
+        _recoveryTask = task
+        return .shared(id: _recoveryID, task: task)
+    }
+
+    /// Clears the in-flight marker only if it still refers to the same recovery
+    /// round — a straggler from a finished round must not cancel a newer one.
+    /// Identity is an incrementing token because `Task` is a value type and
+    /// cannot be compared with `===`.
+    private func endRecovery(id: Int) {
+        _recoverLock.lock()
+        if id == _recoveryID { _recoveryTask = nil }
+        _recoverLock.unlock()
+    }
+
+    private func attemptSilentRecovery() async -> Bool {
+        switch beginRecovery() {
+        case .unavailable:
+            return false
+        case .shared(let id, let task):
+            let recovered = await task.value
+            endRecovery(id: id)
+            return recovered
+        }
+    }
+
     // MARK: - Initialisation
 
     init(serverConfig: ServerConfig, keychain: KeychainService = .shared) {
@@ -679,7 +750,20 @@ final class NetworkManager: NSObject, Sendable {
 
     private func performRequest(_ request: URLRequest) async throws -> (Data, URLResponse) {
         do {
-            return try await session.data(for: request)
+            var result = try await session.data(for: request)
+            // Transparent session recovery: an authenticated request that got a
+            // 401 gets ONE silent-refresh attempt (single-flight) with a fresh
+            // Authorization header before the error surfaces anywhere.
+            if let http = result.1 as? HTTPURLResponse, http.statusCode == 401,
+               request.value(forHTTPHeaderField: "Authorization") != nil,
+               await attemptSilentRecovery(),
+               let fresh = authToken {
+                var retry = request
+                retry.setValue("Bearer \(fresh)", forHTTPHeaderField: "Authorization")
+                logger.info("Recovered from 401 via silent session refresh, retrying \(request.url?.path ?? "")")
+                result = try await session.data(for: retry)
+            }
+            return result
         } catch {
             throw APIError.from(error)
         }

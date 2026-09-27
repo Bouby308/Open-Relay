@@ -395,12 +395,16 @@ struct LDAPLoginView: View {
 struct AuthMethodSelectionView: View {
     @Bindable var viewModel: AuthViewModel
     @Environment(\.theme) private var theme
+    @Environment(AppDependencyContainer.self) private var dependencies
     @State private var appeared = false
+    @State private var showNativeSSOSheet = false
 
     /// OAuth providers detected from the server configuration.
     private var enabledOAuthProviders: [String] {
         viewModel.oauthProviders?.enabledProviders ?? []
     }
+
+    private var activeServer: ServerConfig? { dependencies.serverConfigStore.activeServer }
 
     var body: some View {
         ScrollView(showsIndicators: false) {
@@ -464,6 +468,26 @@ struct AuthMethodSelectionView: View {
                                     )
                             }
                         }
+
+                        // Native SSO setup entry — without this, configuring
+                        // native SSO would require being signed in already
+                        // (Settings → Server → Edit Server), a dead end for
+                        // IdP-only servers where the first sign-in must be SSO.
+                        Button {
+                            showNativeSSOSheet = true
+                        } label: {
+                            HStack(spacing: Spacing.xs) {
+                                Image(systemName: "key.fill")
+                                Text(activeServer?.nativeSSO?.isConfigured == true
+                                     ? "Native SSO: on — edit setup"
+                                     : "Set up sign-in via system browser (passkeys)")
+                            }
+                            .scaledFont(size: 12, weight: .medium)
+                            .foregroundStyle(theme.textTertiary)
+                            .frame(maxWidth: .infinity)
+                            .padding(.top, Spacing.xs)
+                        }
+                        .buttonStyle(.plain)
 
                         // Divider
                         if viewModel.isLoginEnabled || viewModel.isLDAPEnabled {
@@ -570,6 +594,9 @@ struct AuthMethodSelectionView: View {
         }
         .background(theme.background)
         .onAppear { appeared = true }
+        .sheet(isPresented: $showNativeSSOSheet) {
+            NativeSSOSettingsSheet(onDismiss: { showNativeSSOSheet = false })
+        }
     }
 
     // MARK: - OAuth Provider Button
@@ -578,10 +605,16 @@ struct AuthMethodSelectionView: View {
         let displayName = viewModel.oauthProviders?.displayName(for: provider)
             ?? provider.capitalized
         let iconName = OAuthProviders.iconName(for: provider)
+        // Native flow (system browser) when configured — supports passkeys.
+        let useNative = viewModel.usesNativeSSO(for: provider)
 
         return Button {
             viewModel.selectedSSOProvider = provider
-            viewModel.goToPhase(.ssoLogin)
+            if useNative {
+                Task { await viewModel.startNativeSSOSignIn(provider: provider) }
+            } else {
+                viewModel.goToPhase(.ssoLogin)
+            }
         } label: {
             HStack(spacing: Spacing.md) {
                 Image(systemName: iconName)
@@ -589,15 +622,32 @@ struct AuthMethodSelectionView: View {
                     .foregroundStyle(theme.buttonPrimaryText)
                     .frame(width: 24, height: 24)
 
-                Text("Continue with \(displayName)")
-                    .scaledFont(size: 16, weight: .medium)
-                    .foregroundStyle(theme.buttonPrimaryText)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Continue with \(displayName)")
+                        .scaledFont(size: 16, weight: .medium)
+                        .foregroundStyle(theme.buttonPrimaryText)
+
+                    if useNative {
+                        HStack(spacing: 4) {
+                            Image(systemName: "key.fill")
+                                .scaledFont(size: 9)
+                            Text("Passkey & browser SSO supported")
+                                .scaledFont(size: 11, weight: .regular)
+                        }
+                        .foregroundStyle(theme.buttonPrimaryText.opacity(0.75))
+                    }
+                }
 
                 Spacer()
 
-                Image(systemName: "arrow.right")
-                    .scaledFont(size: 12, weight: .semibold)
-                    .foregroundStyle(theme.buttonPrimaryText.opacity(0.7))
+                if useNative && viewModel.isLoggingIn {
+                    ProgressView()
+                        .tint(theme.buttonPrimaryText)
+                } else {
+                    Image(systemName: "arrow.right")
+                        .scaledFont(size: 12, weight: .semibold)
+                        .foregroundStyle(theme.buttonPrimaryText.opacity(0.7))
+                }
             }
             .padding(.horizontal, Spacing.md)
             .frame(maxWidth: .infinity)
@@ -611,6 +661,8 @@ struct AuthMethodSelectionView: View {
         .clipShape(RoundedRectangle(cornerRadius: CornerRadius.button + 4, style: .continuous))
         .buttonStyle(.plain)
         .pressEffect()
+        .disabled(useNative && viewModel.isLoggingIn)
+        .opacity(useNative && viewModel.isLoggingIn ? 0.6 : 1)
     }
 
     // MARK: - Divider with Text

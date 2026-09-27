@@ -27,6 +27,14 @@ final class APIClient: @unchecked Sendable {
         }
     }
 
+    /// Async 401 recovery hook (native-SSO silent refresh) forwarded to the
+    /// underlying `NetworkManager`. Set by `DependencyContainer` alongside
+    /// `onAuthTokenInvalid`; see `NetworkManager.onUnauthorizedRecover`.
+    var onUnauthorizedRecover: (@Sendable () async -> Bool)? {
+        get { network.onUnauthorizedRecover }
+        set { network.onUnauthorizedRecover = newValue }
+    }
+
     init(serverConfig: ServerConfig, keychain: KeychainService = .shared) {
         self.network = NetworkManager(serverConfig: serverConfig, keychain: keychain)
     }

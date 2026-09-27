@@ -225,6 +225,9 @@ final class AuthViewModel {
     private let logger = Logger(subsystem: "com.openui", category: "Auth")
     private var tokenRefreshTask: Task<Void, Never>?
     private var hasRunLegacyMigration = false
+    /// Retained only while the native SSO browser flow is in flight so the
+    /// `ASWebAuthenticationSession` it owns is not deallocated mid-flow.
+    private var nativeAuthenticator: NativeOIDCAuthenticator?
 
     private static let onboardingKey = "openui.has_shown_onboarding"
     private static let cachedUserKey = "openui.cached_user"
@@ -721,6 +724,134 @@ final class AuthViewModel {
         isLoggingIn = false
     }
 
+    // MARK: - Native SSO (ASWebAuthenticationSession + token exchange)
+
+    /// Whether the native passkey-capable SSO flow should be used for `provider`.
+    ///
+    /// True when the active server has native SSO configured
+    /// (issuer + client ID) and its provider key matches the tapped provider.
+    func usesNativeSSO(for provider: String) -> Bool {
+        guard let settings = serverConfigStore.activeServer?.nativeSSO,
+              settings.isConfigured else { return false }
+        return settings.providerKey.lowercased() == provider.lowercased()
+    }
+
+    /// Runs the native OIDC sign-in flow (system browser → PKCE code →
+    /// IdP token → Open WebUI token exchange) and completes login with the
+    /// returned session JWT.
+    ///
+    /// Unlike the WKWebView flow this supports passkeys / WebAuthn at the
+    /// identity provider, because the system browser service enforces no
+    /// Associated Domains requirement on the IdP's domain.
+    func startNativeSSOSignIn(provider: String) async {
+        guard let server = serverConfigStore.activeServer,
+              let settings = server.nativeSSO, settings.isConfigured else {
+            errorMessage = "Native SSO is not configured for this server."
+            return
+        }
+        guard !isLoggingIn else { return }
+
+        errorMessage = nil
+        isLoggingIn = true
+
+        let authenticator = NativeOIDCAuthenticator()
+        nativeAuthenticator = authenticator
+
+        do {
+            let session = try await authenticator.signIn(server: server, providerKey: settings.providerKey)
+            nativeAuthenticator = nil
+            // Persist the IdP refresh token (offline_access) so the session
+            // can later be silently re-exchanged when the JWT expires.
+            if let refreshToken = session.refreshToken {
+                KeychainService.shared.saveToken(refreshToken, forServer: Self.nativeSSORefreshKey(for: server.url))
+            } else {
+                KeychainService.shared.deleteToken(forServer: Self.nativeSSORefreshKey(for: server.url))
+            }
+            isLoggingIn = false
+            await loginWithSSOToken(session.jwt)
+        } catch {
+            nativeAuthenticator = nil
+            isLoggingIn = false
+            if let authError = error as? NativeOIDCAuthError,
+               case .cancelled = authError {
+                logger.info("Native SSO cancelled by user")
+            } else {
+                logger.error("Native SSO failed: \(error.localizedDescription)")
+                errorMessage = error.localizedDescription
+            }
+        }
+    }
+
+    /// Keychain account key under which the IdP refresh token is stored.
+    /// Follows the `cached_user_…` prefixed-key convention.
+    static func nativeSSORefreshKey(for serverURL: String) -> String {
+        "native_sso_refresh_\(serverURL)"
+    }
+
+    /// Public entry point for the networking layer: called when an
+    /// authenticated request returns 401 so the request can be transparently
+    /// retried instead of surfacing "session expired". No-ops unless the user
+    /// is fully authenticated (never fires mid-restore, matching the existing
+    /// `onAuthTokenInvalid` guard).
+    func recoverSessionFrom401() async -> Bool {
+        guard phase == .authenticated else { return false }
+        return await attemptNativeSSOSilentRefresh()
+    }
+
+    /// Silent session recovery for native-SSO accounts.
+    ///
+    /// When the Open WebUI JWT has expired (401), instead of interrupting the
+    /// user with a re-login we: refresh the IdP access token with the stored
+    /// refresh token → re-run the Open WebUI token exchange → install the new
+    /// JWT. No browser UI is shown.
+    ///
+    /// Returns `true` when a fresh session JWT was installed. Any failure
+    /// (revoked refresh token, server without exchange enabled, network)
+    /// returns `false` so callers fall back to the normal re-auth flow.
+    private func attemptNativeSSOSilentRefresh() async -> Bool {
+        guard let server = serverConfigStore.activeServer,
+              let settings = server.nativeSSO, settings.isConfigured,
+              let refreshToken = KeychainService.shared.getToken(forServer: Self.nativeSSORefreshKey(for: server.url)),
+              let client = dependencies?.apiClient else { return false }
+
+        let authenticator = NativeOIDCAuthenticator()
+        nativeAuthenticator = authenticator
+        defer { nativeAuthenticator = nil }
+
+        do {
+            let session = try await authenticator.refreshSession(
+                server: server,
+                providerKey: settings.providerKey,
+                refreshToken: refreshToken
+            )
+            // Store the rotated refresh token (echoed back when not rotated).
+            if let rotated = session.refreshToken {
+                KeychainService.shared.saveToken(rotated, forServer: Self.nativeSSORefreshKey(for: server.url))
+            }
+            // Install the new JWT everywhere the old one lives.
+            client.updateAuthToken(session.jwt)
+            KeychainService.shared.saveToken(session.jwt, forServer: server.url)
+            if let userId = currentUser?.id {
+                KeychainService.shared.saveToken(session.jwt, forServer: server.url, userId: userId)
+            }
+            // The Socket.IO handshake carries the JWT — re-handshake with the
+            // new one (reads it back from the Keychain) so the realtime channel
+            // doesn't start 401-ing while REST calls silently recover.
+            connectSocketWithToken()
+            logger.info("Native SSO: silent token refresh installed a new session JWT")
+            return true
+        } catch {
+            // Refresh token rejected (expired/revoked) — clear it so future
+            // attempts go straight to interactive sign-in.
+            if let authError = error as? NativeOIDCAuthError,
+               case .tokenRequestFailed(let status, _) = authError, status == 400 || status == 401 {
+                KeychainService.shared.deleteToken(forServer: Self.nativeSSORefreshKey(for: server.url))
+            }
+            logger.warning("Native SSO silent refresh failed: \(error.localizedDescription)")
+            return false
+        }
+    }
+
     // MARK: - Session Restore
 
     /// Restores session from a stored token in the Keychain.
@@ -766,6 +897,12 @@ final class AuthViewModel {
 
                 // If the token is genuinely invalid (401/403), don't retry
                 if apiError.requiresReauth {
+                    // Native-SSO accounts can silently re-exchange with the
+                    // stored IdP refresh token before forcing a re-login.
+                    if await attemptNativeSSOSilentRefresh() {
+                        logger.info("Session restore: recovered via native SSO silent refresh, retrying")
+                        continue
+                    }
                     logger.warning("Session restore: token invalid (401), clearing credentials")
                     client.updateAuthToken(nil)
                     currentUser = nil
@@ -848,6 +985,13 @@ final class AuthViewModel {
         // SECURITY FIX: Clear SSO/OAuth cookies so the next user can't
         // auto-authenticate with the previous user's SSO session.
         clearSSOCookies()
+
+        // Drop the native SSO refresh token — signing out must also revoke
+        // the silent re-exchange material, otherwise the session could be
+        // silently rebuilt after sign-out.
+        if let server = serverConfigStore.activeServer {
+            KeychainService.shared.deleteToken(forServer: Self.nativeSSORefreshKey(for: server.url))
+        }
         
         // Clear cached profile images so the next user gets fresh avatars
         Task { await ImageCacheService.shared.evictProfileImages() }
@@ -916,6 +1060,23 @@ final class AuthViewModel {
         } catch {
             let apiError = APIError.from(error)
             if apiError.requiresReauth {
+                // JWT expired. For native-SSO accounts, silently refresh the
+                // IdP token and re-exchange for a new JWT — no re-login UI.
+                if await attemptNativeSSOSilentRefresh() {
+                    do {
+                        currentUser = try await client.getCurrentUser()
+                        cacheCurrentUser()
+                        connectSocketWithToken()
+                        if currentUser?.role == .pending {
+                            phase = .pendingApproval
+                            return
+                        }
+                        logger.info("Token refresh: session renewed via native SSO silent refresh")
+                        return
+                    } catch {
+                        logger.warning("Token refresh: native SSO renew did not restore access — falling back to re-auth")
+                    }
+                }
                 logger.warning("Token expired during refresh; user must re-authenticate")
                 await MainActor.run {
                     self.currentUser = nil

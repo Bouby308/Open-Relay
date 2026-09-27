@@ -8,6 +8,10 @@ struct ServerManagementView: View {
     @State private var editingName: String = ""
     @State private var editingSelfSigned: Bool = false
     @State private var editingSwitchStatusURL: String = ""
+    @State private var editingNativeEnabled: Bool = false
+    @State private var editingNativeIssuer: String = ""
+    @State private var editingNativeClientID: String = ""
+    @State private var editingNativeProviderKey: String = ""
     @State private var editingHeaderEntries: [CustomHeaderEntry] = []
     @State private var isEditing: Bool = false
     @State private var showDeleteConfirmation = false
@@ -508,6 +512,14 @@ struct ServerManagementView: View {
             .map { CustomHeaderEntry(id: UUID().uuidString, key: $0.key, value: $0.value) }
             .sorted { $0.key < $1.key }
         editingSwitchStatusURL = activeServer?.switchStatusURL ?? ""
+        editingNativeEnabled = activeServer?.nativeSSO != nil
+        // The issuer intentionally does NOT default to the Open WebUI server
+        // URL — the IdP usually lives on a different origin and a wrong default
+        // silently breaks the flow. Leave it blank for the user to fill (the
+        // login-screen sheet auto-detects it from the server's SSO redirect).
+        editingNativeIssuer = activeServer?.nativeSSO?.issuerURL ?? ""
+        editingNativeClientID = activeServer?.nativeSSO?.clientID ?? NativeSSOSettings.defaultClientID
+        editingNativeProviderKey = activeServer?.nativeSSO?.providerKey ?? "oidc"
         isEditing = true
     }
 
@@ -552,6 +564,31 @@ struct ServerManagementView: View {
                     Text("Optional. If set, Open UI will poll this URL while a request is pending and show a banner like \"Loading qwen3-35b ~42s left\". Leave blank to disable. Useful for SGLang or similar proxies that hot-swap models.")
                         .font(.caption)
                 }
+
+                Section {
+                    Toggle("Sign in via System Browser", isOn: $editingNativeEnabled)
+                        .disabled(editingNativeIssuer.isEmpty || editingNativeClientID.isEmpty)
+                    // Fields stay editable regardless of the toggle — the
+                    // toggle only enables once issuer + client ID are filled,
+                    // so gating the fields on the toggle would deadlock the
+                    // form when the issuer starts empty.
+                    TextField("https://keycloak.example.com/realms/myrealm", text: $editingNativeIssuer)
+                        .textContentType(.URL)
+                        .autocorrectionDisabled()
+                        .textInputAutocapitalization(.never)
+                        .keyboardType(.URL)
+                    TextField("Client ID (e.g. openrelay-mobile)", text: $editingNativeClientID)
+                        .autocorrectionDisabled()
+                        .textInputAutocapitalization(.never)
+                    TextField("Provider key (default: oidc)", text: $editingNativeProviderKey)
+                        .autocorrectionDisabled()
+                        .textInputAutocapitalization(.never)
+                } header: {
+                    Text("Native SSO (Passkeys)")
+                } footer: {
+                    Text("Sign in through the system browser instead of the embedded web view — this enables passkey/WebAuthn and browser SSO at your identity provider, and silent session refresh via the offline_access scope. Requires an OIDC public client (PKCE) with redirect URI openui://oauth-callback and the offline_access client scope enabled, and on the server: ENABLE_OAUTH_TOKEN_EXCHANGE=true plus this client ID in OAUTH_TOKEN_EXCHANGE_TRUSTED_CLIENT_IDS.")
+                        .font(.caption)
+                }
             }
             .navigationTitle("Edit Server")
             .navigationBarTitleDisplayMode(.inline)
@@ -589,6 +626,23 @@ struct ServerManagementView: View {
 
         let trimmedSwitchURL = editingSwitchStatusURL.trimmingCharacters(in: .whitespaces)
         config.switchStatusURL = trimmedSwitchURL.isEmpty ? nil : trimmedSwitchURL
+
+        // Native SSO — enabled only via the explicit toggle with both
+        // issuer and client ID filled in.
+        let trimmedIssuer = editingNativeIssuer.trimmingCharacters(in: .whitespaces)
+        let trimmedClientID = editingNativeClientID.trimmingCharacters(in: .whitespaces)
+        if editingNativeEnabled, !trimmedIssuer.isEmpty, !trimmedClientID.isEmpty {
+            let trimmedProviderKey = editingNativeProviderKey.trimmingCharacters(in: .whitespaces)
+            config.nativeSSO = NativeSSOSettings(
+                issuerURL: trimmedIssuer,
+                clientID: trimmedClientID,
+                providerKey: trimmedProviderKey.isEmpty ? "oidc" : trimmedProviderKey
+            )
+        } else {
+            config.nativeSSO = nil
+            // Toggling off must also drop any stored IdP refresh token.
+            KeychainService.shared.deleteToken(forServer: AuthViewModel.nativeSSORefreshKey(for: config.url))
+        }
 
         dependencies.serverConfigStore.updateServer(config)
         dependencies.refreshServices()

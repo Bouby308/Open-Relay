@@ -49,6 +49,18 @@ struct ServerConfig: Codable, Identifiable, Hashable, Sendable {
     /// The URL the proxy redirected to (auth portal URL) — used to re-scope cookies.
     var proxyAuthPortalURL: String?
 
+    // MARK: - Native SSO (passkey-capable OIDC flow)
+
+    /// Optional settings for the native OIDC sign-in flow
+    /// (`ASWebAuthenticationSession` + Open WebUI token exchange).
+    /// When configured for a provider, sign-in uses the system browser —
+    /// which enables passkey / WebAuthn login at the identity provider
+    /// (not possible in the embedded WKWebView without Associated Domains
+    /// + AASA hosting on the IdP's domain). Requires
+    /// `ENABLE_OAUTH_TOKEN_EXCHANGE=true` and this client listed in
+    /// `OAUTH_TOKEN_EXCHANGE_TRUSTED_CLIENT_IDS` on the server.
+    var nativeSSO: NativeSSOSettings?
+
     /// Optional URL for a model-switch status endpoint (issue #79).
     /// When set, Open Relay polls this URL every 1 s while a chat request is
     /// pending and shows a progress banner if the backend is switching models.
@@ -96,6 +108,7 @@ struct ServerConfig: Codable, Identifiable, Hashable, Sendable {
         case lastUserName, lastUserEmail, lastUserProfileImageURL, lastAuthType, hasActiveSession
         case savedAccounts, activeAccountId
         case switchStatusURL
+        case nativeSSO
     }
 
     /// Custom decoder so existing saved configs (without the new metadata fields)
@@ -125,6 +138,7 @@ struct ServerConfig: Codable, Identifiable, Hashable, Sendable {
         savedAccounts = (try? c.decode([SavedAccount].self, forKey: .savedAccounts)) ?? []
         activeAccountId = try? c.decode(String.self, forKey: .activeAccountId)
         switchStatusURL = try? c.decode(String.self, forKey: .switchStatusURL)
+        nativeSSO = try? c.decode(NativeSSOSettings.self, forKey: .nativeSSO)
         apiKey = nil // always nil from storage; loaded from Keychain at runtime
     }
 
@@ -151,7 +165,8 @@ struct ServerConfig: Codable, Identifiable, Hashable, Sendable {
         hasActiveSession: Bool = false,
         savedAccounts: [SavedAccount] = [],
         activeAccountId: String? = nil,
-        switchStatusURL: String? = nil
+        switchStatusURL: String? = nil,
+        nativeSSO: NativeSSOSettings? = nil
     ) {
         self.id = id
         self.name = name
@@ -176,6 +191,7 @@ struct ServerConfig: Codable, Identifiable, Hashable, Sendable {
         self.savedAccounts = savedAccounts
         self.activeAccountId = activeAccountId
         self.switchStatusURL = switchStatusURL
+        self.nativeSSO = nativeSSO
     }
 
     /// Whether the persisted `cf_clearance` cookie is still valid (not expired).

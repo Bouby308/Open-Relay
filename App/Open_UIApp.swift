@@ -253,6 +253,10 @@ struct Open_UIApp: App {
     private func handleDeepLink(_ url: URL) {
         guard let host = url.host() else { return }
 
+        // OAuth callbacks are consumed by ASWebAuthenticationSession itself;
+        // they can also arrive here after the session closes — ignore them.
+        if host == "oauth-callback" { return }
+
         switch host {
         case "new-chat":
             // Widget "Ask Open Relay" bar → new chat with keyboard auto-focus.

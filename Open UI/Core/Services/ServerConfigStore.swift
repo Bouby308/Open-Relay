@@ -79,6 +79,7 @@ final class ServerConfigStore {
         guard let config = servers.first(where: { $0.id == id }) else { return }
         KeychainService.shared.deleteToken(forServer: config.url)
         KeychainService.shared.deleteToken(forServer: "cached_user_\(config.url)")
+        KeychainService.shared.deleteToken(forServer: AuthViewModel.nativeSSORefreshKey(for: config.url))
         servers.removeAll(where: { $0.id == id })
         saveServers()
     }
@@ -88,6 +89,7 @@ final class ServerConfigStore {
         for server in servers {
             KeychainService.shared.deleteToken(forServer: server.url)
             KeychainService.shared.deleteToken(forServer: "cached_user_\(server.url)")
+            KeychainService.shared.deleteToken(forServer: AuthViewModel.nativeSSORefreshKey(for: server.url))
         }
         servers.removeAll()
         saveServers()

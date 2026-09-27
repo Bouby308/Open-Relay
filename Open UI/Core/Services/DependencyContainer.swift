@@ -510,6 +510,17 @@ final class AppDependencyContainer: ServiceContainer {
             }
         }
 
+        // Native SSO: transparent 401 recovery. Tried BEFORE the callback above
+        // ever sees a failure — the silent refresh (IdP refresh token → token
+        // exchange → new JWT) retries the failed request in NetworkManager, so
+        // an expired JWT never surfaces as "Failed to fetch …: Your session has
+        // expired". Non-native accounts return false instantly and keep the
+        // existing sign-out behaviour untouched.
+        apiClient?.onUnauthorizedRecover = { [weak self] in
+            guard let self else { return false }
+            return await self.authViewModel.recoverSessionFrom401()
+        }
+
         // Dispose previous socket before creating new one
         socketService?.dispose()
 
