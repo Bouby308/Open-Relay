@@ -1,5 +1,35 @@
 # Changelog
 
+## v5.9 — September 26, 2026
+
+### What's New
+- All-new voice calls — faster, smarter conversations that feel natural:
+  - Talk over the AI to interrupt it naturally.
+  - Keeps working when you lock your phone or switch apps (server tts required).
+  - Shows in the Dynamic Island and on the Lock Screen with Mute and End buttons, and no longer fills your phone's Recents.
+  - Starts replying as soon as the first sentence is ready.
+  - Uses Apple's new speech recognition on iOS 26, or on-device Parakeet / Qwen3.
+- New Voice settings (Settings → Voice) — the assistant's voice, your language, dictation, voice calls and downloaded models, all in one place. Includes advanced tuning and live diagnostics for voice calls.
+- Dictation can stop automatically after a short silence.
+- Full-screen library search — find chats, folders, knowledge bases and text inside documents, with the matching part highlighted. Tap the magnifying glass in the sidebar.
+- Hide the suggested prompts on new chats (Settings → Chat Behavior → New Chats).
+- Hide the voice-mode button in the message box (Settings → Chat Behavior → Composer).
+
+### Improvements
+- Thinking streams live as the AI reasons, and replies type out smoothly.
+- Swipe right anywhere on a chat to open the sidebar.
+- Subtler blur behind the status bar.
+- The top bar now hides and reappears instantly as you scroll.
+- Close buttons across the app now use the standard iOS style.
+- Dictation recordings are no longer lost when transcription fails — retry, transcribe on device, save/share the audio, or discard it.
+
+### Bug Fixes
+- Fixed tool results briefly showing as garbled text while a reply loads.
+- Fixed starting prompts sometimes missing on the welcome screen.
+- Fixed dictation sometimes using the wrong speech engine.
+- Fixed extra divider lines in the sidebar when Channels is turned off.
+- Fixed long dictated messages being cut off and impossible to scroll through in the message box.
+
 ## v5.8 — September 22, 2026
 
 ### What's New

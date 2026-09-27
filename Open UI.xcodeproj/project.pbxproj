@@ -41,6 +41,8 @@
 		38B6DED72FA55DDC001924FB /* MarkdownView in Frameworks */ = {isa = PBXBuildFile; productRef = 38B6DED62FA55DDC001924FB /* MarkdownView */; };
 		38C7FDAB2FF9783D001C94A0 /* MarkdownParser in Frameworks */ = {isa = PBXBuildFile; productRef = 38C7FDAA2FF9783D001C94A0 /* MarkdownParser */; };
 		38C7FDAD2FF9783D001C94A0 /* MarkdownView in Frameworks */ = {isa = PBXBuildFile; productRef = 38C7FDAC2FF9783D001C94A0 /* MarkdownView */; };
+		38E88FD73064E45500224261 /* MLXAudioVAD in Frameworks */ = {isa = PBXBuildFile; productRef = 38E88FD63064E45500224261 /* MLXAudioVAD */; };
+		38E88FD93064E45E00224261 /* MLXAudioSTS in Frameworks */ = {isa = PBXBuildFile; productRef = 38E88FD83064E45E00224261 /* MLXAudioSTS */; };
 		38FEA3182FA2A18600A98F25 /* MLXAudioCore in Frameworks */ = {isa = PBXBuildFile; productRef = 38FEA3172FA2A18600A98F25 /* MLXAudioCore */; };
 		38FEA31A2FA2A18600A98F25 /* MLXAudioSTT in Frameworks */ = {isa = PBXBuildFile; productRef = 38FEA3192FA2A18600A98F25 /* MLXAudioSTT */; };
 		38FEA31C2FA2A18600A98F25 /* MLXAudioTTS in Frameworks */ = {isa = PBXBuildFile; productRef = 38FEA31B2FA2A18600A98F25 /* MLXAudioTTS */; };
@@ -109,6 +111,13 @@
 			);
 			target = 38SHARE042F00000000000004 /* OpenUIShareExtension */;
 		};
+		38VCLA012F00000000000001 /* Exceptions for "Open UI" folder in "OpenUIWidgetsExtension" target */ = {
+			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
+			membershipExceptions = (
+				Features/VoiceCall/LiveActivity/VoiceCallActivityAttributes.swift,
+			);
+			target = 3852C70B2F71110800283682 /* OpenUIWidgetsExtension */;
+		};
 /* End PBXFileSystemSynchronizedBuildFileExceptionSet section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
@@ -124,6 +133,7 @@
 			isa = PBXFileSystemSynchronizedRootGroup;
 			exceptions = (
 				38EB66802F39CE5B00AED774 /* Exceptions for "Open UI" folder in "Open UI" target */,
+				38VCLA012F00000000000001 /* Exceptions for "Open UI" folder in "OpenUIWidgetsExtension" target */,
 			);
 			path = "Open UI";
 			sourceTree = "<group>";
@@ -156,12 +166,14 @@
 				38FEA3182FA2A18600A98F25 /* MLXAudioCore in Frameworks */,
 				38FEA31C2FA2A18600A98F25 /* MLXAudioTTS in Frameworks */,
 				3879DA932FE7D4ED0064E527 /* MarkdownView in Frameworks */,
+				38E88FD93064E45E00224261 /* MLXAudioSTS in Frameworks */,
 				38754A972F845BE60012CD28 /* ReactionContextMenu in Frameworks */,
 				388C02F72FB5131C0098FB4F /* MarkdownParser in Frameworks */,
 				3883D6B5305061D100F5DC07 /* MarkdownView in Frameworks */,
 				387CAAD82F8AB953000B5152 /* MarkdownView in Frameworks */,
 				38B6DED72FA55DDC001924FB /* MarkdownView in Frameworks */,
 				3890E28F2F9845C10011D505 /* MarkdownParser in Frameworks */,
+				38E88FD73064E45500224261 /* MLXAudioVAD in Frameworks */,
 				3879DA912FE7D4ED0064E527 /* MarkdownParser in Frameworks */,
 				383573A33040FCDC00BB4B52 /* MarkdownView in Frameworks */,
 				38AD615B2FAB1946007725CE /* MarkdownParser in Frameworks */,
@@ -308,6 +320,8 @@
 				383573A23040FCDC00BB4B52 /* MarkdownView */,
 				3883D6B2305061D100F5DC07 /* MarkdownParser */,
 				3883D6B4305061D100F5DC07 /* MarkdownView */,
+				38E88FD63064E45500224261 /* MLXAudioVAD */,
+				38E88FD83064E45E00224261 /* MLXAudioSTS */,
 			);
 			productName = "Open UI";
 			productReference = 38EB667D2F39CE5A00AED774 /* Open UI.app */;
@@ -469,7 +483,7 @@
 					"@executable_path/Frameworks",
 					"@executable_path/../../Frameworks",
 				);
-				MARKETING_VERSION = 5.8;
+				MARKETING_VERSION = 5.9;
 				PRODUCT_BUNDLE_IDENTIFIER = com.openui.openui.OpenUIWidget;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SKIP_INSTALL = YES;
@@ -501,7 +515,7 @@
 					"@executable_path/Frameworks",
 					"@executable_path/../../Frameworks",
 				);
-				MARKETING_VERSION = 5.8;
+				MARKETING_VERSION = 5.9;
 				PRODUCT_BUNDLE_IDENTIFIER = com.openui.openui.OpenUIWidget;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SKIP_INSTALL = YES;
@@ -660,6 +674,7 @@
 				INFOPLIST_KEY_NSPhotoLibraryAddUsageDescription = "Open Relay needs permission to save images generated in conversations to your photo library.";
 				INFOPLIST_KEY_NSPhotoLibraryUsageDescription = "Open Relay needs photo library access to attach images to your conversations.";
 				INFOPLIST_KEY_NSSpeechRecognitionUsageDescription = "Open Relay uses speech recognition to convert your voice input to text.";
+				INFOPLIST_KEY_NSSupportsLiveActivities = YES;
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
@@ -670,7 +685,7 @@
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				MARKETING_VERSION = 5.8;
+				MARKETING_VERSION = 5.9;
 				PRODUCT_BUNDLE_IDENTIFIER = com.openui.openui;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;
@@ -708,6 +723,7 @@
 				INFOPLIST_KEY_NSPhotoLibraryAddUsageDescription = "Open Relay needs permission to save images generated in conversations to your photo library.";
 				INFOPLIST_KEY_NSPhotoLibraryUsageDescription = "Open Relay needs photo library access to attach images to your conversations.";
 				INFOPLIST_KEY_NSSpeechRecognitionUsageDescription = "Open Relay uses speech recognition to convert your voice input to text.";
+				INFOPLIST_KEY_NSSupportsLiveActivities = YES;
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
@@ -718,7 +734,7 @@
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				MARKETING_VERSION = 5.8;
+				MARKETING_VERSION = 5.9;
 				PRODUCT_BUNDLE_IDENTIFIER = com.openui.openui;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;
@@ -751,7 +767,7 @@
 					"@executable_path/Frameworks",
 					"@executable_path/../../Frameworks",
 				);
-				MARKETING_VERSION = 5.8;
+				MARKETING_VERSION = 5.9;
 				PRODUCT_BUNDLE_IDENTIFIER = com.openui.openui.ShareExtension;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SKIP_INSTALL = YES;
@@ -778,7 +794,7 @@
 					"@executable_path/Frameworks",
 					"@executable_path/../../Frameworks",
 				);
-				MARKETING_VERSION = 5.8;
+				MARKETING_VERSION = 5.9;
 				PRODUCT_BUNDLE_IDENTIFIER = com.openui.openui.ShareExtension;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SKIP_INSTALL = YES;
@@ -1002,6 +1018,16 @@
 		38C7FDAC2FF9783D001C94A0 /* MarkdownView */ = {
 			isa = XCSwiftPackageProductDependency;
 			productName = MarkdownView;
+		};
+		38E88FD63064E45500224261 /* MLXAudioVAD */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 38FEA3162FA2A18600A98F25 /* XCRemoteSwiftPackageReference "mlx-audio-swift" */;
+			productName = MLXAudioVAD;
+		};
+		38E88FD83064E45E00224261 /* MLXAudioSTS */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 38FEA3162FA2A18600A98F25 /* XCRemoteSwiftPackageReference "mlx-audio-swift" */;
+			productName = MLXAudioSTS;
 		};
 		38FEA3172FA2A18600A98F25 /* MLXAudioCore */ = {
 			isa = XCSwiftPackageProductDependency;

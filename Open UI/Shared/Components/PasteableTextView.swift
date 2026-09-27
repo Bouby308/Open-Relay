@@ -109,19 +109,34 @@ struct PasteableTextView: UIViewRepresentable {
         // the latest struct values (fixes stale-closure "Send on Enter" bug).
         context.coordinator.parent = self
 
+        // SwiftUI calls this on every composer re-render (including mid-scroll, e.g.
+        // from the press-feedback or expand gestures). Re-assigning font/colors makes
+        // UITextView re-layout its text and scroll the caret back into view, which
+        // yanks the user to the bottom while they scroll. So only write what changed,
+        // and never disturb the scroll position when the text itself is unchanged.
+        let userIsScrolling = textView.isTracking || textView.isDragging || textView.isDecelerating
+        let savedOffset = textView.contentOffset
+        var textChanged = false
+
         // Only update text if it actually changed (avoids cursor jump)
         if textView.text != text {
             textView.text = text
+            textChanged = true
         }
-        textView.isEditable = isEnabled
-        textView.isSelectable = true
-        textView.font = font
-        textView.textColor = textColor
-        textView.tintColor = tintColor
-        textView.placeholderLabel.isHidden = !text.isEmpty
-        textView.placeholderLabel.text = placeholder
-        textView.placeholderLabel.font = placeholderFont ?? font
-        textView.placeholderLabel.textColor = placeholderColor
+        if textView.isEditable != isEnabled { textView.isEditable = isEnabled }
+        if !textView.isSelectable { textView.isSelectable = true }
+        if textView.font != font { textView.font = font }
+        if !Self.sameColor(textView.textColor, textColor, in: textView) { textView.textColor = textColor }
+        if !Self.sameColor(textView.tintColor, tintColor, in: textView) { textView.tintColor = tintColor }
+
+        let placeholderLabel = textView.placeholderLabel
+        if placeholderLabel.isHidden != !text.isEmpty { placeholderLabel.isHidden = !text.isEmpty }
+        if placeholderLabel.text != placeholder { placeholderLabel.text = placeholder }
+        let resolvedPlaceholderFont = placeholderFont ?? font
+        if placeholderLabel.font != resolvedPlaceholderFont { placeholderLabel.font = resolvedPlaceholderFont }
+        if !Self.sameColor(placeholderLabel.textColor, placeholderColor, in: textView) {
+            placeholderLabel.textColor = placeholderColor
+        }
         let newReturnKeyType: UIReturnKeyType = sendOnReturn ? .send : .default
         if textView.returnKeyType != newReturnKeyType {
             textView.returnKeyType = newReturnKeyType
@@ -143,8 +158,25 @@ struct PasteableTextView: UIViewRepresentable {
             context.coordinator.parent.onSubmit?()
         }
 
-        // Recalculate sizing: toggle scroll when content exceeds max height
-        PasteableTextView.recalculateHeight(textView)
+        // Recalculate sizing: toggle scroll when content exceeds max height.
+        // Skipped while the user is scrolling an unchanged draft so the view stays put.
+        if textChanged || !userIsScrolling {
+            PasteableTextView.recalculateHeight(textView)
+        }
+
+        // Keep the user's reading position when nothing about the text changed.
+        if !textChanged, textView.isScrollEnabled, textView.contentOffset != savedOffset {
+            textView.setContentOffset(savedOffset, animated: false)
+        }
+    }
+
+    /// Compares colors by their resolved values — `UIColor(Color)` creates a new
+    /// instance each render, so identity/`isEqual` alone would always differ.
+    private static func sameColor(_ current: UIColor?, _ new: UIColor, in view: UIView) -> Bool {
+        guard let current else { return false }
+        if current.isEqual(new) { return true }
+        let traits = view.traitCollection
+        return current.resolvedColor(with: traits).cgColor == new.resolvedColor(with: traits).cgColor
     }
 
     /// Recalculates the text view height and toggles scrolling appropriately.
@@ -160,7 +192,13 @@ struct PasteableTextView: UIViewRepresentable {
         if textView.isScrollEnabled != shouldScroll {
             textView.isScrollEnabled = shouldScroll
         }
-        textView.invalidateIntrinsicContentSize()
+        // Only invalidate when the reported height actually changes — a redundant
+        // invalidation re-lays out the view and can reset its scroll position.
+        let height = min(fittingSize.height, maxHeight)
+        if textView.lastReportedHeight != height {
+            textView.lastReportedHeight = height
+            textView.invalidateIntrinsicContentSize()
+        }
     }
 
     // MARK: - Coordinator
@@ -430,13 +468,17 @@ final class PasteInterceptingTextView: UITextView {
         label.numberOfLines = 1
         label.lineBreakMode = .byTruncatingTail
         addSubview(label)
+        // Anchor to the viewport so the placeholder cannot redefine contentSize.
         NSLayoutConstraint.activate([
-            label.leadingAnchor.constraint(equalTo: leadingAnchor),
-            label.topAnchor.constraint(equalTo: topAnchor),
-            label.trailingAnchor.constraint(equalTo: trailingAnchor),
+            label.leadingAnchor.constraint(equalTo: frameLayoutGuide.leadingAnchor),
+            label.topAnchor.constraint(equalTo: frameLayoutGuide.topAnchor),
+            label.trailingAnchor.constraint(equalTo: frameLayoutGuide.trailingAnchor),
         ])
         return label
     }()
+
+    /// Last height reported via `intrinsicContentSize`, used to skip redundant invalidations.
+    var lastReportedHeight: CGFloat = -1
 
     /// Maximum content height (~8 lines).
     var maxContentHeight: CGFloat {

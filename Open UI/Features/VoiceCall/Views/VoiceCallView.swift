@@ -20,8 +20,6 @@ struct VoiceCallView: View {
     /// The presenter is responsible for dismissing the sheet and cleaning up the view model.
     var onDismiss: () -> Void = {}
 
-    @AppStorage("sttLocale") private var sttLocale: String = ""
-    @AppStorage("ttsVoiceIdentifier") private var ttsVoiceIdentifier: String = ""
     @State private var showVoiceSettings = false
 
     var body: some View {
@@ -47,7 +45,12 @@ struct VoiceCallView: View {
 
             // Transcript
             transcriptSection
-                .padding(.bottom, 24)
+                .padding(.bottom, viewModel.diagnostics == nil ? 24 : 8)
+
+            if let d = viewModel.diagnostics {
+                diagnosticsSection(d)
+                    .padding(.bottom, 16)
+            }
 
             Spacer(minLength: 0)
 
@@ -252,6 +255,37 @@ struct VoiceCallView: View {
         }
     }
 
+    // MARK: - Diagnostics
+
+    /// Live turn-taking readout (Settings → Voice → Voice Calls → Advanced → Diagnostics).
+    private func diagnosticsSection(_ d: CallDiagnostics) -> some View {
+        VStack(spacing: 3) {
+            Text(d.lastEvent)
+                .scaledFont(size: 12, weight: .semibold)
+                .foregroundStyle(.white.opacity(0.75))
+            if !d.summary.isEmpty {
+                Text(d.summary)
+                    .scaledFont(size: 11, weight: .medium)
+                    .monospacedDigit()
+                    .foregroundStyle(.white.opacity(0.55))
+            }
+            if !d.mode.isEmpty {
+                Text(d.mode)
+                    .scaledFont(size: 10)
+                    .foregroundStyle(.white.opacity(0.35))
+                    .lineLimit(2)
+                    .multilineTextAlignment(.center)
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 6)
+        .background(.white.opacity(0.05))
+        .clipShape(RoundedRectangle(cornerRadius: 10))
+        .padding(.horizontal, 24)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("Diagnostics: \(d.lastEvent). \(d.summary)")
+    }
+
     // MARK: - Transcript
 
     private var transcriptSection: some View {
@@ -308,8 +342,8 @@ struct VoiceCallView: View {
 
             Spacer()
 
-            // Voice / language settings
-            compactControl(icon: "globe", isActive: false) {
+            // Voice settings (the Voice hub — same screen as Settings → Voice)
+            compactControl(icon: "slider.horizontal.3", isActive: false) {
                 showVoiceSettings = true
             }
 
@@ -331,13 +365,10 @@ struct VoiceCallView: View {
             Spacer()
         }
         .sheet(isPresented: $showVoiceSettings) {
-            VoiceCallSettingsSheet(
-                sttLocale: $sttLocale,
-                ttsVoiceIdentifier: $ttsVoiceIdentifier,
-                speechService: dependencies.speechRecognitionService,
-                ttsService: dependencies.textToSpeechService
-            )
-            .presentationDetents([.medium])
+            NavigationStack {
+                VoiceSettingsHubView(presentedInCall: true)
+            }
+            .presentationDetents([.medium, .large])
             .presentationDragIndicator(.visible)
         }
     }
@@ -514,93 +545,6 @@ struct CompactOrbView: View {
     private func stopPulse() {
         withAnimation(.easeOut(duration: 0.3)) {
             pulse = 1.0
-        }
-    }
-}
-
-// MARK: - Voice Call Settings Sheet
-
-/// Compact in-call sheet for quickly switching STT language and TTS voice.
-struct VoiceCallSettingsSheet: View {
-    @Binding var sttLocale: String
-    @Binding var ttsVoiceIdentifier: String
-    let speechService: SpeechRecognitionService
-    let ttsService: TextToSpeechService
-    @Environment(\.dismiss) private var dismiss
-
-    private var supportedSTTLocales: [Locale] {
-        SFSpeechRecognizer.supportedLocales()
-            .sorted {
-                (Locale.current.localizedString(forIdentifier: $0.identifier) ?? $0.identifier)
-                    < (Locale.current.localizedString(forIdentifier: $1.identifier) ?? $1.identifier)
-            }
-    }
-
-    private var availableTTSVoices: [AVSpeechSynthesisVoice] {
-        ttsService.availableVoices()
-    }
-
-    var body: some View {
-        NavigationStack {
-            List {
-                Section("Speech Recognition Language") {
-                    NavigationLink {
-                        STTLanguagePickerView(sttLocale: $sttLocale, locales: supportedSTTLocales)
-                            .onChange(of: sttLocale) { _, newValue in
-                                speechService.updateLocale(newValue)
-                            }
-                    } label: {
-                        HStack {
-                            Text("Language")
-                            Spacer()
-                            Text(
-                                sttLocale.isEmpty
-                                    ? "Auto"
-                                    : (Locale.current.localizedString(forIdentifier: sttLocale) ?? sttLocale)
-                            )
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
-                        }
-                    }
-                }
-
-                Section("Text-to-Speech Voice") {
-                    NavigationLink {
-                        TTSVoicePickerView(voiceIdentifier: $ttsVoiceIdentifier, voices: availableTTSVoices)
-                            .onChange(of: ttsVoiceIdentifier) { _, newValue in
-                                ttsService.voiceIdentifier = newValue.isEmpty ? nil : newValue
-                            }
-                    } label: {
-                        HStack {
-                            Text("Voice")
-                            Spacer()
-                            Text(
-                                ttsVoiceIdentifier.isEmpty
-                                    ? "Auto (detect language)"
-                                    : (AVSpeechSynthesisVoice(identifier: ttsVoiceIdentifier)?.name ?? ttsVoiceIdentifier)
-                            )
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
-                        }
-                    }
-                }
-            }
-            .navigationTitle("Voice Settings")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .navigationBarLeading) {
-                    Button {
-                        dismiss()
-                    } label: {
-                        Image(systemName: "xmark")
-                            .scaledFont(size: 14, weight: .medium)
-                            .foregroundStyle(Color.secondary)
-                            .frame(width: 32, height: 32)
-                            .background(Color(uiColor: .systemGray5).opacity(0.6))
-                            .clipShape(Circle())
-                    }
-                }
-            }
         }
     }
 }

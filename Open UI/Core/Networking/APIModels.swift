@@ -218,6 +218,24 @@ struct BackendConfig: Codable, Sendable {
         oauth = try? container.decodeIfPresent(OAuthConfig.self, forKey: .oauth)
     }
 
+    /// Merge initializer: copies all fields from `updated`, but if `updated` has
+    /// no `defaultPromptSuggestions` and `previous` does, the previous suggestions
+    /// are carried over so the welcome-screen cards never disappear during a refresh.
+    init(preservingSuggestionsFrom previous: BackendConfig?, updatedWith updated: BackendConfig) {
+        status = updated.status
+        version = updated.version
+        name = updated.name
+        features = updated.features
+        defaultModels = updated.defaultModels
+        audio = updated.audio
+        oauth = updated.oauth
+        if let fresh = updated.defaultPromptSuggestions, !fresh.isEmpty {
+            defaultPromptSuggestions = fresh
+        } else {
+            defaultPromptSuggestions = previous?.defaultPromptSuggestions
+        }
+    }
+
     /// Whether this response looks like a valid OpenWebUI server.
     var isValidOpenWebUI: Bool {
         status == true

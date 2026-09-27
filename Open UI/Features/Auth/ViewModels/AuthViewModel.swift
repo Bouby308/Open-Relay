@@ -1294,10 +1294,27 @@ final class AuthViewModel {
     /// Force-refreshes `backendConfig` from the server unconditionally.
     /// Called when the sidebar opens so that server-side feature flags
     /// (e.g. enableChannels, enableNotes) are always up-to-date.
+    ///
+    /// If the fresh config comes back without `default_prompt_suggestions`
+    /// (e.g. token expired between the sidebar open and the request), we
+    /// preserve the existing suggestions so the welcome-screen prompt cards
+    /// don't vanish mid-session.
     func refreshBackendConfig() async {
         guard let client = dependencies?.apiClient else { return }
         do {
-            backendConfig = try await client.getBackendConfig()
+            let fresh = try await client.getBackendConfig()
+            // If the new config has no suggestions but we already have some,
+            // keep the existing ones so the welcome-screen cards don't disappear.
+            if fresh.defaultPromptSuggestions == nil || (fresh.defaultPromptSuggestions?.isEmpty == true),
+               let existing = backendConfig?.defaultPromptSuggestions, !existing.isEmpty {
+                // Merge: adopt all new fields but restore the known-good suggestions.
+                backendConfig = BackendConfig(
+                    preservingSuggestionsFrom: backendConfig,
+                    updatedWith: fresh
+                )
+            } else {
+                backendConfig = fresh
+            }
         } catch {
             logger.warning("Failed to refresh backend config: \(error.localizedDescription)")
         }
@@ -1654,6 +1671,7 @@ final class AuthViewModel {
         }
 
         // Tear down current session (lightweight — no server disconnect)
+        dependencies?.dictationService.unbind()
         stopTokenRefreshTimer()
         dependencies?.socketService?.disconnect()
         dependencies?.activeChatStore.clear()
@@ -2007,8 +2025,15 @@ final class AuthViewModel {
         connectSocketWithToken()
         startTokenRefreshTimer()
 
+        // Fetch user + backend config in parallel so a transient failure on
+        // one doesn't delay the other. The config supplies `default_prompt_suggestions`
+        // for the welcome-screen cards; we want it regardless of whether the
+        // user call succeeds.
+        async let userResult: User = client.getCurrentUser()
+        async let configResult: BackendConfig? = try? client.getBackendConfig()
+
         do {
-            let freshUser = try await client.getCurrentUser()
+            let (freshUser, freshConfig) = try await (userResult, configResult)
             // Update with fresh data from server
             currentUser = freshUser
             if freshUser.role == .pending {
@@ -2016,7 +2041,19 @@ final class AuthViewModel {
                 return
             }
             cacheCurrentUser()
-            backendConfig = try? await client.getBackendConfig()
+            // Apply the fresh config, preserving any existing suggestions if the
+            // new response is missing them (e.g. token edge-case at request time).
+            if let fresh = freshConfig {
+                if fresh.defaultPromptSuggestions == nil || (fresh.defaultPromptSuggestions?.isEmpty == true),
+                   let existing = backendConfig?.defaultPromptSuggestions, !existing.isEmpty {
+                    backendConfig = BackendConfig(preservingSuggestionsFrom: backendConfig, updatedWith: fresh)
+                } else {
+                    backendConfig = fresh
+                }
+            } else if backendConfig == nil {
+                // Config call failed but we don't have anything yet — try once more.
+                backendConfig = try? await client.getBackendConfig()
+            }
             logger.info("✅ Background session validation succeeded for '\(freshUser.displayName)'")
         } catch {
             let apiError = APIError.from(error)
@@ -2038,6 +2075,11 @@ final class AuthViewModel {
                 // Transient error — keep the user in the app, they can still
                 // browse cached data. Socket reconnect will handle recovery.
                 logger.info("🔄 Background validation: transient error (\(apiError.localizedDescription)), keeping optimistic session")
+                // Still try to fetch the config if we don't have it yet, so that
+                // welcome-screen prompts appear even when user validation failed.
+                if backendConfig == nil {
+                    backendConfig = try? await client.getBackendConfig()
+                }
             }
         }
     }

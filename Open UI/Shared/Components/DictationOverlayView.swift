@@ -21,6 +21,8 @@ struct DictationOverlayView: View {
     var onCancel: () -> Void
 
     @Environment(\.theme) private var theme
+    @State private var sharingAudioURL: URL?
+    @State private var barHeight: CGFloat = 64
 
     // MARK: - Waveform State
 
@@ -36,14 +38,33 @@ struct DictationOverlayView: View {
 
     var body: some View {
         HStack(spacing: 10) {
-            cancelButton
-            engineChip
-                .fixedSize()
-            waveformArea
-                .frame(maxWidth: .infinity)
-            HStack(spacing: 8) {
-                durationLabel
-                stopButton
+            if service.showsRecovery && service.state != .processing {
+                recoveryMenu
+                VStack(alignment: .leading, spacing: 2) {
+                    if case .error(let message) = service.state {
+                        Text(service.attemptTask == nil ? message : "Stopping transcription…")
+                            .font(.subheadline)
+                            .lineLimit(2)
+                    }
+                    Text("Recording saved · \(formattedDuration)")
+                        .font(.caption)
+                        .foregroundStyle(theme.textSecondary)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                Button { service.retry() } label: {
+                    Image(systemName: "arrow.clockwise").frame(minWidth: 32, minHeight: 32)
+                }
+                .recoveryButtonStyle()
+                .disabled(service.attemptTask != nil)
+                .accessibilityLabel("Retry transcription")
+            } else {
+                cancelButton
+                engineChip.fixedSize()
+                waveformArea.frame(maxWidth: .infinity)
+                HStack(spacing: 8) {
+                    durationLabel
+                    stopButton
+                }
             }
         }
         .padding(.horizontal, 14)
@@ -58,12 +79,38 @@ struct DictationOverlayView: View {
             color: theme.isDark ? Color.black.opacity(0.3) : Color.black.opacity(0.1),
             radius: 8, x: 0, y: 2
         )
+        .onGeometryChange(for: CGFloat.self, of: { $0.size.height }) { barHeight = $0 }
         .padding(.horizontal, 16)
-        .onAppear { startSampling() }
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("dictation-recovery-bar")
+        .sheet(item: $sharingAudioURL) { url in
+            ShareSheetView(activityItems: [url])
+        }
+        .onAppear { if service.state == .listening { startSampling() } }
         .onDisappear { stopSampling() }
         .onChange(of: service.state) { _, newState in
-            if newState == .idle { stopSampling() }
+            if newState == .listening { startSampling() } else { stopSampling() }
         }
+    }
+
+    private var recoveryMenu: some View {
+        var actions: [UIMenuElement] = []
+        if let url = service.savedAudioURL {
+            actions.append(UIAction(title: "Save / Share Audio…", image: UIImage(systemName: "square.and.arrow.up")) { _ in
+                sharingAudioURL = url
+            })
+        }
+        if service.canTranscribeOnDevice {
+            actions.append(UIAction(title: "Transcribe on Device", image: UIImage(systemName: "brain"),
+                                    attributes: service.attemptTask == nil ? [] : .disabled) { _ in
+                service.retry(onDevice: true)
+            })
+        }
+        actions.append(UIAction(title: "Discard Recording", image: UIImage(systemName: "trash"), attributes: .destructive) { _ in
+            service.discardRecording()
+        })
+        return RecordingRecoveryMenu(menu: UIMenu(children: actions), barHeight: barHeight)
+            .frame(width: 44, height: 44)
     }
 
     // MARK: - Cancel Button
@@ -80,7 +127,7 @@ struct DictationOverlayView: View {
             }
         }
         .buttonStyle(.plain)
-        .accessibilityLabel("Cancel dictation")
+        .accessibilityLabel(service.state == .processing ? "Stop transcription and keep recording" : "Cancel dictation")
     }
 
     // MARK: - Engine Chip
@@ -125,7 +172,7 @@ struct DictationOverlayView: View {
             )
         }
         .buttonStyle(.plain)
-        .disabled(isSwitchingEngine)
+        .disabled(isSwitchingEngine || service.state != .listening)
         .animation(.easeInOut(duration: 0.15), value: isSwitchingEngine)
         .animation(.easeInOut(duration: 0.15), value: service.activeEngine)
         .accessibilityLabel("STT engine: \(service.currentEngineName). Tap to switch.")
@@ -134,7 +181,7 @@ struct DictationOverlayView: View {
     // MARK: - Stop Button
 
     private var stopButton: some View {
-        Button(action: onStop) {
+        Button(action: { if service.state == .processing { service.cancelAttempt() } else { onStop() } }) {
             ZStack {
                 Circle()
                     .fill(theme.error.opacity(0.15))
@@ -145,7 +192,7 @@ struct DictationOverlayView: View {
             }
         }
         .buttonStyle(.plain)
-        .accessibilityLabel("Stop dictation")
+        .accessibilityLabel(service.state == .processing ? "Stop transcription and keep recording" : "Stop dictation")
     }
 
     // MARK: - Duration Label
@@ -234,6 +281,64 @@ struct DictationOverlayView: View {
     /// Generates a gentle randomised baseline so the waveform looks alive from frame 1.
     private static func makeSeedSamples() -> [CGFloat] {
         (0..<60).map { _ in CGFloat.random(in: 0.04...0.12) }
+    }
+}
+
+/// UIKit exposes the attachment point needed to keep the menu above the entire bar.
+private struct RecordingRecoveryMenu: UIViewRepresentable {
+    var menu: UIMenu
+    var barHeight: CGFloat
+
+    final class Control: UIControl {
+        var menu: UIMenu?
+        var barHeight: CGFloat = 64
+        override func contextMenuInteraction(_ interaction: UIContextMenuInteraction,
+                                            configurationForMenuAtLocation location: CGPoint) -> UIContextMenuConfiguration? {
+            let configuration = UIContextMenuConfiguration(actionProvider: { [weak self] _ in self?.menu })
+            configuration.preferredMenuElementOrder = .fixed
+            return configuration
+        }
+        override func menuAttachmentPoint(for configuration: UIContextMenuConfiguration) -> CGPoint {
+            CGPoint(x: bounds.midX, y: bounds.midY - barHeight / 2 - 8)
+        }
+    }
+
+    func makeUIView(context: Context) -> Control {
+        let control = Control()
+        var configuration: UIButton.Configuration
+        if #available(iOS 26, *) { configuration = .glass() }
+        else { configuration = .gray() }
+        configuration.image = UIImage(systemName: "ellipsis")
+        configuration.preferredSymbolConfigurationForImage = UIImage.SymbolConfiguration(pointSize: 17, weight: .semibold)
+        configuration.cornerStyle = .capsule
+        configuration.baseForegroundColor = .label
+        let button = UIButton(configuration: configuration)
+        button.adjustsImageSizeForAccessibilityContentSizeCategory = false
+        button.isUserInteractionEnabled = false
+        button.isAccessibilityElement = false
+        button.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        control.addSubview(button)
+        control.isContextMenuInteractionEnabled = true
+        control.showsMenuAsPrimaryAction = true
+        control.isAccessibilityElement = true
+        control.accessibilityTraits = .button
+        control.accessibilityLabel = "Recording recovery options"
+        return control
+    }
+
+    func updateUIView(_ control: Control, context: Context) {
+        control.menu = menu
+        control.barHeight = barHeight
+    }
+}
+
+private extension View {
+    @ViewBuilder func recoveryButtonStyle() -> some View {
+        if #available(iOS 26, *) {
+            self.buttonStyle(.glass).buttonBorderShape(.circle)
+        } else {
+            self.buttonStyle(.bordered).buttonBorderShape(.circle)
+        }
     }
 }
 

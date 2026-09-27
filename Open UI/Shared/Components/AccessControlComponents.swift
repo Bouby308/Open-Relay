@@ -393,12 +393,11 @@ struct UnifiedAddAccessSheet: View {
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
-                    Button {
+                    Button("Close", systemImage: "xmark") {
                         onCancel()
-                    } label: {
-                        Image(systemName: "xmark")
-                            .scaledFont(size: 14, weight: .semibold)
                     }
+                    .labelStyle(.iconOnly)
+                    .tint(.secondary)
                     .disabled(isLoading)
                 }
             }

@@ -165,6 +165,9 @@ final class SocketIOService: NSObject, @unchecked Sendable, URLSessionWebSocketD
     /// the OS has us suspended.
     func markAppBackground() {
         isAppInBackground = true
+        // A voice call keeps running in the background and needs any pending
+        // reconnect to go through.
+        guard !CallAudioSession.isCallActive else { return }
         // Cancel any pending reconnect timer — we'll reconnect immediately on foreground
         DispatchQueue.main.async { [weak self] in
             self?.reconnectTimer?.invalidate()
@@ -1243,7 +1246,9 @@ final class SocketIOService: NSObject, @unchecked Sendable, URLSessionWebSocketD
 
         // If the app is backgrounded, don't schedule a timer that won't fire reliably.
         // resetBackoffAndReconnect() will connect immediately when foreground returns.
-        if isAppInBackground {
+        // Exception: a voice call keeps the app running in the background via
+        // audio and needs the socket to receive replies, so keep reconnecting.
+        if isAppInBackground && !CallAudioSession.isCallActive {
             logger.info("App in background — deferring reconnect until foreground")
             return
         }

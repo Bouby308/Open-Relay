@@ -17,5 +17,8 @@ struct OpenUIWidgetsBundle: WidgetBundle {
 
         // Control Center (iOS 18+)
         OpenUIWidgetsControl()
+
+        // Voice call — Dynamic Island + Lock Screen Live Activity
+        VoiceCallLiveActivity()
     }
 }

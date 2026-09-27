@@ -196,7 +196,7 @@ final class ReadAloudPlayer {
         requiresRestart = false
         for (command, target) in remoteTargets { command.removeTarget(target) }
         remoteTargets.removeAll()
-        if wasVisible {
+        if wasVisible, !CallAudioSession.isCallActive {
             MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
             try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
         }

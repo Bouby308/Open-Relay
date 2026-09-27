@@ -186,9 +186,12 @@ final class OnDeviceTTSService {
     private var backgroundObserver: NSObjectProtocol?
     /// Queue of sentences waiting to be generated + played (used by streaming enqueue).
     private var sentenceQueue: [String] = []
+    /// Monotonically increasing reply number. Incremented on every stop() call.
+    /// Sentences tagged with an old reply number are silently dropped when dequeued,
+    /// preventing sentences from one reply leaking into the next after a barge-in.
+    private var currentReplyID: Int = 0
     /// When true, the queue pipeline keeps its audio streaming session open and waits
     /// for more sentences even when the queue is momentarily empty.
-    /// Set by TextToSpeechService.startStreamingTTS(); cleared by finishStreamingTTS()/stop().
     var streamingModeActive: Bool = false
 
     // MARK: - Model Loading
@@ -204,7 +207,17 @@ final class OnDeviceTTSService {
             return
         }
 
-        if isLoadInProgress { return }
+        if isLoadInProgress {
+            // Wait for the in-progress load to finish rather than returning early.
+            // This prevents a race where sentence 2 calls loadModel(), finds it in
+            // progress, returns immediately (model is still nil), and gets queued
+            // before sentence 1 which is waiting for the load to complete.
+            let deadline = Date().addingTimeInterval(30)
+            while isLoadInProgress, Date() < deadline {
+                try? await Task.sleep(for: .milliseconds(50))
+            }
+            return
+        }
 
         // If a different model is currently loaded, unload it first to free memory
         if let loaded = loadedModel, loaded != targetModel {
@@ -347,21 +360,30 @@ final class OnDeviceTTSService {
     }
 
     /// Enqueues a sentence for sequential generation + playback.
+    /// Sentences are added to the queue IMMEDIATELY (preserving arrival order),
+    /// then the model is loaded on demand if needed.
     func enqueue(_ text: String) async {
         let cleaned = TTSTextPreprocessor.prepareForSpeech(text)
         guard !cleaned.isEmpty else { return }
 
+        let sentences = TTSTextPreprocessor.splitIntoSentences(cleaned)
+        let pieces = sentences.isEmpty ? [cleaned] : sentences
+
+        // *** Add to queue first, before any await, to preserve sentence order. ***
+        // Previously we awaited loadModel() before appending, which allowed
+        // sentence 2 to be added while sentence 1 was still waiting for the load,
+        // causing out-of-order playback.
+        sentenceQueue.append(contentsOf: pieces)
+
+        // Load the model if needed (will return early if already loaded or loading).
         if model == nil {
             do { try await loadModel() } catch {
                 logger.error("Cannot enqueue: \(error.localizedDescription)")
+                sentenceQueue.removeAll(where: { pieces.contains($0) })
                 onError?("On-device TTS model not available")
                 return
             }
         }
-
-        let sentences = TTSTextPreprocessor.splitIntoSentences(cleaned)
-        let pieces = sentences.isEmpty ? [cleaned] : sentences
-        sentenceQueue.append(contentsOf: pieces)
 
         if !isRunning {
             startQueuePipeline()
@@ -372,6 +394,9 @@ final class OnDeviceTTSService {
         generationTask?.cancel()
         generationTask = nil
         sentenceQueue.removeAll()
+        // Increment reply ID so any enqueue() calls still in flight for the
+        // previous reply are silently dropped when they try to start generation.
+        currentReplyID += 1
 
         #if canImport(MLXAudioTTS)
         audioPlayer.stop()
@@ -806,6 +831,90 @@ final class OnDeviceTTSService {
             NotificationCenter.default.removeObserver(obs)
             backgroundObserver = nil
         }
+    }
+
+    // MARK: - Voice Call Mode
+
+    /// Output sample rate of the loaded model (nil if no model is loaded).
+    /// For Qwen3 the configured speed factor is folded in, matching read-aloud.
+    var callOutputSampleRate: Double? {
+        #if canImport(MLXAudioTTS)
+        guard let model else { return nil }
+        let base = Double(model.sampleRate)
+        if loadedModel == .qwen3 && config.qwen3Speed > 0 {
+            return base * Double(config.qwen3Speed)
+        }
+        return base
+        #else
+        return nil
+        #endif
+    }
+
+    /// Voice-call synthesis: returns raw float chunks for one sentence.
+    /// Never touches the audio session or this service's own player, so the
+    /// caller can route audio through the call's echo-cancelled engine.
+    func synthesizeForCall(_ sentence: String) -> AsyncThrowingStream<[Float], Error> {
+        #if canImport(MLXAudioTTS)
+        let ref = model.map(ModelRef.init)
+        let active = config.activeModel
+        let kokoroVoice = config.kokoroVoice
+        let qwen3Voice = config.qwen3Voice
+        let qwen3Language = config.qwen3Language
+        let speed = config.speed
+        return AsyncThrowingStream { continuation in
+            let task = Task.detached(priority: .userInitiated) {
+                guard let ref else {
+                    continuation.finish(throwing: OnDeviceTTSServiceError.notAvailable)
+                    return
+                }
+                let model = ref.value
+                guard MLXCallLock.gpuAllowed else {
+                    continuation.finish(throwing: MLXCallLock.GPUUnavailable())
+                    return
+                }
+                Memory.cacheLimit = 512 * 1024 * 1024
+                let params = GenerateParameters(
+                    temperature: active == .qwen3 ? 0.2 : 0.9,
+                    topP: active == .qwen3 ? 0.9 : 1.0
+                )
+                let stream: AsyncThrowingStream<AudioGeneration, Error>
+                switch active {
+                case .kokoro:
+                    (model as? KokoroModel)?.speed = speed
+                    stream = model.generateStream(
+                        text: sentence, voice: kokoroVoice, refAudio: nil, refText: nil,
+                        language: nil, generationParameters: params
+                    )
+                case .qwen3:
+                    let lang = qwen3Language == "auto" ? detectQwen3Language(for: sentence) : qwen3Language
+                    stream = model.generateStream(
+                        text: sentence, voice: qwen3Voice, refAudio: nil, refText: nil,
+                        language: lang, generationParameters: params, streamingInterval: 0.32
+                    )
+                }
+                do {
+                    // Never start (or keep feeding) Metal work once the app is
+                    // leaving the foreground — iOS aborts the process for it.
+                    guard MLXCallLock.gpuAllowed else { throw MLXCallLock.GPUUnavailable() }
+                    for try await event in stream {
+                        try Task.checkCancellation()
+                        guard MLXCallLock.gpuAllowed else { throw MLXCallLock.GPUUnavailable() }
+                        if case .audio(let audio) = event {
+                            continuation.yield(audio.asArray(Float.self))
+                        }
+                    }
+                    Memory.clearCache()
+                    continuation.finish()
+                } catch {
+                    Memory.clearCache()
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
+        #else
+        return AsyncThrowingStream { $0.finish(throwing: OnDeviceTTSServiceError.notAvailable) }
+        #endif
     }
 
 }

@@ -140,6 +140,11 @@ final class TextToSpeechService: NSObject {
     private var isUsingKokoro = false
     private var isUsingServer = false
 
+    /// Serial task chain for on-device TTS enqueuing.
+    /// Ensures sentences are added to OnDeviceTTSService in arrival order,
+    /// even though each enqueue() call may need to await a model load.
+    private var enqueueChain: Task<Void, Never>?
+
     // MARK: - Streaming TTS State
 
     /// Character offset of cleaned text already enqueued for TTS.
@@ -346,6 +351,9 @@ final class TextToSpeechService: NSObject {
         // queue pipeline's wait-loop exits cleanly rather than waiting for more text.
         kokoroService.streamingModeActive = false
 
+        // Clear the enqueue chain so the next reply doesn't wait for old tasks.
+        enqueueChain = nil
+
         // Stop on-device TTS
         kokoroService.stop()
         isUsingKokoro = false
@@ -473,6 +481,8 @@ final class TextToSpeechService: NSObject {
         // Stop any active speech without unloading the model
         kokoroService.stop()
         isUsingKokoro = false
+        // Reset the enqueue chain so this reply starts fresh.
+        enqueueChain = nil
 
         stopServerPlayback()
 
@@ -895,6 +905,8 @@ final class TextToSpeechService: NSObject {
     /// Runs setActive(false) on a background thread to avoid main-thread UI stalls.
     private func deactivateAudioSession() {
         Task.detached(priority: .userInitiated) {
+            // A voice call owns the session — never pull it out from under it.
+            guard !CallAudioSession.isCallActive else { return }
             try? AVAudioSession.sharedInstance().setActive(
                 false,
                 options: .notifyOthersOnDeactivation
@@ -908,7 +920,13 @@ final class TextToSpeechService: NSObject {
         switch engine {
         case .kokoro, .qwen3:
             isUsingKokoro = true
-            Task { await kokoroService.enqueue(chunk) }
+            // Chain onto the previous enqueue task so sentences execute serially
+            // and the model-load wait in enqueue() can never reverse their order.
+            let previous = enqueueChain
+            enqueueChain = Task { [weak self] in
+                _ = await previous?.value   // wait for previous sentence to be enqueued
+                await self?.kokoroService.enqueue(chunk)
+            }
         case .server:
             isUsingServer = true
             serverQueue.append(chunk)

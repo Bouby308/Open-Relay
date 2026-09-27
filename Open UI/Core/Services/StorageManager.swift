@@ -165,6 +165,7 @@ final class StorageManager: @unchecked Sendable {
     /// Runs once per device, keyed by `storage.hubCacheMigration.v1`. Safe to call on every
     /// app launch — it's a no-op after the first run.
     func runHubCacheMigrationIfNeeded() {
+        runVADModelMigrationIfNeeded()
         let migrationKey = "storage.hubCacheMigration.v1"
         guard !UserDefaults.standard.bool(forKey: migrationKey) else { return }
 
@@ -188,6 +189,24 @@ final class StorageManager: @unchecked Sendable {
                 } else {
                     self.logger.info("Hub cache migration: nothing to clean")
                 }
+            }
+        }
+    }
+
+    /// One-time cleanup of the old MLX voice-detection models, replaced by the
+    /// Core ML builds in `Documents/Models/coreml-vad/`.
+    private func runVADModelMigrationIfNeeded() {
+        let key = "storage.vadCoreMLMigration.v2"
+        guard !UserDefaults.standard.bool(forKey: key) else { return }
+        Task.detached(priority: .utility) { [self] in
+            let freed = await self.deleteModelDirs(patterns: [
+                "mlx-community_silero-vad", "mlx-community_smart-turn-v3",
+                // Partial downloads left by the first Core ML build.
+                "models--FluidInference--silero-vad-coreml", "models--aufklarer--Smart-Turn-v3.2-CoreML",
+            ])
+            await MainActor.run { UserDefaults.standard.set(true, forKey: key) }
+            if freed > 0 {
+                self.logger.info("Removed old MLX VAD models (\(ByteCountFormatter.string(fromByteCount: freed, countStyle: .file)))")
             }
         }
     }
@@ -631,9 +650,10 @@ final class StorageManager: @unchecked Sendable {
         Int64(diskSize(of: StorageManager.modelCacheDirectory))
     }
 
-    /// Returns the on-disk size of the ASR model files (Qwen3-ASR + legacy Parakeet).
+    /// Returns the on-disk size of the ASR model files (Qwen3-ASR only;
+    /// Parakeet is the voice-call recogniser and is listed separately).
     func asrModelSize() -> Int64 {
-        modelSize(patterns: ["Qwen3-ASR", "parakeet-tdt"])
+        modelSize(patterns: ["Qwen3-ASR"])
     }
 
     /// Returns the on-disk size of the Kokoro TTS model files.
@@ -649,6 +669,26 @@ final class StorageManager: @unchecked Sendable {
     /// Returns the on-disk size of the legacy MarvisTTS model files (if any remain).
     func marvisTTSModelSize() -> Int64 {
         modelSize(patterns: ["marvis-tts", "Marvis-AI", "MarvisTTS"])
+    }
+
+    /// Voice-call Parakeet speech recognition (MLX).
+    func parakeetModelSize() -> Int64 {
+        modelSize(patterns: ["parakeet-tdt"])
+    }
+
+    @discardableResult
+    func deleteParakeetModelFiles() -> Int64 {
+        deleteModelDirs(patterns: ["parakeet-tdt"])
+    }
+
+    /// Voice-call voice detection (Silero VAD + Smart Turn, Core ML).
+    func voiceDetectionModelSize() -> Int64 {
+        modelSize(patterns: ["coreml-vad"])
+    }
+
+    @discardableResult
+    func deleteVoiceDetectionModelFiles() -> Int64 {
+        deleteModelDirs(patterns: ["coreml-vad"])
     }
 
     /// Deletes all downloaded ML model files from Documents/Models.
@@ -696,10 +736,11 @@ final class StorageManager: @unchecked Sendable {
         return freed
     }
 
-    /// Deletes ASR model files (Qwen3-ASR + legacy Parakeet) from Documents/Models.
+    /// Deletes Qwen3 ASR model files from Documents/Models. Parakeet (the
+    /// voice-call recogniser) has its own delete in Models & Storage.
     @discardableResult
     func deleteASRModelFiles() -> Int64 {
-        let freed = deleteModelDirs(patterns: ["Qwen3-ASR", "parakeet-tdt"])
+        let freed = deleteModelDirs(patterns: ["Qwen3-ASR"])
         if freed > 0 {
             logger.info("Deleted ASR model files: \(ByteCountFormatter.string(fromByteCount: freed, countStyle: .file))")
         }

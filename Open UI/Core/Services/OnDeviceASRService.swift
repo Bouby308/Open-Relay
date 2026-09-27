@@ -137,7 +137,10 @@ final class OnDeviceASRService {
     // MARK: - Init
 
     init() {
-        let raw = UserDefaults.standard.string(forKey: "sttEngine") ?? "qwen3asr"
+        // NOTE: uses its own "onDeviceASR.model" key — NOT "sttEngine" (which stores the
+        // device/server STT backend choice for dictation & voice calls). These used to be
+        // conflated, which caused the two features to stomp on each other's preference.
+        let raw = UserDefaults.standard.string(forKey: "onDeviceASR.model") ?? "qwen3asr"
         activeVariant = ASRModelVariant(rawValue: raw) ?? .qwen3ASR
         registerBackgroundTaskHandlerIfNeeded()
     }
@@ -193,7 +196,7 @@ final class OnDeviceASRService {
         guard variant != activeVariant else { return }
         if state != .unloaded { unloadModel() }
         activeVariant = variant
-        UserDefaults.standard.set(variant.rawValue, forKey: "sttEngine")
+        UserDefaults.standard.set(variant.rawValue, forKey: "onDeviceASR.model")
         logger.info("Switched ASR variant to \(variant.displayName)")
     }
 

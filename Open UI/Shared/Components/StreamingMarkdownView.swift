@@ -1,6 +1,7 @@
 import UIKit
 import SwiftUI
 import MarkdownView
+import MarkdownParser
 import Charts
 import Photos
 import os.log
@@ -45,24 +46,8 @@ func openPhotosSettings() {
 
 /// Renders markdown using MarkdownView (UIKit-backed).
 ///
-/// During streaming, a single `MarkdownView` renders the `displayContent` string
-/// which is smoothly drained from the raw server tokens by `StreamingContentStore`.
-/// This gives a typewriter effect — characters flow in at a readable pace rather
-/// than bursting in large chunks.
-///
-/// ## Parse Throttling
-/// During streaming, the underlying MarkdownView (which runs a full CommonMark
-/// parse + CoreText layout pass on every update) is throttled via the MarkdownView
-/// library's built-in `lastHeightMeasureTime` coordinator — updated at most once
-/// per frame (16ms). On top of that, SwiftUI's own coalescing means view updates
-/// are already capped at display refresh rate.
-///
-/// ## Animated Height
-/// The container height is animated with a spring so content grows smoothly
-/// instead of jumping as new lines appear.
-///
-/// When streaming ends, `finalBody` takes over for special block detection
-/// (charts, HTML, Mermaid, SVG, images).
+/// Streaming and completed content use the same segment hierarchy so the
+/// existing text view survives completion.
 struct StreamingMarkdownView: View {
     let content: String
     let isStreaming: Bool
@@ -89,37 +74,11 @@ struct StreamingMarkdownView: View {
     /// Reference-type segment parse cache. Keyed by (content, isStreaming).
     /// A cache miss triggers parseSpecialBlocks(); a hit returns the stored
     /// result in O(1) via Swift COW pointer equality on the content string.
-    ///
-    /// Also caches the opening fence location for `resolveStreamingCodeBlock()`.
-    /// Once the fence is found (Phase 1 or Phase 2 of that function), subsequent
-    /// ticks only scan the *new* suffix for a closing fence — O(delta) instead of
-    /// the previous O(N) × 4 full re-scan on every drain tick.
     private final class SegmentCache {
         // parseSpecialBlocks cache
         var content: String = ""
         var isStreaming: Bool = false
         var segments: [ContentSegment] = []
-
-        // Fence location cache for resolveStreamingCodeBlock fast path.
-        //
-        // `fenceContentStart` is the String.Index of the first character of the
-        // code block body (i.e. the char just after the opening fence's \n).
-        // It is stable for the entire life of an open code block because content
-        // only grows by appending — the fence never moves.
-        //
-        // `fenceBaseByteCount` is the utf8.count of `content` when the fence was
-        // found. On each new tick we verify content.utf8.count > fenceBaseByteCount
-        // (always true for an append) and that content[..<fenceContentStart] still
-        // matches (implicit — Swift indices are stable under appends).
-        var fenceContentStart: String.Index? = nil
-        var fenceBaseByteCount: Int = 0
-        var fenceLanguage: String = ""
-        // true → Phase 1 (html/svg live-preview); false → Phase 2 (generic .streamingCode)
-        var fenceIsLivePreview: Bool = false
-        // Phase 1 only: the makeSeg closure cached so we don't re-allocate the array literal
-        var fenceMakeSegTag: String = ""   // "html" or "svg"
-        // Phase 1 only: text before the opening fence (stable once fence is found)
-        var fenceBeforeText: String = ""
     }
 
 
@@ -131,13 +90,7 @@ struct StreamingMarkdownView: View {
 
     var body: some View {
         unifiedBody
-            // Animate layout changes only when streaming ends (isStreaming flips true→false).
-            // Using a nil animation while streaming prevents keyboard-triggered layout
-            // invalidations (safe-area inset changes when the composer appears) from being
-            // animated — which was causing the assistant message bubble to visibly shrink
-            // and settle whenever the keyboard opened. The animation only fires on the
-            // streaming-end transition so the final height settle is still smooth.
-            .animation(isStreaming ? nil : .easeOut(duration: 0.18), value: isStreaming)
+            .transaction { $0.animation = nil }
             .onAppear {
                 rebuildThemeIfNeeded()
             }
@@ -193,14 +146,6 @@ struct StreamingMarkdownView: View {
             let segments: [ContentSegment] = resolveSegments()
             if segments.isEmpty {
                 EmptyView()
-            } else if !isStreaming, segments.count == 1, case .markdown(let text) = segments[0].kind {
-                // Fast path: plain markdown only — no viz, no ForEach overhead.
-                // Only used when NOT streaming so the container type never changes
-                // mid-stream. If we allowed this during streaming, the view would
-                // swap from bare MarkdownView → VStack{ForEach} the moment a code
-                // fence appears, destroying the prose view for one frame (blank flash).
-                MarkdownView(text, theme: cachedTheme)
-                    .codeAutoScroll(isStreaming)
             } else {
                 VStack(alignment: .leading, spacing: 8) {
                     // Use stable type-based IDs so SwiftUI updates each segment
@@ -303,27 +248,6 @@ struct StreamingMarkdownView: View {
                 return result
             }
 
-            // ── Streaming code-block detection (html / svg) ───────────────────
-            // If the model is mid-way through a ```html or ```svg block (opening
-            // fence seen, closing fence not yet arrived), render a live preview
-            // instead of raw monospace text. This is the streaming analogue of
-            // parseCodeBlocks — it only fires when isStreaming=true and the block
-            // is incomplete. Once the closing ``` arrives, resolveSegments() falls
-            // through to parseSpecialBlocks() which handles the complete block.
-            if let streamingSeg = resolveStreamingCodeBlock(content) {
-                return streamingSeg
-            }
-
-            // No incomplete special block found — but there may be a *complete* block
-            // (opening AND closing fence both arrived) while post-block prose is still
-            // streaming. Use parseSpecialBlocks so HTML/SVG/chart blocks already closed
-            // render as previews instead of flashing to raw code text until streaming ends.
-            //
-            // CACHE: parseSpecialBlocks / parseCodeBlocks is O(N) and was previously
-            // called on every drain tick (~60fps) once a code block's closing fence
-            // arrived. The content string only grows by ~7 chars per tick (maxRatePerFrame),
-            // so consecutive ticks with identical content are pure wasted work.
-            // Cache the result and return it directly on a hit (O(1) COW pointer check).
             return cachedParseSpecialBlocks(content, isStreaming: true)
 
         } else {
@@ -344,171 +268,6 @@ struct StreamingMarkdownView: View {
         segmentCache.isStreaming = isStreaming
         segmentCache.segments = result
         return result
-    }
-
-    /// Detects an incomplete (unclosed) fenced code block in `text` during streaming.
-    ///
-    /// **Priority order:**
-    /// 1. `html` / `svg` → live preview via `HTMLPreviewView` / `SVGPreviewView`
-    /// 2. Any other language → `StreamingCodeBlockView` (O(delta) append + O(viewport) windowed render)
-    ///
-    /// Returns `nil` when no incomplete fenced code block is found, letting the
-    /// caller fall back to plain markdown rendering via `MarkdownView`.
-    ///
-    /// ## Performance
-    /// After the opening fence is located on the first call, the fence position is
-    /// cached in `segmentCache`. Subsequent ticks (where `text` is always an append
-    /// of the previous `text`) skip all four O(N) `range(of:)` scans and only scan
-    /// the *new* suffix for a closing fence — reducing per-tick cost to O(delta).
-    private func resolveStreamingCodeBlock(_ text: String) -> [ContentSegment]? {
-        let textByteCount = text.utf8.count
-
-        // ── FAST PATH: fence already located and text is a streaming append ──
-        // `fenceContentStart` is valid when we previously found an open fence and
-        // the content has only grown (utf8 count is strictly larger than when found).
-        if let cachedStart = segmentCache.fenceContentStart,
-           textByteCount > segmentCache.fenceBaseByteCount {
-            // Only scan the suffix *after* the known fence start for a closing fence.
-            // This is O(delta) — proportional only to newly-appended characters.
-            let afterOpen = text[cachedStart...]
-            if afterOpen.range(of: "\n```") != nil {
-                // Closing fence just arrived — invalidate and fall through to slow path
-                // so parseSpecialBlocks (caller's fallback) handles the complete block.
-                segmentCache.fenceContentStart = nil
-                return nil
-            }
-            // Still open — build result from cached metadata + growing suffix.
-            let partialContent = String(afterOpen)
-            if segmentCache.fenceIsLivePreview {
-                let tag = segmentCache.fenceMakeSegTag
-                let makeSeg: (String) -> ContentSegment = { content in
-                    switch tag {
-                    case "html":    return .html(content, isStreaming: true, index: 0)
-                    case "svg":     return .svg(content, isStreaming: true, index: 0)
-                    case "mermaid": return .mermaid(content, isStreaming: true, index: 0)
-                    default:        return .chart(content, isStreaming: true, index: 0)
-                    }
-                }
-                let before = segmentCache.fenceBeforeText
-                var result: [ContentSegment] = []
-                if !before.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    result.append(.markdown(before, index: 0))
-                }
-                if !partialContent.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    result.append(makeSeg(partialContent))
-                }
-                return result.isEmpty ? nil : result
-            } else {
-                // Phase 2 generic code block
-                let before = segmentCache.fenceBeforeText
-                var result: [ContentSegment] = []
-                if !before.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    result.append(.markdown(before, index: 0))
-                }
-                result.append(.streamingCode(partialContent, language: segmentCache.fenceLanguage, index: 0))
-                return result
-            }
-        }
-
-        // ── SLOW PATH: first call or content replaced — locate fence via full scan ──
-        // Runs at most once per code block (until closing fence arrives).
-
-        // ── Phase 1: Live-preview languages (html/svg/mermaid/chart) ───────
-        let livePreviewCandidates: [(tag: String, langKey: String)] = [
-            ("```html\n",      "html"),
-            ("```svg\n",       "svg"),
-            ("```mermaid\n",   "mermaid"),
-            ("```chart\n",     "chart"),
-            ("```chartjs\n",   "chart"),
-            ("```echarts\n",   "chart"),
-            ("```highcharts\n","chart"),
-            ("```plotly\n",    "chart"),
-            ("```vega-lite\n", "chart"),
-            ("```vegalite\n",  "chart"),
-        ]
-        for (tag, langKey) in livePreviewCandidates {
-            guard let openRange = text.range(of: tag, options: .caseInsensitive) else { continue }
-            let contentStart = openRange.upperBound
-            let afterOpen = text[contentStart...]
-            if afterOpen.range(of: "\n```") != nil { continue }  // complete — skip
-
-            let partialContent = String(afterOpen)
-            let before = String(text[text.startIndex..<openRange.lowerBound])
-
-            // Cache fence location for fast path on next tick.
-            segmentCache.fenceContentStart = contentStart
-            segmentCache.fenceBaseByteCount = textByteCount
-            segmentCache.fenceIsLivePreview = true
-            segmentCache.fenceMakeSegTag = langKey
-            segmentCache.fenceLanguage = langKey
-            segmentCache.fenceBeforeText = before
-
-            let makeSeg: (String) -> ContentSegment = { content in
-                switch langKey {
-                case "html":    return .html(content, isStreaming: true, index: 0)
-                case "svg":     return .svg(content, isStreaming: true, index: 0)
-                case "mermaid": return .mermaid(content, isStreaming: true, index: 0)
-                default:        return .chart(content, isStreaming: true, index: 0)
-                }
-            }
-            var result: [ContentSegment] = []
-            if !before.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                result.append(.markdown(before, index: 0))
-            }
-            if !partialContent.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                result.append(makeSeg(partialContent))
-            }
-            return result.isEmpty ? nil : result
-        }
-
-        // ── Phase 2: Generic unclosed fence → StreamingCodeBlockView ───────
-        guard let fenceStart = text.range(of: "```") else { return nil }
-        let afterTicks = text[fenceStart.upperBound...]
-
-        let language: String
-        let partialContent: String
-
-        if let newlineAfterFence = afterTicks.firstIndex(of: "\n") {
-            language = String(afterTicks[afterTicks.startIndex..<newlineAfterFence])
-                .trimmingCharacters(in: .whitespaces)
-                .lowercased()
-            let contentStart = text.index(after: newlineAfterFence)
-            let afterOpen = text[contentStart...]
-            if afterOpen.range(of: "\n```") != nil { return nil }  // complete block
-            partialContent = String(afterOpen)
-
-            let before = String(text[text.startIndex..<fenceStart.lowerBound])
-
-            // Cache fence location only once the fence line is complete (has \n).
-            // Do NOT cache when the fence line is still arriving — the endIndex of
-            // the partial text would become a mid-string index in the next tick's
-            // longer string, corrupting the language label and first content line.
-            segmentCache.fenceContentStart = contentStart
-            segmentCache.fenceBaseByteCount = textByteCount
-            segmentCache.fenceIsLivePreview = false
-            segmentCache.fenceLanguage = language
-            segmentCache.fenceBeforeText = before
-
-            var result: [ContentSegment] = []
-            if !before.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                result.append(.markdown(before, index: 0))
-            }
-            result.append(.streamingCode(partialContent, language: language, index: 0))
-            return result
-        } else {
-            // Fence line still arriving (e.g. "```python" with no \n yet).
-            // Do NOT cache — the index would be invalid in the next tick's longer string.
-            language = String(afterTicks).trimmingCharacters(in: .whitespaces).lowercased()
-            partialContent = ""
-            let before = String(text[text.startIndex..<fenceStart.lowerBound])
-            var result: [ContentSegment] = []
-            if !before.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                result.append(.markdown(before, index: 0))
-            }
-            // Still emit .streamingCode with empty content to stabilise view identity.
-            result.append(.streamingCode(partialContent, language: language, index: 0))
-            return result
-        }
     }
 
     /// Extracts the text that appears before `@@@VIZ-START` in the content.
@@ -555,8 +314,7 @@ struct StreamingMarkdownView: View {
         switch segment.kind {
         case .markdown(let text):
             if !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                MarkdownView(text, theme: cachedTheme)
-                    .codeAutoScroll(isStreaming)
+                StableStreamingMarkdown(text: text, isStreaming: isStreaming, theme: cachedTheme)
             }
         case .chart(let code, let streaming):
             ChartPreviewView(
@@ -573,22 +331,6 @@ struct StreamingMarkdownView: View {
             SVGPreviewView(code: code, isStreaming: streaming)
         case .python(let code):
             PythonCodeBlockView(code: code)
-        case .streamingCode(let code, let language):
-            StreamingCodeBlockView(
-                language: language,
-                content: code,
-                isStreaming: true,
-                theme: cachedTheme
-            )
-        case .code(let code, let language):
-            // Finalized large code block — rendered via StreamingCodeBlockView(isStreaming:false)
-            // to avoid the O(n) CommonMark parse spike MarkdownView triggers on transition.
-            StreamingCodeBlockView(
-                language: language,
-                content: code,
-                isStreaming: false,
-                theme: cachedTheme
-            )
         case .markdownImage(let imageURL, let altText, let linkURL):
             MarkdownInlineImageView(imageURL: imageURL, altText: altText, linkURL: linkURL)
         case .visualization(let html):
@@ -635,16 +377,6 @@ struct StreamingMarkdownView: View {
             /// `isStreaming` — true while the closing ``` fence has not yet arrived.
             case svg(String, isStreaming: Bool)
             case python(String)
-            /// A code block being actively streamed (unclosed fence). Rendered via
-            /// `StreamingCodeBlockView` which uses O(delta) incremental appends and
-            /// O(viewport) virtual line windowing — bypasses IncrementalStreamingParser
-            /// entirely to avoid O(n²) re-parse lag on large blocks.
-            case streamingCode(String, language: String)
-            /// A finalized (closed fence) large plain code block (>50 lines). Rendered
-            /// via `StreamingCodeBlockView(isStreaming: false)` to bypass the O(n)
-            /// CommonMark full-parse spike ("Frame of Doom") that MarkdownView triggers
-            /// the moment a big code block transitions from streaming → done.
-            case code(String, language: String)
             case markdownImage(imageURL: URL, altText: String, linkURL: URL?)
             case visualization(String)
 
@@ -657,8 +389,6 @@ struct StreamingMarkdownView: View {
                 case .mermaid:       return "mermaid"
                 case .svg:           return "svg"
                 case .python:        return "python"
-                case .streamingCode: return "scode"
-                case .code:          return "code"
                 case .markdownImage: return "img"
                 case .visualization: return "viz"
                 }
@@ -686,12 +416,6 @@ struct StreamingMarkdownView: View {
         }
         static func python(_ code: String, index: Int = 0) -> ContentSegment {
             ContentSegment(id: "python-\(index)", kind: .python(code))
-        }
-        static func streamingCode(_ code: String, language: String, index: Int = 0) -> ContentSegment {
-            ContentSegment(id: "scode-\(index)", kind: .streamingCode(code, language: language))
-        }
-        static func code(_ code: String, language: String, index: Int = 0) -> ContentSegment {
-            ContentSegment(id: "code-\(index)", kind: .code(code, language: language))
         }
         static func markdownImage(imageURL: URL, altText: String, linkURL: URL?, index: Int = 0) -> ContentSegment {
             ContentSegment(id: "img-\(index)", kind: .markdownImage(imageURL: imageURL, altText: altText, linkURL: linkURL))
@@ -945,92 +669,55 @@ struct StreamingMarkdownView: View {
     /// have an info string).
     private func parseCodeBlocks(_ text: String, baseOffset: Int = 0) -> [ContentSegment] {
         guard text.contains("```") else { return [.markdown(text, index: baseOffset)] }
-
-        // Split into lines for fence detection. We work line-by-line so we can
-        // apply the CommonMark closer rules precisely.
         let lines = text.split(separator: "\n", omittingEmptySubsequences: false)
         var segments: [ContentSegment] = []
         var i = 0
-        var proseLinesStart = 0   // first line of the current prose run
+        var proseStart = 0
+
+        func nextIndex(_ prefix: String) -> Int {
+            segments.filter { $0.id.hasPrefix(prefix) }.count + baseOffset
+        }
 
         while i < lines.count {
-            guard let fence = Self.parseFenceLine(lines[i]) else {
-                i += 1
+            guard let fence = Self.parseFenceLine(lines[i]) else { i += 1; continue }
+            let closer = Self.findClosingFence(in: lines, from: i + 1, minTickCount: fence.backtickCount)
+            let codeEnd = closer ?? lines.count
+            let code = lines[(i + 1)..<codeEnd].joined(separator: "\n")
+            let language = fence.info.lowercased()
+            let live = closer == nil && isStreaming
+            let chart = chartLanguageTags.contains(language) &&
+                (looksLikeChartJSON(code) || (live && language != "json"))
+            let html = language == "html" && (live || (code.contains("<") && code.contains(">") && code.count >= 10))
+            let svg = language == "svg" && (live || looksLikeSVG(code))
+            let mermaid = language == "mermaid" && (live || code.trimmingCharacters(in: .whitespacesAndNewlines).count >= 5)
+            let python = !live && pythonLanguageTags.contains(language) &&
+                code.trimmingCharacters(in: .whitespacesAndNewlines).count >= 2
+            guard (closer != nil || live), chart || html || svg || mermaid || python else {
+                // Ordinary fences remain in ONE Markdown document, whether open
+                // or closed. Closing a fence must not move code to a new parent.
+                i = codeEnd + 1
                 continue
             }
-            // lines[i] is a fence opener. Find its matching closer.
-            let openerTickCount = fence.backtickCount
-            let lang = fence.info.lowercased()
-
-            guard let closerIdx = Self.findClosingFence(in: lines, from: i + 1, minTickCount: openerTickCount) else {
-                // No matching closer found — unclosed block (or streaming). Treat
-                // everything from here to end as plain markdown (MarkdownView handles it).
-                i += 1
-                continue
-            }
-
-            // Flush preceding prose lines as a .markdown segment.
-            if proseLinesStart < i {
-                let proseText = lines[proseLinesStart..<i].joined(separator: "\n")
-                if !proseText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    let mdIdx = baseOffset + segments.filter { if case .markdown = $0.kind { return true }; return false }.count
-                    segments.append(.markdown(proseText, index: mdIdx))
+            if proseStart < i {
+                let prose = lines[proseStart..<i].joined(separator: "\n")
+                if !prose.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    segments.append(.markdown(prose, index: nextIndex("md-")))
                 }
             }
-
-            // Extract code content (lines between opener and closer).
-            let codeContent = lines[(i + 1)..<closerIdx].joined(separator: "\n")
-
-            // Determine segment type based on language tag.
-            let isChart = chartLanguageTags.contains(lang) && looksLikeChartJSON(codeContent)
-            let isHTML = lang == "html" && codeContent.contains("<") && codeContent.contains(">") && codeContent.count >= 10
-            let isMermaid = lang == "mermaid" && codeContent.trimmingCharacters(in: .whitespacesAndNewlines).count >= 5
-            let isSVG = lang == "svg" && looksLikeSVG(codeContent)
-            let isPython = pythonLanguageTags.contains(lang) && codeContent.trimmingCharacters(in: .whitespacesAndNewlines).count >= 2
-
-            // Per-type index for stable segment identity within this parse.
-            let typeIdx = baseOffset + segments.count
-            if isChart {
-                segments.append(.chart(codeContent, isStreaming: false, index: typeIdx))
-            } else if isMermaid {
-                segments.append(.mermaid(codeContent, isStreaming: false, index: typeIdx))
-            } else if isSVG {
-                segments.append(.svg(codeContent, isStreaming: false, index: typeIdx))
-            } else if isPython {
-                segments.append(.python(codeContent, index: typeIdx))
-            } else if isHTML {
-                segments.append(.html(codeContent, isStreaming: false, index: typeIdx))
-            } else {
-                // Plain code block. For large blocks (>50 lines) use StreamingCodeBlockView
-                // with isStreaming:false to avoid the O(n) CommonMark full-parse spike
-                // ("Frame of Doom") that MarkdownView triggers on the streaming→done transition.
-                let lineCount = codeContent.components(separatedBy: "\n").count
-                if lineCount > 50 {
-                    segments.append(.code(codeContent, language: lang, index: typeIdx))
-                } else {
-                    // Small block — reconstruct fenced markdown so MarkdownView renders it
-                    // with syntax highlighting. Any literal ``` inside the code content
-                    // (e.g. from nested blocks) are preserved as-is.
-                    let fenceStr = String(repeating: "`", count: openerTickCount)
-                    let fencedBlock = "\(fenceStr)\(lang)\n\(codeContent)\n\(fenceStr)"
-                    let mdIdx = baseOffset + segments.filter { if case .markdown = $0.kind { return true }; return false }.count
-                    segments.append(.markdown(fencedBlock, index: mdIdx))
-                }
-            }
-
-            i = closerIdx + 1
-            proseLinesStart = i
+            if chart { segments.append(.chart(code, isStreaming: live, index: nextIndex("chart-"))) }
+            else if html { segments.append(.html(code, isStreaming: live, index: nextIndex("html-"))) }
+            else if svg { segments.append(.svg(code, isStreaming: live, index: nextIndex("svg-"))) }
+            else if mermaid { segments.append(.mermaid(code, isStreaming: live, index: nextIndex("mermaid-"))) }
+            else { segments.append(.python(code, index: nextIndex("python-"))) }
+            i = codeEnd + 1
+            proseStart = i
         }
-
-        // Flush any trailing prose after the last code block.
-        if proseLinesStart < lines.count {
-            let trailingText = lines[proseLinesStart...].joined(separator: "\n")
-            if !trailingText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                let mdIdx = baseOffset + segments.filter { if case .markdown = $0.kind { return true }; return false }.count
-                segments.append(.markdown(trailingText, index: mdIdx))
+        if proseStart < lines.count {
+            let prose = lines[proseStart...].joined(separator: "\n")
+            if !prose.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                segments.append(.markdown(prose, index: nextIndex("md-")))
             }
         }
-
         return segments.isEmpty ? [.markdown(text, index: baseOffset)] : segments
     }
 
@@ -1583,4 +1270,320 @@ struct MarkdownWithLoading: View {
         .padding()
     }
     .themed()
+}
+
+/// Keeps the same parsed-chunk views during streaming and completion. Parsing a
+/// complete Markdown document preserves container context (lists, fences, links);
+/// only changed chunks receive new render objects.
+private struct StableStreamingMarkdown: View {
+    let text: String
+    let isStreaming: Bool
+    let theme: MarkdownTheme
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var reveal = StreamingTextReveal()
+    @State private var parser = StreamingMarkdownParser()
+
+    private struct Request: Equatable {
+        let text: String
+        let isStreaming: Bool
+        let theme: MarkdownTheme
+        let reduceMotion: Bool
+    }
+
+    var body: some View {
+        let request = Request(text: text, isStreaming: isStreaming, theme: theme, reduceMotion: reduceMotion)
+        let cached = isStreaming ? nil : MarkdownBlockRenderCache.shared.lookup(content: text, theme: theme)
+        Group {
+            if let visible = reveal.chunks ?? cached {
+                VStack(alignment: .leading, spacing: 0) {
+                    ForEach(visible.indices, id: \.self) { index in
+                        if visible[index].blocks.count == 1,
+                           case let .codeBlock(language, content) = visible[index].blocks[0] {
+                            // cmark adds a terminal newline even to partial lines.
+                            // Omit it so the native code view can append new tokens.
+                            let code = content.hasSuffix("\n") ? String(content.dropLast()) : content
+                            StreamingCodeBlockView(language: language ?? "", content: code,
+                                                   isStreaming: isStreaming || reveal.isAnimating, theme: theme)
+                        } else {
+                            MarkdownView(visible[index], theme: theme)
+                                .codeAutoScroll(isStreaming || reveal.isAnimating)
+                        }
+                    }
+                }
+            } else {
+                Color.clear
+                    .frame(height: isStreaming ? 0 : CGFloat(max(1, text.count / 55)) * theme.fonts.body.lineHeight)
+                    .accessibilityHidden(true)
+            }
+        }
+        .onDisappear { reveal.finish() }
+        .task(id: request) {
+            if let cached {
+                reveal.receive(cached, source: text, streaming: isStreaming, reduceMotion: reduceMotion)
+                return
+            }
+            if isStreaming || reveal.chunks != nil {
+                // The actor serializes parses; cancelled, superseded requests
+                // are skipped before parsing. No shared mutable detached parser.
+                let parsed = await parser.parse(text)
+                guard !Task.isCancelled else { return }
+                reveal.receive(parsed, source: text, streaming: isStreaming, reduceMotion: reduceMotion)
+            }
+            if !isStreaming {
+                // Reuse the existing finished-message cache, including its math
+                // rendering. Keep the visible text while that work completes.
+                let finished = await withCheckedContinuation { continuation in
+                    MarkdownBlockRenderCache.shared.build(content: text, theme: theme) {
+                        continuation.resume(returning: $0)
+                    }
+                }
+                guard !Task.isCancelled else { return }
+                reveal.receive(finished, source: text, streaming: false, reduceMotion: reduceMotion)
+            }
+        }
+    }
+}
+
+/// Animation changes only a prefix of the already-parsed active chunk. Completed
+/// chunks keep their render objects; Markdown parsing is driven by server updates,
+/// never by the display clock. Non-text attachments are revealed atomically.
+@MainActor @Observable
+final class StreamingTextReveal {
+    private var target: [MarkdownView.PreprocessedContent]?
+    @ObservationIgnored private var lengths: [Int] = []
+    private let progress = StreamingTypewriter()
+    var isAnimating: Bool { progress.isAnimating }
+
+    var chunks: [MarkdownView.PreprocessedContent]? {
+        guard let target else { return nil }
+        var remaining = progress.visibleCount
+        var visible: [MarkdownView.PreprocessedContent] = []
+        for (index, chunk) in target.enumerated() {
+            if remaining >= lengths[index] {
+                visible.append(chunk)
+                remaining -= lengths[index]
+            } else {
+                if remaining > 0 {
+                    visible.append(.init(blocks: RevealPrefix.blocks(chunk.blocks, budget: &remaining),
+                                         rendered: chunk.rendered, highlightMaps: chunk.highlightMaps))
+                }
+                break
+            }
+        }
+        return visible
+    }
+
+    func receive(_ next: [MarkdownView.PreprocessedContent], source: String,
+                 streaming: Bool, reduceMotion: Bool = false) {
+        let previous = target ?? []
+        lengths = next.enumerated().map { index, chunk in
+            index < previous.count && previous[index] === chunk
+                ? lengths[index] : chunk.blocks.reduce(0) { $0 + RevealPrefix.length($1) }
+        }
+        target = next
+        progress.receive(source, count: lengths.reduce(0, +), streaming: streaming, reduceMotion: reduceMotion)
+    }
+
+    func advance(by seconds: Double) { progress.advance(by: seconds) }
+    func finish() { progress.finish() }
+}
+
+/// Both formatted answers and plain reasoning use this clock. Learn the input
+/// cadence instead of emptying every packet at a fixed minimum typing speed.
+@MainActor @Observable
+final class StreamingTypewriter {
+    private(set) var visibleCount = 0
+    private(set) var hasStreamed = false
+    @ObservationIgnored private var source = ""
+    @ObservationIgnored private var shown = 0.0
+    @ObservationIgnored private var total = 0
+    @ObservationIgnored private var speed = 90.0
+    @ObservationIgnored private var desiredSpeed = 90.0
+    @ObservationIgnored private var arrivalRate = 90.0
+    @ObservationIgnored private var lastArrival: Double?
+    @ObservationIgnored private var meanInterval = 0.0
+    @ObservationIgnored private var meanSize = 0.0
+    @ObservationIgnored private var arrivalSamples = 0
+    @ObservationIgnored private var link: CADisplayLink?
+    var isAnimating: Bool { visibleCount < total }
+
+    deinit { link?.invalidate() }
+
+    func receive(_ source: String, count: Int, streaming: Bool, reduceMotion: Bool = false,
+                 now: Double = ProcessInfo.processInfo.systemUptime) {
+        let append = source.hasPrefix(self.source)
+        let added = count - total
+        total = count
+        self.source = source
+        hasStreamed = hasStreamed || streaming
+        guard hasStreamed, !reduceMotion, append else {
+            lastArrival = nil; meanInterval = 0; meanSize = 0
+            arrivalSamples = 0
+            arrivalRate = 90; speed = 90; desiredSpeed = 90
+            finish()
+            return
+        }
+        if added > 0 {
+            if let lastArrival {
+                let interval = now - lastArrival
+                // A network outage is not a new typing speed. Average packet
+                // sizes and intervals separately so clustered packets do not
+                // inflate the estimate as averages of instantaneous rates do.
+                if interval > 0, interval < 1.5 {
+                    // Average the first few samples before using a fixed EWMA weight.
+                    arrivalSamples += 1
+                    let weight = max(0.3, 1 / Double(arrivalSamples))
+                    meanInterval += (interval - meanInterval) * weight
+                    meanSize += (Double(added) - meanSize) * weight
+                    arrivalRate = meanSize / meanInterval
+                }
+            }
+            lastArrival = now
+        }
+        shown = min(shown, Double(total))
+        // No startup wait and no fixed character reserve.
+        // Already character-paced input needs no additional animation clock.
+        if link == nil, Double(total) - shown <= 1 { shown = Double(total) }
+        else if shown == 0, total > 0 { shown = 1 }
+        let horizon = max(0.5, min(1, meanInterval * 1.25))
+        desiredSpeed = max(arrivalRate, (Double(total) - shown) / horizon)
+        if link == nil { speed = arrivalRate }
+        visibleCount = Int(shown)
+        if shown >= Double(total) { finish() }
+        else if link == nil {
+            let clock = Clock(self)
+            let displayLink = CADisplayLink(target: clock, selector: #selector(Clock.tick(_:)))
+            displayLink.preferredFrameRateRange = CAFrameRateRange(minimum: 30, maximum: 60, preferred: 60)
+            displayLink.add(to: .main, forMode: .common)
+            link = displayLink
+        }
+    }
+
+    func advance(by seconds: Double) {
+        guard seconds > 0, seconds.isFinite, shown < Double(total) else { return }
+        // Ease rate changes rather than visibly accelerating at each packet.
+        // Keep the catch-up target until the next input; recalculating it from
+        // the shrinking remainder every frame produces a long exponential tail.
+        speed += (desiredSpeed - speed) * (1 - exp(-seconds / 0.08))
+        shown = min(Double(total), shown + speed * seconds)
+        visibleCount = Int(shown)
+        if shown >= Double(total) { finish() }
+    }
+
+    func finish() {
+        shown = Double(total)
+        visibleCount = total
+        speed = arrivalRate
+        link?.invalidate()
+        link = nil
+    }
+
+    @MainActor private final class Clock: NSObject {
+        weak var owner: StreamingTypewriter?
+        private var previous: CFTimeInterval?
+        init(_ owner: StreamingTypewriter) { self.owner = owner }
+        @objc func tick(_ link: CADisplayLink) {
+            let elapsed = previous.map { link.timestamp - $0 } ?? (link.targetTimestamp - link.timestamp)
+            previous = link.timestamp
+            owner?.advance(by: elapsed)
+        }
+    }
+}
+
+/// Prefixes formatted nodes, not Markdown source: a closing fence or emphasis
+/// delimiter cannot disappear merely because the animation has not reached it.
+enum RevealPrefix {
+    static func length(_ node: MarkdownBlockNode) -> Int {
+        switch node {
+        case let .paragraph(content), let .heading(_, content): return inlineLength(content)
+        case let .codeBlock(_, content): return content.count
+        case let .blockquote(children), let .callout(_, children): return children.reduce(0) { $0 + length($1) }
+        case let .bulletedList(_, items), let .numberedList(_, _, items):
+            return items.reduce(0) { $0 + $1.children.reduce(0) { $0 + length($1) } }
+        case let .taskList(_, items):
+            return items.reduce(0) { $0 + $1.children.reduce(0) { $0 + length($1) } }
+        case .table, .thematicBreak: return 1
+        }
+    }
+
+    private static func inlineLength(_ nodes: [MarkdownInlineNode]) -> Int {
+        nodes.reduce(0) { result, node in
+            switch node {
+            case let .text(text), let .code(text), let .html(text): return result + text.count
+            case .emphasis, .strong, .strikethrough, .link: return result + inlineLength(node.children)
+            case .softBreak, .lineBreak, .image, .math: return result + 1
+            }
+        }
+    }
+
+    static func blocks(_ nodes: [MarkdownBlockNode], budget: inout Int) -> [MarkdownBlockNode] {
+        var result: [MarkdownBlockNode] = []
+        for node in nodes {
+            let count = length(node)
+            if budget >= count { result.append(node); budget -= count; continue }
+            guard budget > 0 else { break }
+            switch node {
+            case let .paragraph(content): result.append(.paragraph(content: inlines(content, budget: &budget)))
+            case let .heading(level, content): result.append(.heading(level: level, content: inlines(content, budget: &budget)))
+            case let .codeBlock(info, content):
+                result.append(.codeBlock(fenceInfo: info, content: String(content.prefix(budget)))); budget = 0
+            case let .blockquote(children): result.append(.blockquote(children: blocks(children, budget: &budget)))
+            case let .callout(kind, children): result.append(.callout(kind: kind, children: blocks(children, budget: &budget)))
+            case let .bulletedList(tight, items):
+                result.append(.bulletedList(isTight: tight, items: list(items, budget: &budget)))
+            case let .numberedList(tight, start, items):
+                result.append(.numberedList(isTight: tight, start: start, items: list(items, budget: &budget)))
+            case let .taskList(tight, items):
+                var visible: [RawTaskListItem] = []
+                for item in items where budget > 0 {
+                    visible.append(.init(isCompleted: item.isCompleted, children: blocks(item.children, budget: &budget)))
+                }
+                result.append(.taskList(isTight: tight, items: visible))
+            case .table, .thematicBreak: break // Atomic nodes were handled above.
+            }
+        }
+        return result
+    }
+
+    private static func list(_ items: [RawListItem], budget: inout Int) -> [RawListItem] {
+        var result: [RawListItem] = []
+        for item in items where budget > 0 { result.append(.init(children: blocks(item.children, budget: &budget))) }
+        return result
+    }
+
+    private static func inlines(_ nodes: [MarkdownInlineNode], budget: inout Int) -> [MarkdownInlineNode] {
+        var result: [MarkdownInlineNode] = []
+        for var node in nodes {
+            let count = inlineLength([node])
+            if budget >= count { result.append(node); budget -= count; continue }
+            guard budget > 0 else { break }
+            switch node {
+            case let .text(text): node = .text(String(text.prefix(budget))); budget = 0
+            case let .code(text): node = .code(String(text.prefix(budget))); budget = 0
+            case let .html(text): node = .html(String(text.prefix(budget))); budget = 0
+            case .emphasis, .strong, .strikethrough, .link: node.children = inlines(node.children, budget: &budget)
+            case .softBreak, .lineBreak, .image, .math: break
+            }
+            result.append(node)
+        }
+        return result
+    }
+}
+
+actor StreamingMarkdownParser {
+    private var chunks: [MarkdownView.PreprocessedContent] = []
+
+    func parse(_ text: String) -> [MarkdownView.PreprocessedContent] {
+        guard !Task.isCancelled else { return chunks }
+        let result = MarkdownParser().parse(text)
+        let next = MarkdownView.PreprocessedContent(parserResultNoMath: result).split()
+        guard !Task.isCancelled else { return chunks }
+        chunks = next.enumerated().map { index, chunk in
+            if index < chunks.count, chunks[index].blocks == chunk.blocks {
+                return chunks[index]
+            }
+            return chunk
+        }
+        return chunks
+    }
 }

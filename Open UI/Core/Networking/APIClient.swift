@@ -251,7 +251,13 @@ final class APIClient: @unchecked Sendable {
     }
 
     func getBackendConfig() async throws -> BackendConfig {
-        let (data, _) = try await network.requestRaw(path: "/api/config", authenticated: false)
+        // Send the auth token when one is available so the server returns the full
+        // config including `default_prompt_suggestions` (which Open WebUI only
+        // includes when it can identify the caller as an admin or regular user).
+        // `requestRaw(authenticated: true)` only adds the Bearer header when a token
+        // is already stored — unauthenticated callers (pre-login screens) are
+        // unaffected because no token is present at that point.
+        let (data, _) = try await network.requestRaw(path: "/api/config", authenticated: true)
         do {
             let config = try JSONDecoder().decode(BackendConfig.self, from: data)
             return config
@@ -1878,13 +1884,17 @@ final class APIClient: @unchecked Sendable {
 
     // MARK: - Audio
 
-    func transcribeSpeech(audioData: Data, fileName: String) async throws -> [String: Any] {
+    func transcribeSpeech(audioData: Data, fileName: String, authorization: String? = nil,
+                          timeout: TimeInterval? = nil) async throws -> [String: Any] {
         let mime = mimeType(for: fileName)
         return try await network.uploadMultipart(
             path: "/api/v1/audio/transcriptions",
             fileData: audioData,
             fileName: fileName,
-            mimeType: mime
+            mimeType: mime,
+            timeout: timeout,
+            authorization: authorization,
+            resourceTimeout: timeout.map { $0 + 60 }
         )
     }
 

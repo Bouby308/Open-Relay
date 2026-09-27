@@ -61,6 +61,14 @@ private final class PumpRef {
     /// without waiting for a SwiftUI @State propagation cycle. This eliminates the race where
     /// the geometry callback reads a stale isFingerDriving (@State) value at the start of a touch.
     var isFingerScrolling: Bool = false
+    /// Scroll distance accumulated in the current direction for nav-bar hide/show
+    /// (positive = scrolling down through content, negative = scrolling up). Reset on
+    /// direction reversal and after each toggle so tiny jitter never flips the bar.
+    var navBarTravel: CGFloat = 0
+    /// Brief lockout after each nav-bar toggle: collapsing/expanding the top bar changes
+    /// the safe-area inset, which shifts the scroll offset once — that layout shift must
+    /// not be read as user travel and bounce the bar straight back.
+    var navBarCooldownUntil: Date = .distantPast
 }
 
 // MARK: - Chat Detail View
@@ -143,6 +151,8 @@ struct ChatDetailView: View {
     @AppStorage("chatScrollControls") private var chatScrollControls: ChatScrollControls = .upDown
     @AppStorage("transparentChatToolbar") private var transparentChatToolbar = false
     @AppStorage("suggestionsEnabled") private var suggestionsEnabled = true
+    @AppStorage("showNewChatSuggestions") private var showNewChatSuggestions = true
+    @AppStorage("showVoiceModeButton") private var showVoiceModeButton = true
     @AppStorage(MessageActionPreferences.orderKey) private var messageActionOrder = ""
     @AppStorage(MessageActionPreferences.hiddenKey) private var hiddenMessageActions = ""
     @AppStorage(MessageActionPreferences.shortcutsKey) private var shortcutMessageActions = ""
@@ -220,9 +230,6 @@ struct ChatDetailView: View {
 
     // MARK: Chat menu actions
     @State private var showDeleteChatConfirm = false
-
-    // MARK: Dictation
-    @State private var isDictating = false
 
     // MARK: Keyboard
     @State private var keyboard = KeyboardTracker()
@@ -395,7 +402,8 @@ struct ChatDetailView: View {
 
     // MARK: - Body
 
-    var body: some View {
+    /// Split from `body` so the type checker handles the long modifier chain reliably.
+    @ViewBuilder private var chatContentWithLifecycle: some View {
         @Bindable var vm = viewModel
 
         ZStack {
@@ -421,6 +429,7 @@ struct ChatDetailView: View {
             }
 
             messageListArea
+                .onChange(of: dictationContext) { _, _ in bindDictation() }
 
             // Animated photo picker — legacy inline fallback used only when
             // the parent view has NOT set photoPickerRequestAction (e.g. in
@@ -527,9 +536,8 @@ struct ChatDetailView: View {
                         Color.clear
                             // Keep the glass rim outside the visible status-area band.
                             .glassEffect(.clear, in: Rectangle().inset(by: -geometry.safeAreaInsets.top))
-                            .overlay(theme.background.opacity(theme.isDark ? 0.7 : 0.15))
                             .mask(LinearGradient(stops: [
-                                .init(color: .black, location: 0.8),
+                                .init(color: .black, location: 0.35),
                                 .init(color: .clear, location: 1)
                             ], startPoint: .top, endPoint: .bottom))
                     } else {
@@ -589,6 +597,7 @@ struct ChatDetailView: View {
             withTransaction(\.animation, nil) { randomPrompts = updated }
         }
         .onAppear {
+            bindDictation()
             viewModel.syncOnEntry()
             // Lock in the background URL on first appear so it survives folder refreshes
             // that return a flat list without meta data.
@@ -672,6 +681,10 @@ struct ChatDetailView: View {
                 ttsGeneratingMessageId = nil
             }
         }
+    }
+
+    var body: some View {
+        chatContentWithLifecycle
         // Toasts & banners
         .overlay(alignment: .top) {
             if showCopiedToast { copiedToastView }
@@ -751,7 +764,7 @@ struct ChatDetailView: View {
         }
         // Assistant inline edit sheet — shown when the user taps the pencil icon
         // on an assistant message. Allows editing content in-place (no regeneration).
-        .sheet(isPresented: Binding(
+        .sheet(isPresented: Binding<Bool>(
             get: { editingAssistantMessageId != nil },
             set: { if !$0 { cancelAssistantEdit() } }
         )) {
@@ -1455,7 +1468,7 @@ struct ChatDetailView: View {
                 onCameraCapture: { showCameraPicker = true },
                 onWebAttachment: { showWebURLAlert = true },
                 // Voice call — gated by permissions.chat.call
-                onVoiceInput: dependencies.authViewModel.chatPermissions.call ? { toggleVoiceInput() } : nil,
+                onVoiceInput: showVoiceModeButton && dependencies.authViewModel.chatPermissions.call ? { toggleVoiceInput() } : nil,
                 apiClient: dependencies.apiClient,
                 notesManager: dependencies.notesManager,
                 conversationManager: dependencies.conversationManager,
@@ -1469,8 +1482,7 @@ struct ChatDetailView: View {
                 onDictationStart: dependencies.authViewModel.chatPermissions.stt ? { startDictation() } : nil,
                 onDictationStop: { stopDictation() },
                 onDictationCancel: { cancelDictation() },
-                isDictating: isDictating,
-                dictationService: dependencies.dictationService,
+                dictationService: dependencies.dictationService.context == dictationContext ? dependencies.dictationService : nil,
                 onToolsSheetPresented: {
                     Task { await viewModel.loadTools() }
                     viewModel.loadSkills()
@@ -2066,38 +2078,44 @@ struct ChatDetailView: View {
             // All other cases (layout reflows, programmatic scrolls, WKWebView resizes)
             // emit .animating/.idle → isUserDriving is false → no state change.
 
-            // ── Nav bar direction-based hide/show ──
-            // Uses isFingerDriving (NOT isUserDriving) so that:
-            //   • Inertia deceleration and bounce recovery (.decelerating phase) NEVER
-            //     trigger nav-bar changes — that was the primary source of bottom-edge jitter.
-            //   • Only actual finger-contact scrolls (.interacting phase) hide/show the bar.
+            // ── Nav bar hide/show (accumulated-distance, iOS-style) ──
+            // User-driven motion (finger drag AND the coast after a flick — isUserDriving
+            // stays true through .decelerating) hides the bar after ~24pt of downward
+            // travel and shows it after ~24pt of upward travel. Travel resets on direction
+            // reversal, so a quick flick responds immediately and sub-pixel jitter never
+            // flips the bar. Programmatic scrolls (streaming pump, FAB jumps, window
+            // expansion) never set isUserDriving, so they never move the bar — which also
+            // makes it safe to respond while a reply is streaming.
             //
-            // Nav-bar baseline is only updated when NOT bouncing.
-            // During a bottom overscroll the offset oscillates around maxScrollOffset —
-            // freezing the baseline during bounce keeps the delta near zero, so the
-            // nav bar stays completely still during overscroll recovery.
+            // Baseline is frozen during rubber-band bounce so overscroll recovery at
+            // either edge never moves the bar.
             if !isBouncing {
-                let navSuppressed = Date() < _pumpRef.programmaticScrollUntil
                 let navDelta = newOffset.y - _pumpRef.lastNavBarOffsetY
                 _pumpRef.lastNavBarOffsetY = newOffset.y
 
-                // Only respond to genuine finger-contact drags, not inertia or streaming pump.
-                // Use _pumpRef.isFingerScrolling (not @State isFingerDriving) so we read
-                // the value immediately — @State has a 1-2 frame propagation delay that
-                // causes the first geometry callback of a new touch to see a stale false.
-                if !navSuppressed && _pumpRef.isFingerScrolling && !viewModel.isStreaming {
-                    if distanceFromBottom > 80 {
-                        if navDelta > 1 && !navBarHidden {
-                            withAnimation(.easeOut(duration: 0.25)) { navBarHidden = true }
-                        } else if navDelta < -1 && navBarHidden {
-                            withAnimation(.easeOut(duration: 0.25)) { navBarHidden = false }
-                        }
-                    } else {
-                        // Near/at bottom with finger scrolling upward — show bar
-                        if navDelta < -1 && navBarHidden {
-                            withAnimation(.easeOut(duration: 0.25)) { navBarHidden = false }
-                        }
+                let userDriven = isUserDriving || _pumpRef.isFingerScrolling
+                let inCooldown = Date() < _pumpRef.navBarCooldownUntil
+                if inCooldown {
+                    _pumpRef.navBarTravel = 0
+                } else if userDriven && abs(navDelta) > 0.5 {
+                    // Reset travel when the scroll direction reverses.
+                    if (navDelta > 0) != (_pumpRef.navBarTravel > 0) {
+                        _pumpRef.navBarTravel = 0
                     }
+                    _pumpRef.navBarTravel += navDelta
+
+                    let threshold: CGFloat = 24
+                    if _pumpRef.navBarTravel > threshold && !navBarHidden && !isAtTop {
+                        _pumpRef.navBarTravel = 0
+                        _pumpRef.navBarCooldownUntil = Date().addingTimeInterval(0.3)
+                        withAnimation(.easeOut(duration: 0.25)) { navBarHidden = true }
+                    } else if _pumpRef.navBarTravel < -threshold && navBarHidden {
+                        _pumpRef.navBarTravel = 0
+                        _pumpRef.navBarCooldownUntil = Date().addingTimeInterval(0.3)
+                        withAnimation(.easeOut(duration: 0.25)) { navBarHidden = false }
+                    }
+                } else if !userDriven {
+                    _pumpRef.navBarTravel = 0
                 }
             }
 
@@ -3165,11 +3183,11 @@ struct ChatDetailView: View {
                 }
 
                 // ── Suggested prompt cards ──
-                // Only shown when the server has configured suggestions.
+                // Only shown when enabled locally and the server has configured suggestions.
                 // If the admin clears all suggestions (or the server doesn't
                 // return any), this entire block is hidden and the welcome
                 // screen shows only the hero avatar + "How can I help?".
-                if !randomPrompts.isEmpty {
+                if showNewChatSuggestions && !randomPrompts.isEmpty {
                     Spacer().frame(height: 32)
 
                     // Adaptive grid: 2-col iPhone, 4-col iPad
@@ -4726,6 +4744,9 @@ struct ChatDetailView: View {
     }
 
     private func handleDisappear() {
+        if dependencies.dictationService.context == dictationContext {
+            dependencies.dictationService.unbind()
+        }
         keyboard.stop()
         // Stop TTS playback and clear state when navigating away from chat
         if speakingMessageId != nil || ttsGeneratingMessageId != nil {
@@ -4738,31 +4759,49 @@ struct ChatDetailView: View {
 
     // MARK: - Dictation
 
-    private func startDictation() {
+    /// Identity for dictation recovery: server + account + conversation (nil for a new chat).
+    private var dictationContext: DictationContext? {
+        guard let server = dependencies.serverConfigStore.activeServer,
+              let user = dependencies.authViewModel.currentUser,
+              dependencies.authViewModel.phase == .authenticated else { return nil }
+        if let selected = dependencies.serverConfigStore.activeAccount, selected.userId != user.id { return nil }
+        return DictationContext(server: server.url, account: user.id,
+                                conversation: viewModel.conversationId ?? viewModel.conversation?.id)
+    }
+
+    /// Binds the shared dictation service to this chat's draft, restoring any saved recording.
+    private func bindDictation() {
         let service = dependencies.dictationService
-        service.onTranscriptReady = { [weak viewModel] text in
-            guard let vm = viewModel else { return }
-            if vm.inputText.isEmpty {
-                vm.inputText = text
-            } else {
-                vm.inputText += " " + text
-            }
+        guard let context = dictationContext else { service.unbind(); return }
+        do { try viewModel.restoreDictationDraft(for: context) }
+        catch {
+            service.unbind()
+            viewModel.errorMessage = "Could not restore the dictation draft. " + error.localizedDescription
+            return
         }
-        service.onError = { _ in
-            Task { @MainActor in isDictating = false }
+        service.onError = { [weak viewModel, weak service] message in
+            if service?.showsRecovery != true { viewModel?.errorMessage = message }
         }
-        isDictating = true
+        // Silence auto-stop ends recording and starts transcription inside the
+        // service; the overlay follows the service state, so nothing else to do.
+        service.onAutoStopped = nil
+        service.bind(to: context, isCurrent: { dictationContext == context },
+                     draft: { [weak viewModel] in viewModel?.inputText },
+                     deliver: { [weak viewModel] text in viewModel?.inputText = text })
+    }
+
+    private func startDictation() {
+        bindDictation()
+        let service = dependencies.dictationService
         Task { await service.startDictation() }
     }
 
     private func stopDictation() {
         dependencies.dictationService.stopDictation()
-        isDictating = false
     }
 
     private func cancelDictation() {
         dependencies.dictationService.cancelDictation()
-        isDictating = false
     }
 
     private func toggleVoiceInput() {
@@ -5737,99 +5776,17 @@ private struct IsolatedAssistantMessage: View {
             }
             .frame(minHeight: 44)
         } else {
-            // ── Unified stable render path ────────────────────────────────────
-            //
-            // AssistantMessageContent is ALWAYS child-0 of the outer VStack.
-            // This gives it a stable SwiftUI view identity across every render
-            // mode — streaming split, pure-prose split, and the final merged
-            // state — so SwiftUI diffs the content in place rather than tearing
-            // down the subtree when streaming ends.  The previous 3-way
-            // if/else-if/else produced different top-level view types (VStack vs
-            // bare AssistantMessageContent), causing a one-frame blank flash and
-            // a height re-rounding that nudged the scroll position.
-            //
-            // Split-render modes: use frozenBoundary or pureFrozenProse as the
-            // primary content (stable prefix, ParseCache hits every frame) and
-            // append the tiny live tail as a transient second child.  When
-            // streaming ends both useSplit* flags go false, the tail child is
-            // simply removed, and child-0's content transitions to the full
-            // displayContent — a pure prop update with no structural change.
-
-            // useSplitTool: frozen tool/reasoning prefix + live tail.
-            let useSplitTool = isActivelyStreaming && streamingStore.frozenBoundary > 0
-            // useSplitProse: pure-prose frozen prefix + live prose tail.
-            let useSplitProse = isActivelyStreaming && !streamingStore.pureFrozenProse.isEmpty
-
-            // Primary content: stable frozen prefix during streaming, full
-            // displayContent otherwise.  Always fed to AssistantMessageContent.
-            let primaryContent: String = {
-                if useSplitTool  { return streamingStore.frozenContent }
-                if useSplitProse { return streamingStore.pureFrozenProse }
-                return displayContent
-            }()
-            // Primary is never marked streaming — the live tail carries that role.
-            // For short / non-split messages the regular effectiveIsStreaming applies.
-            let primaryIsStreaming = !(useSplitTool || useSplitProse) && effectiveIsStreaming
-
             if renderAssistantMarkdown {
-                VStack(alignment: .leading, spacing: 0) {
-                    AssistantMessageContent(
-                        content: primaryContent,
-                        isStreaming: primaryIsStreaming,
-                        messageEmbeds: message.embeds,
-                        authToken: authToken,
-                        serverBaseURL: serverBaseURL,
-                        apiClient: apiClient
-                    )
-                    // ── Live tail: transient streaming-only second child ───────
-                    // Appended during split-render; removed atomically when
-                    // streaming ends.  Child-0 identity is unaffected.
-                    if useSplitTool {
-                        let liveTailStr = streamingStore.liveTail
-                        // An unclosed <details> block must disable streaming so
-                        // the raw HTML tag text doesn't flash before the block
-                        // completes.
-                        // A VIZ block must still stream so InlineVisualizerView
-                        // receives isStreaming: true and uses its reconcileContent
-                        // path instead of finalizeContent (which fails on partial HTML).
-                        // NOTE: We no longer disable streaming for unclosed <details> blocks.
-                        // The pipeline freeze was removed — ToolCallParser.findDetailsBlocks()
-                        // skips incomplete blocks, so partial <details> in the live tail
-                        // are invisible to the user and always safe to stream through.
-                        let liveTailHasViz = liveTailStr.contains("@@@VIZ-START")
-
-                        if !liveTailStr.isEmpty {
-                            if !liveTailHasViz && !streamingStore.liveTailFrozenProse.isEmpty {
-                                // Further split at prose boundary within the live tail.
-                                // The live segment starts on a new paragraph boundary,
-                                // so we add 16pt to match the CommonMark paragraphSpacing
-                                // that CoreText drops on the last paragraph of a view.
-                                StreamingMarkdownView(content: streamingStore.liveTailFrozenProse, isStreaming: false)
-                                if !streamingStore.liveTailLiveProse.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                                    StreamingMarkdownView(content: streamingStore.liveTailLiveProse, isStreaming: true)
-                                        .padding(.top, 16)
-                                }
-                            } else {
-                                // Stream live tail — VIZ content and plain text both stream.
-                                StreamingMarkdownView(content: liveTailStr, isStreaming: true)
-                            }
-                        }
-                    } else if useSplitProse {
-                        // Pure-prose live tail.  No tool/reasoning blocks.
-                        // Pipeline pre-slices at paragraph boundary; pureFrozenProse
-                        // is stable until the boundary advances (~every 400 chars).
-                        if !streamingStore.pureLiveProse.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                            // The live prose starts on a new paragraph boundary.
-                            // Add 16pt top padding to match CommonMark's paragraphSpacing
-                            // (which CoreText drops on the final paragraph of a view).
-                            // Without this, the two segments render flush against each other.
-                            StreamingMarkdownView(content: streamingStore.pureLiveProse, isStreaming: true)
-                                .padding(.top, 16)
-                        }
-                    }
-                    // No tail added for non-split / final messages — VStack contains
-                    // only AssistantMessageContent, identical to the old fallback.
-                }
+                let hasFrozenPrefix = isActivelyStreaming && !streamingStore.frozenContent.isEmpty
+                AssistantMessageContent(
+                    content: hasFrozenPrefix ? streamingStore.frozenContent : displayContent,
+                    isStreaming: effectiveIsStreaming,
+                    streamingTail: hasFrozenPrefix ? streamingStore.liveTail : nil,
+                    messageEmbeds: message.embeds,
+                    authToken: authToken,
+                    serverBaseURL: serverBaseURL,
+                    apiClient: apiClient
+                )
                 .transaction { $0.animation = nil }
             } else {
                 // Plain text (markdown rendering disabled).
@@ -6510,13 +6467,28 @@ private extension View {
         }
     }
 
-    @ViewBuilder
+    /// Wraps the chat chrome bar in a ViewModifier so the host view's (very large)
+    /// type appears once per call instead of once per availability/edge branch.
+    /// The branching lives in the modifier's own body, which SwiftUI resolves
+    /// separately — this keeps `ChatDetailView.body`'s type shallow enough that
+    /// runtime metadata instantiation does not overflow the main-thread stack.
     func chatChromeBar<Content: View>(edge: VerticalEdge, @ViewBuilder content: () -> Content) -> some View {
+        modifier(ChatChromeBarModifier(edge: edge, bar: content()))
+    }
+}
+
+private struct ChatChromeBarModifier<Bar: View>: ViewModifier {
+    let edge: VerticalEdge
+    let bar: Bar
+
+    func body(content: Content) -> some View {
         if #available(iOS 26.0, *) {
-            self.safeAreaBar(edge: edge, spacing: 0, content: content)
+            // The custom status-bar glass handles the top blur, so hide the native
+            // scroll-edge effect on both edges (avoids a double blur).
+            content.safeAreaBar(edge: edge, spacing: 0) { bar }
                 .scrollEdgeEffectHidden(true, for: [.top, .bottom])
         } else {
-            self.safeAreaInset(edge: edge, spacing: 0, content: content)
+            content.safeAreaInset(edge: edge, spacing: 0) { bar }
         }
     }
 }

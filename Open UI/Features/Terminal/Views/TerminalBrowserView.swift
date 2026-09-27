@@ -108,6 +108,9 @@ final class TerminalHostView: TerminalView {
 struct TerminalBrowserView: View {
     @Bindable var viewModel: TerminalBrowserViewModel
     var onDismiss: () -> Void
+    /// Panel surface colour. Defaults to the app background; the iPhone page-card
+    /// layout passes the sidebar colour so the panel matches the sidebar.
+    var background: SwiftUI.Color? = nil
 
     @Environment(\.theme) private var theme
     @State private var showFilePicker = false
@@ -173,7 +176,7 @@ struct TerminalBrowserView: View {
                 terminalToggleBar
             }
         }
-        .background(theme.background)
+        .background(background ?? theme.background)
         .onChange(of: viewModel.isTerminalExpanded) { _, expanded in
             if expanded { viewModel.reconnectIfNeeded() }
         }
@@ -316,6 +319,8 @@ struct TerminalBrowserView: View {
                     }
                 }
                 .listStyle(.plain)
+                // Let the panel surface show through instead of the list's own fill.
+                .scrollContentBackground(.hidden)
                 .refreshable { await viewModel.loadDirectory() }
             }
         }

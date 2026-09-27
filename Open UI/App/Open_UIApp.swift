@@ -225,7 +225,12 @@ struct Open_UIApp: App {
                         let session = AVAudioSession.sharedInstance()
                         print("🌙[APP] scenePhase=\(newPhase) — tts.activeEngine=\(tts.activeEngine) tts.state=\(tts.state)")
                         print("🌙[APP] AudioSession before BG — category=\(session.category.rawValue) mode=\(session.mode.rawValue) isActive=\(session.isOtherAudioPlaying)")
-                        if tts.activeEngine == .kokoro || tts.activeEngine == .qwen3 {
+                        if CallAudioSession.isCallActive {
+                            // A voice call owns the audio session and handles its own
+                            // GPU → CPU/system-engine switch. stopAndUnload() would
+                            // deactivate the session and kill the call's mic.
+                            print("🌙[APP] Voice call active — skipping read-aloud TTS teardown")
+                        } else if tts.activeEngine == .kokoro || tts.activeEngine == .qwen3 {
                             print("🌙[APP] Stopping on-device TTS (Kokoro/Qwen3) before background")
                             tts.stop()
                         }
@@ -233,7 +238,9 @@ struct Open_UIApp: App {
                         // AVAudioSession.setActive(false) on the shared session, killing
                         // AVQueuePlayer (server TTS) mid-playback. Skip it when server TTS
                         // is actively playing so background audio continues uninterrupted.
-                        if tts.activeEngine != .server {
+                        if CallAudioSession.isCallActive {
+                            // (see above) — leave the shared session alone during a call.
+                        } else if tts.activeEngine != .server {
                             print("🌙[APP] Calling kokoroService.stopAndUnload() — engine is \(tts.activeEngine), not server")
                             tts.kokoroService.stopAndUnload()
                         } else {
@@ -261,6 +268,10 @@ struct Open_UIApp: App {
                     }
                 }
                 .task {
+                    // End any voice-call Live Activity left over from a previous
+                    // run (e.g. the app was killed mid-call).
+                    VoiceCallLiveActivityController.endStaleActivities()
+
                     // STORAGE FIX: Run cleanup on app launch to handle accumulated
                     // data from previous sessions (orphaned files, stale caches, etc.)
                     StorageManager.shared.performRoutineCleanup()
@@ -396,6 +407,12 @@ struct Open_UIApp: App {
             }
 
         case "voice-call":
+            // Tapping the voice-call Live Activity (Dynamic Island / Lock
+            // Screen) while a call is running → bring that call back.
+            if router.voiceCallViewModel != nil {
+                if router.isVoiceCallMinimized { router.expandVoiceCall() }
+                return
+            }
             // Widget mic button → voice call. Posts a notification that
             // MainChatView/iPadMainChatView handle by creating a VoiceCallViewModel
             // and presenting it via router.presentVoiceCall(viewModel:).
@@ -1182,7 +1199,7 @@ struct RootView: View {
                     if viewModel.currentUser != nil
                         || dependencies.serverConfigStore.activeServer != nil {
                         ToolbarItem(placement: .cancellationAction) {
-                            Button {
+                            Button("Close", systemImage: "xmark") {
                                 withAnimation(.spring(response: 0.4, dampingFraction: 0.85)) {
                                     if viewModel.currentUser != nil {
                                         viewModel.phase = .authenticated
@@ -1192,12 +1209,9 @@ struct RootView: View {
                                         viewModel.phase = .serverConnection
                                     }
                                 }
-                            } label: {
-                                Image(systemName: "xmark.circle.fill")
-                                    .symbolRenderingMode(.hierarchical)
-                                    .foregroundStyle(.secondary)
-                                    .font(.system(size: 20))
                             }
+                            .labelStyle(.iconOnly)
+                            .tint(.secondary)
                             .accessibilityLabel("Close server switcher")
                         }
                     }
@@ -1241,14 +1255,11 @@ struct RootView: View {
                 .navigationBarTitleDisplayMode(.inline)
                 .toolbar {
                     ToolbarItem(placement: .cancellationAction) {
-                        Button {
+                        Button("Close", systemImage: "xmark") {
                             showServerSwitcherSheet = false
-                        } label: {
-                            Image(systemName: "xmark.circle.fill")
-                                .symbolRenderingMode(.hierarchical)
-                                .foregroundStyle(.secondary)
-                                .font(.system(size: 20))
                         }
+                        .labelStyle(.iconOnly)
+                        .tint(.secondary)
                         .accessibilityLabel("Dismiss server switcher")
                     }
                 }

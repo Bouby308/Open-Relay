@@ -13,9 +13,6 @@ struct SettingsView: View {
     @Bindable var appearanceManager: AppearanceManager
     @State private var showSignOutConfirmation = false
     @State private var navigationPath = NavigationPath()
-    @State private var showDefaultModelPicker = false
-    @State private var showLanguagePicker = false
-    @State private var showRestartAlert = false
     @State private var availableModels: [AIModel] = []
     @State private var defaultModelId: String?
     @State private var isLoadingModels = false
@@ -63,8 +60,9 @@ struct SettingsView: View {
                             showDivider: false,
                             accessory: isLoadingModels ? .loading : .chevron
                         ) {
-                            showDefaultModelPicker = true
+                            navigationPath.append(SettingsDestination.defaultModel)
                         }
+                        .disabled(isLoadingModels)
                     }
 
                                     // Display & Customization
@@ -98,7 +96,7 @@ struct SettingsView: View {
                             showDivider: false,
                             accessory: .chevron
                         ) {
-                            showLanguagePicker = true
+                            navigationPath.append(SettingsDestination.language)
                         }
                     }
 
@@ -115,25 +113,16 @@ struct SettingsView: View {
                         }
                     }
 
-                    // Voice
+                    // Voice — one hub for speaking, listening and calls
                     SettingsSection(header: "Voice") {
                         SettingsCell(
                             icon: "waveform",
-                            title: "Text-to-Speech",
-                            subtitle: "Voice & speed settings",
-                            showDivider: true,
-                            accessory: .chevron
-                        ) {
-                            navigationPath.append(SettingsDestination.ttsSettings)
-                        }
-                        SettingsCell(
-                            icon: "mic",
-                            title: "Speech-to-Text",
-                            subtitle: "Voice input settings",
+                            title: "Voice",
+                            subtitle: "Assistant's voice, your language, dictation & calls",
                             showDivider: false,
                             accessory: .chevron
                         ) {
-                            navigationPath.append(SettingsDestination.sttSettings)
+                            navigationPath.append(SettingsDestination.voiceHub)
                         }
                     }
 
@@ -263,6 +252,14 @@ struct SettingsView: View {
                     AppearanceSettingsView(manager: appearanceManager)
                 case .accessibility:
                     AccessibilitySettingsView(manager: dependencies.accessibilityManager)
+                case .defaultModel:
+                    DefaultModelPickerView(
+                        models: availableModels,
+                        selectedModelId: $defaultModelId,
+                        onSave: saveDefaultModel
+                    )
+                case .language:
+                    LanguagePickerView()
                 case .serverManagement:
                     ServerManagementView(viewModel: viewModel)
                 case .serverSwitcher:
@@ -278,10 +275,14 @@ struct SettingsView: View {
                     AboutView(viewModel: viewModel)
                 case .chatSettings:
                     ChatSettingsView()
+                case .voiceHub:
+                    VoiceSettingsHubView()
                 case .ttsSettings:
                     TTSSettingsView()
                 case .sttSettings:
                     STTSettingsView()
+                case .voiceCallSettings:
+                    VoiceCallSettingsView()
                 case .notifications:
                     NotificationSettingsView()
                 case .adminConsole:
@@ -291,18 +292,6 @@ struct SettingsView: View {
                 case .storage:
                     StorageSettingsView()
                 }
-            }
-            .sheet(isPresented: $showDefaultModelPicker) {
-                DefaultModelPickerView(
-                    models: availableModels,
-                    selectedModelId: $defaultModelId,
-                    onSave: saveDefaultModel
-                )
-            }
-            .sheet(isPresented: $showLanguagePicker) {
-                LanguagePickerView()
-                    .presentationDetents([.large])
-                    .presentationDragIndicator(.visible)
             }
             .sheet(isPresented: $showSignOutConfirmation) {
                 SignOutConfirmationSheet(
@@ -336,15 +325,9 @@ struct SettingsView: View {
 
     /// The display name of the currently active app language.
     private var currentLanguageDisplayName: String {
-        let langs = UserDefaults.standard.stringArray(forKey: "AppleLanguages") ?? []
-        if let first = langs.first, !first.hasPrefix("en") {
-            let locale = Locale(identifier: first)
-            // Show native name in that language
-            if let native = locale.localizedString(forIdentifier: first) {
-                return native
-            }
-        }
-        return String(localized: "System Default")
+        LanguagePickerView.supportedLanguages.first {
+            $0.code == LanguagePickerView.selectedLanguageCode
+        }?.nativeName ?? String(localized: "System Default")
     }
 
     private var notificationStatusSubtitle: String {
@@ -398,13 +381,17 @@ enum SettingsDestination: Hashable {
     case profile
     case appearance
     case accessibility
+    case defaultModel
+    case language
     case serverManagement
     case serverSwitcher
     case privacySecurity
     case about
     case chatSettings
+    case voiceHub
     case ttsSettings
     case sttSettings
+    case voiceCallSettings
     case notifications
     case adminConsole
     case memories
@@ -431,52 +418,47 @@ struct DefaultModelPickerView: View {
     }
 
     var body: some View {
-        NavigationStack {
-            List {
-                // Model list
-                ForEach(filteredModels) { model in
-                    Button {
-                        localSelection = model.id
-                    } label: {
-                        HStack {
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text(model.name)
-                                    .scaledFont(size: 16)
-                                    .fontWeight(.medium)
-                                HStack(spacing: 4) {
-                                    if model.isMultimodal {
-                                        Label("Vision", systemImage: "photo")
-                                            .scaledFont(size: 10)
-                                            .foregroundStyle(theme.brandPrimary)
-                                    }
+        List {
+            ForEach(filteredModels) { model in
+                Button {
+                    localSelection = model.id
+                } label: {
+                    HStack {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(model.name)
+                                .scaledFont(size: 16)
+                                .fontWeight(.medium)
+                                .foregroundStyle(theme.textPrimary)
+                            HStack(spacing: 4) {
+                                if model.isMultimodal {
+                                    Label("Vision", systemImage: "photo")
+                                        .scaledFont(size: 10)
+                                        .foregroundStyle(theme.brandPrimary)
                                 }
                             }
-                            Spacer()
-                            if localSelection == model.id {
-                                Image(systemName: "checkmark")
-                                    .foregroundStyle(theme.brandPrimary)
-                            }
+                        }
+                        Spacer()
+                        if localSelection == model.id {
+                            Image(systemName: "checkmark")
+                                .foregroundStyle(theme.brandPrimary)
                         }
                     }
-                    .listRowBackground(
-                        localSelection == model.id ? theme.brandPrimary.opacity(0.08) : Color.clear
-                    )
                 }
+                .accessibilityAddTraits(localSelection == model.id ? .isSelected : [])
             }
-            .searchable(text: $searchText, prompt: "Search Models")
-            .navigationTitle("Default Model")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button("Cancel") { dismiss() }
+        }
+        .listStyle(.insetGrouped)
+        .searchable(text: $searchText, prompt: "Search Models")
+        .navigationTitle("Default Model")
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItem(placement: .confirmationAction) {
+                Button("Save", systemImage: "checkmark") {
+                    onSave(localSelection)
+                    dismiss()
                 }
-                ToolbarItem(placement: .confirmationAction) {
-                    Button("Save") {
-                        onSave(localSelection)
-                        dismiss()
-                    }
-                    .fontWeight(.semibold)
-                }
+                .labelStyle(.iconOnly)
+                .tint(.secondary)
             }
         }
         .onAppear {
@@ -491,9 +473,11 @@ struct ChatSettingsView: View {
     @Environment(\.theme) private var theme
     @Environment(AppDependencyContainer.self) private var dependencies
     @AppStorage("sendOnEnter") private var sendOnEnter = true
+    @AppStorage("showVoiceModeButton") private var showVoiceModeButton = true
     @AppStorage("streamingHaptics") private var streamingHaptics = true
     @AppStorage("titleGenerationEnabled") private var titleGenerationEnabled = true
     @AppStorage("suggestionsEnabled") private var suggestionsEnabled = true
+    @AppStorage("showNewChatSuggestions") private var showNewChatSuggestions = true
     @AppStorage("temporaryChatDefault") private var temporaryChatDefault = false
     @AppStorage("expandThinkingWhileStreaming") private var expandThinkingWhileStreaming = true
     @AppStorage("streamingAutoScroll") private var streamingAutoScroll = true
@@ -557,6 +541,24 @@ struct ChatSettingsView: View {
                 NavigationLink("Message Actions") {
                     MessageActionsSettingsView(availableBuiltInActions: availableMessageActions)
                 }
+            }
+
+            Section {
+                Toggle("Show New Chat Suggestions", isOn: $showNewChatSuggestions)
+                    .tint(theme.brandPrimary)
+            } header: {
+                Text("New Chats")
+            } footer: {
+                Text("Show suggested prompts on the new chat screen. Applies only to Open Relay on this device; your Open WebUI settings and follow-up suggestions are unchanged.")
+            }
+
+            Section {
+                Toggle("Show Voice Mode Button", isOn: $showVoiceModeButton)
+                    .tint(theme.brandPrimary)
+            } header: {
+                Text("Composer")
+            } footer: {
+                Text("Show the voice-mode button in the message composer. Microphone dictation remains available. Applies only to Open Relay on this device.")
             }
 
             Section("Input Behavior") {
@@ -818,14 +820,12 @@ struct TTSSettingsView: View {
                     .buttonStyle(.plain)
                 }
             } header: {
-                Text("TTS Engine")
+                Text("Engine")
             } footer: {
                 if selectedEngine == "auto" {
-                    Text("Auto mode uses the on-device model when loaded, otherwise falls back to server or system.")
-                } else if selectedEngine == "kokoro" {
-                    Text("Kokoro runs locally on your device. Supports 54 voices across 9 languages.")
-                } else if selectedEngine == "qwen3" {
-                    Text("Qwen3 runs locally on your device. Supports English, Korean, German, Spanish, and 7 more languages.")
+                    Text("Used for Read Aloud and voice calls. Auto uses the on-device model when it's loaded, otherwise your server or the system voice.")
+                } else {
+                    Text("Used for Read Aloud and voice calls.")
                 }
             }
 
@@ -1019,9 +1019,9 @@ struct TTSSettingsView: View {
                         }
                     }
                 } header: {
-                    Text("Response Splitting")
+                    Text("Read Aloud Splitting")
                 } footer: {
-                    Text("The client setting applies on this device. Whole Message keeps the text together for more context but takes longer to prepare and must fit your speech provider’s limits. Changes apply to the next playback; voice calls continue speaking incrementally.")
+                    Text("Read Aloud only. Whole Message keeps the text together for more context but takes longer to prepare and must fit your speech provider’s limits. Voice calls always speak sentence by sentence.")
                 }
             }
 
@@ -1108,52 +1108,11 @@ struct TTSSettingsView: View {
                 Text("Tap preview to hear how the selected voice sounds.")
             }
 
-            // Model Storage Management
             Section {
-                HStack {
-                    Text("Kokoro TTS")
-                        .scaledFont(size: 16)
-                        .foregroundStyle(theme.textPrimary)
-                    Spacer()
-                    Text(kokoroModelSize)
-                        .scaledFont(size: 14)
-                        .foregroundStyle(theme.textSecondary)
-                }
-                .swipeActions(edge: .trailing, allowsFullSwipe: true) {
-                    Button(role: .destructive) {
-                        ttsService.kokoroService.config.activeModel = .kokoro
-                        ttsService.kokoroService.unloadAndDeleteModel()
-                        refreshModelSizes()
-                    } label: {
-                        Label("Delete", systemImage: "trash")
-                    }
-                }
-
-                HStack {
-                    Text("Qwen3 TTS")
-                        .scaledFont(size: 16)
-                        .foregroundStyle(theme.textPrimary)
-                    Spacer()
-                    Text(qwen3ModelSize)
-                        .scaledFont(size: 14)
-                        .foregroundStyle(theme.textSecondary)
-                }
-                .swipeActions(edge: .trailing, allowsFullSwipe: true) {
-                    Button(role: .destructive) {
-                        ttsService.kokoroService.config.activeModel = .qwen3
-                        ttsService.kokoroService.unloadAndDeleteModel()
-                        refreshModelSizes()
-                    } label: {
-                        Label("Delete", systemImage: "trash")
-                    }
-                }
-            } header: {
-                Text("Model Storage")
-            } footer: {
-                Text("Swipe left on a model row to delete it from disk and free storage.")
+                NavigationLink("Models & Storage") { VoiceModelsStorageView() }
             }
         }
-        .navigationTitle("Text-to-Speech")
+        .navigationTitle("Assistant's Voice")
         .navigationBarTitleDisplayMode(.inline)
         .onAppear {
             availableVoices = dependencies.textToSpeechService.availableVoices()
@@ -1465,7 +1424,7 @@ struct STTSettingsView: View {
     @Environment(AppDependencyContainer.self) private var dependencies
     @AppStorage("sttEngine") private var selectedSTTEngine: String = "device"
     @AppStorage("audioFileTranscriptionMode") private var audioFileMode: String = "server"
-    @AppStorage("voiceSilenceDuration") private var silenceDuration: Double = 2.0
+    @AppStorage(DictationService.autoStopKey) private var autoStopSeconds: Double = 0
     @AppStorage("sttLocale") private var sttLocale: String = ""
     @State private var micPermissionGranted = false
     @State private var speechPermissionGranted = false
@@ -1493,7 +1452,26 @@ struct STTSettingsView: View {
 
     var body: some View {
         List {
-            // Live Voice Transcription (microphone / call)
+            // Language — used by dictation, voice calls and Apple Speech.
+            Section {
+                NavigationLink {
+                    STTLanguagePickerView(sttLocale: $sttLocale, locales: supportedSTTLocales)
+                        .onChange(of: sttLocale) { _, newValue in
+                            dependencies.speechRecognitionService.updateLocale(newValue)
+                        }
+                } label: {
+                    LabeledContent(
+                        "Language",
+                        value: sttLocale.isEmpty
+                            ? "Device Language"
+                            : (Locale.current.localizedString(forIdentifier: sttLocale) ?? sttLocale)
+                    )
+                }
+            } footer: {
+                Text("The language you speak. Used for dictation and voice calls.")
+            }
+
+            // Dictation (microphone button in the message box)
             Section {
                 Button {
                     withAnimation(.easeOut(duration: 0.15)) {
@@ -1503,8 +1481,8 @@ struct STTSettingsView: View {
                 } label: {
                     engineRow(
                         value: "device",
-                        label: "On-Device (Apple)",
-                        description: "Apple Speech framework",
+                        label: "On-Device (Qwen3)",
+                        description: "Private, works offline · ~700 MB download on first use",
                         selected: selectedSTTEngine == "device"
                     )
                 }
@@ -1520,22 +1498,22 @@ struct STTSettingsView: View {
                         engineRow(
                             value: "server",
                             label: "Server (OpenWebUI)",
-                            description: "Server-side transcription via /api/v1/audio/transcriptions",
+                            description: "Your server transcribes the recording · needs internet",
                             selected: selectedSTTEngine == "server"
                         )
                     }
                     .buttonStyle(.plain)
                 }
-            } header: {
-                Text("Voice Transcription Engine")
-            } footer: {
-                if selectedSTTEngine == "device" {
-                    Text("Used for live microphone input. Apple's Speech framework works offline with no data sent to external servers.")
-                } else if selectedSTTEngine == "server" {
-                    Text("Used for live microphone input. Sends audio to your OpenWebUI server for transcription. Requires internet.")
-                } else {
-                    Text("Select the engine used for live microphone input and voice calls.")
+
+                Picker("Stop Automatically", selection: $autoStopSeconds) {
+                    ForEach(DictationService.autoStopOptions, id: \.self) { s in
+                        Text(s == 0 ? "Off" : "After \(Int(s)) s of silence").tag(s)
+                    }
                 }
+            } header: {
+                Text("Dictation")
+            } footer: {
+                Text("For the microphone button in the message box. Voice calls have their own listening setting in Voice Calls. With \"Stop Automatically\" off, tap stop when you're done.")
             }
 
             // Audio File Transcription (attach audio file in chat)
@@ -1689,55 +1667,6 @@ struct STTSettingsView: View {
                 }
             }
 
-            // Language (only for on-device Apple STT)
-            if selectedSTTEngine == "device" {
-                Section {
-                    NavigationLink {
-                        STTLanguagePickerView(
-                            sttLocale: $sttLocale,
-                            locales: supportedSTTLocales
-                        )
-                        .onChange(of: sttLocale) { _, newValue in
-                            dependencies.speechRecognitionService.updateLocale(newValue)
-                        }
-                    } label: {
-                        HStack {
-                            Text("Language")
-                            Spacer()
-                            Text(
-                                sttLocale.isEmpty
-                                    ? "Auto"
-                                    : (Locale.current.localizedString(forIdentifier: sttLocale) ?? sttLocale)
-                            )
-                            .foregroundStyle(.secondary)
-                        }
-                    }
-                } header: {
-                    Text("Language")
-                } footer: {
-                    Text("Choose the language you'll speak. \"Auto\" uses your device's current language.")
-                }
-            }
-
-            // Voice Activity Detection
-            Section {
-                VStack(alignment: .leading) {
-                    HStack {
-                        Text("Silence Duration")
-                        Spacer()
-                        Text("\(String(format: "%.1f", silenceDuration))s")
-                            .scaledFont(size: 12, weight: .medium)
-                            .foregroundStyle(theme.brandPrimary)
-                    }
-                    Slider(value: $silenceDuration, in: 0.5...5.0, step: 0.5)
-                        .tint(theme.brandPrimary)
-                }
-            } header: {
-                Text("Voice Activity Detection")
-            } footer: {
-                Text("How long to wait after you stop speaking before finalizing the transcript. Shorter = faster, longer = catches pauses mid-sentence.")
-            }
-
             // Permissions
             Section {
                 HStack {
@@ -1787,33 +1716,12 @@ struct STTSettingsView: View {
             } header: {
                 Text("Permissions")
             }
-            // Model Storage Management
-            Section {
-                HStack {
-                    Text("Qwen3 ASR")
-                        .scaledFont(size: 16)
-                        .foregroundStyle(theme.textPrimary)
-                    Spacer()
-                    Text(asrModelSize)
-                        .scaledFont(size: 14)
-                        .foregroundStyle(theme.textSecondary)
-                }
-                .swipeActions(edge: .trailing, allowsFullSwipe: true) {
-                    Button(role: .destructive) {
-                        asr.unloadAndDeleteVariant(.qwen3ASR)
-                        refreshModelSizes()
-                    } label: {
-                        Label("Delete", systemImage: "trash")
-                    }
-                }
 
-            } header: {
-                Text("Model Storage")
-            } footer: {
-                Text("Swipe left on a model row to delete it from disk and free storage.")
+            Section {
+                NavigationLink("Models & Storage") { VoiceModelsStorageView() }
             }
         }
-        .navigationTitle("Audio & Transcription")
+        .navigationTitle("Your Voice")
         .navigationBarTitleDisplayMode(.inline)
         .onAppear {
             refreshPermissions()

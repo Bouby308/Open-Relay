@@ -14,6 +14,7 @@ struct MainChatView: View {
     @Environment(AppDependencyContainer.self) private var dependencies
     @Environment(AppRouter.self) private var router
     @Environment(\.theme) private var theme
+    @Environment(\.displayScale) private var displayScale
     @Environment(\.colorScheme) private var systemColorScheme
     @Environment(\.scenePhase) private var scenePhase
     @Environment(\.verticalSizeClass) private var verticalSizeClass
@@ -29,6 +30,7 @@ struct MainChatView: View {
 
     /// Controls the workspace sheet presentation.
     @State private var showWorkspace = false
+    @State private var showLibrarySearch = false
 
     /// Controls the calendar sheet presentation.
     @State private var showCalendar = false
@@ -135,6 +137,7 @@ struct MainChatView: View {
 
     /// Cached container width from GeometryReader (avoids deprecated UIScreen.main).
     @State private var containerWidth: CGFloat = 360
+    @State private var containerSafeAreaInsets = EdgeInsets()
 
     /// Live drag offset for interactive drawer sliding.
     @State private var dragOffset: CGFloat = 0
@@ -189,6 +192,9 @@ struct MainChatView: View {
     var body: some View {
         @Bindable var bindableRouter = router
         mainContent(voiceCallBinding: $bindableRouter.isVoiceCallPresented)
+            .onGeometryChange(for: EdgeInsets.self) { proxy in
+                proxy.safeAreaInsets
+            } action: { containerSafeAreaInsets = $0 }
             .onGeometryChange(for: CGFloat.self) { proxy in
                 proxy.size.width
             } action: { newWidth in
@@ -227,14 +233,14 @@ struct MainChatView: View {
         mainContentOffset - fileBrowserContentOffset
     }
 
-    /// Highest open fraction of either panel — drives scale and corner radius.
+    /// Highest open fraction of either panel — controls dismissal hit-testing.
     private var maxPanelFraction: CGFloat {
         max(drawerFraction, fileBrowserFraction)
     }
 
-    /// Corner radius of the main content card (0 → 16) based on most-open panel.
-    private var combinedContentCornerRadius: CGFloat {
-        maxPanelFraction * 16
+    private var usesPageCardSidebar: Bool {
+        if #available(iOS 26.0, *) { return true }
+        return false
     }
 
     // MARK: File Browser Computed Properties (right-side panel, mirrors drawer)
@@ -321,45 +327,7 @@ struct MainChatView: View {
                     .navigationBarTitleDisplayMode(.inline)
                     .toolbarBackground(.hidden, for: .navigationBar)
             }
-            // Left-edge overlay — 20 pt wide strip for swipe-to-open in landscape.
-            // Same rationale as portrait: dedicated overlay blocks all input instantly
-            // the moment a drag is recognised, giving the "content freezes" feel.
-            // Also handles taps so touches on the left half of the hamburger button
-            // (which overlaps this zone) still open the drawer.
-            .overlay(alignment: .leading) {
-                if !showDrawer && !isDraggingFileBrowser && !showFileBrowser {
-                    Color.clear
-                        .frame(width: 20)
-                        .frame(maxHeight: .infinity)
-                        .contentShape(Rectangle())
-                        .onTapGesture { toggleDrawer() }
-                        .gesture(
-                            DragGesture(minimumDistance: 12, coordinateSpace: .local)
-                                .onChanged { value in
-                                    let horizontal = value.translation.width
-                                    let vertical = abs(value.translation.height)
-                                    guard abs(horizontal) > vertical, horizontal > 0 else { return }
-                                    if !isDraggingDrawer {
-                                        UIApplication.shared.sendAction(
-                                            #selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
-                                    }
-                                    isDraggingDrawer = true
-                                    dragOffset = horizontal
-                                }
-                                .onEnded { value in
-                                    guard isDraggingDrawer else { return }
-                                    let horizontal = value.translation.width
-                                    let velocity = value.velocity.width
-                                    isDraggingDrawer = false
-                                    if horizontal > drawerWidth * 0.2 || velocity > 300 {
-                                        openDrawerAnimated()
-                                    } else {
-                                        closeDrawerAnimated()
-                                    }
-                                }
-                        )
-                }
-            }
+            .gesture(sidebarOpeningGesture)
             // Drawer still overlays in landscape (same as portrait)
             .overlay(alignment: .leading) {
                 drawerContent
@@ -429,30 +397,70 @@ struct MainChatView: View {
 
     // MARK: Portrait: ZStack offset layout (original behaviour)
 
+    private var sidebarOpeningGesture: SidebarOpeningGesture {
+        SidebarOpeningGesture(
+            isEnabled: !showDrawer && !isDraggingFileBrowser && !showFileBrowser,
+            onChanged: { horizontal in
+                if !isDraggingDrawer {
+                    UIApplication.shared.sendAction(
+                        #selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
+                }
+                isDraggingDrawer = true
+                dragOffset = horizontal
+            },
+            onEnded: { horizontal, velocity, cancelled in
+                isDraggingDrawer = false
+                if !cancelled && (horizontal > drawerWidth * 0.2 || velocity > 300) {
+                    openDrawerAnimated()
+                } else {
+                    closeDrawerAnimated()
+                }
+            }
+        )
+    }
+
     @ViewBuilder
     private func portraitOverlayLayout(voiceCallBinding: Binding<Bool>) -> some View {
         ZStack(alignment: .leading) {
-            // MARK: Main chat content — pushed right as drawer opens (Reddit/Twitter style)
+            // MARK: Main chat content — slides over the sidebar as a rounded page
             NavigationStack {
                 chatContent
                     .navigationBarTitleDisplayMode(.inline)
                     .toolbarBackground(.hidden, for: .navigationBar)
             }
-            // Push the content card — right by drawer, left by file browser
-            .offset(x: combinedContentOffset)
+            .gesture(sidebarOpeningGesture)
+            // Include the window edges in the mask without moving safe-area content.
+            .padding(.leading, usesPageCardSidebar ? containerSafeAreaInsets.leading : 0)
+            .padding(.trailing, usesPageCardSidebar ? containerSafeAreaInsets.trailing : 0)
+            .background((usesPageCardSidebar ? theme.background : .clear).ignoresSafeArea())
+            .offset(x: usesPageCardSidebar ? 0 : combinedContentOffset)
             .mask {
-                RoundedRectangle(cornerRadius: combinedContentCornerRadius, style: .continuous)
-                    .ignoresSafeArea(.container)
+                if #available(iOS 26.0, *) {
+                    ConcentricRectangle(corners: .concentric, isUniform: true)
+                        .ignoresSafeArea()
+                } else {
+                    RoundedRectangle(cornerRadius: maxPanelFraction * 16, style: .continuous)
+                        .ignoresSafeArea()
+                }
             }
-            // Blur the main content as panels open, plus extra blur during chat-switch transitions
-            .blur(radius: maxPanelFraction * 8 + contentTransitionBlur)
+            // Page-card style (iOS 26) leaves the page unblurred for both panels.
+            .blur(radius: (usesPageCardSidebar ? 0 : maxPanelFraction) * 8 + contentTransitionBlur)
             // Shadow on the active edge: left when drawer open, right when file browser open
             .shadow(color: .black.opacity(0.18 * drawerFraction), radius: 20, x: -4)
             .shadow(color: .black.opacity(0.18 * fileBrowserFraction), radius: 20, x: 4)
-            // Faint scrim proportional to whichever panel is most open
+            .overlay {
+                if #available(iOS 26.0, *) {
+                    ConcentricRectangle(corners: .concentric, isUniform: true)
+                        .stroke(theme.isDark ? Color.white.opacity(0.1) : Color.black.opacity(0.08), lineWidth: 1 / displayScale)
+                        .opacity(maxPanelFraction)
+                        .ignoresSafeArea()
+                        .allowsHitTesting(false)
+                }
+            }
+            // Pre-iOS 26 keeps the faint scrim; page-card style leaves the page undimmed.
             .overlay {
                 Color.black
-                    .opacity(0.12 * maxPanelFraction)
+                    .opacity(usesPageCardSidebar ? 0 : 0.12 * maxPanelFraction)
                     .ignoresSafeArea()
                     .allowsHitTesting(false)
             }
@@ -473,7 +481,7 @@ struct MainChatView: View {
                         }
                     }
                     .gesture(
-                        DragGesture(minimumDistance: 12, coordinateSpace: .local)
+                        DragGesture(minimumDistance: 12, coordinateSpace: .global)
                             .onChanged { value in
                                 let h = value.translation.width
                                 if drawerFraction >= fileBrowserFraction {
@@ -508,13 +516,21 @@ struct MainChatView: View {
                     )
             }
 
+            // Move the mask, shadow, and dismissal surface together with the page.
+            .offset(x: usesPageCardSidebar ? combinedContentOffset : 0)
+            .ignoresSafeArea(.container, edges: usesPageCardSidebar ? .horizontal : [])
+
             // MARK: Drawer
             drawerContent
                 .frame(width: drawerWidth)
-                .offset(x: effectiveDrawerX)
+                .offset(x: usesPageCardSidebar ? 0 : effectiveDrawerX)
+                .zIndex(usesPageCardSidebar ? -1 : 0)
+                // Page-card style: keep the sidebar out of the file browser's reveal.
+                .opacity(usesPageCardSidebar && drawerFraction == 0 && fileBrowserFraction > 0 ? 0 : 1)
+                .allowsHitTesting(drawerFraction > 0.01)
                 .accessibilityHidden(drawerFraction < 0.01)
                 .gesture(
-                    DragGesture(minimumDistance: 12, coordinateSpace: .local)
+                    DragGesture(minimumDistance: 12, coordinateSpace: .global)
                         .onChanged { value in
                             let horizontal = value.translation.width
                             guard horizontal < 0 else { return }
@@ -537,26 +553,42 @@ struct MainChatView: View {
             // MARK: File browser panel (right side — only when terminal is active)
             if isTerminalActiveInCurrentChat {
             // Note: no separate dim overlay — the unified overlay on NavigationStack handles tap/swipe.
+            // iOS 26: page-card style — the panel sits fixed behind the chat card at the
+            // trailing edge and is revealed as the card slides left (mirrors the sidebar).
+            // Earlier iOS: the panel slides in over the chat as before.
             TerminalBrowserView(
                 viewModel: terminalBrowserVM,
-                onDismiss: { closeFileBrowserAnimated() }
+                onDismiss: { closeFileBrowserAnimated() },
+                background: usesPageCardSidebar ? theme.sidebarBackground : nil
             )
             .frame(width: fileBrowserWidth)
             .background(theme.background)
             .clipShape(
                 UnevenRoundedRectangle(
-                    topLeadingRadius: 16,
-                    bottomLeadingRadius: 16,
+                    topLeadingRadius: usesPageCardSidebar ? 0 : 16,
+                    bottomLeadingRadius: usesPageCardSidebar ? 0 : 16,
                     bottomTrailingRadius: 0,
                     topTrailingRadius: 0,
                     style: .continuous
                 )
             )
-            .shadow(color: .black.opacity(0.2), radius: 16, x: -4)
-            .offset(x: effectiveFileBrowserX)
+            // Page-card style: bleed the sidebar surface under the status bar and home
+            // indicator (after the clip so it isn't cut off), so the panel matches the
+            // sidebar edge-to-edge and the chat card reads as a card on top of it.
+            .background {
+                if usesPageCardSidebar {
+                    theme.sidebarBackground.ignoresSafeArea()
+                }
+            }
+            .shadow(color: .black.opacity(usesPageCardSidebar ? 0 : 0.2), radius: 16, x: -4)
+            .offset(x: usesPageCardSidebar ? containerWidth - fileBrowserWidth : effectiveFileBrowserX)
+            .zIndex(usesPageCardSidebar ? -1 : 0)
+            // Behind the card it would otherwise overlap the sidebar's revealed area.
+            .opacity(usesPageCardSidebar && fileBrowserFraction == 0 ? 0 : 1)
+            .allowsHitTesting(!usesPageCardSidebar || fileBrowserFraction > 0.01)
             .accessibilityHidden(fileBrowserFraction < 0.01)
             .gesture(
-                DragGesture(minimumDistance: 12, coordinateSpace: .local)
+                DragGesture(minimumDistance: 12, coordinateSpace: .global)
                     .onChanged { value in
                         let horizontal = value.translation.width
                         guard horizontal > 0 else { return }
@@ -577,48 +609,6 @@ struct MainChatView: View {
             )
             } // end if isTerminalActiveInCurrentChat
 
-
-            // MARK: Left-edge overlay — 20 pt wide strip that exclusively captures left-edge
-            // swipe-from-edge to open the drawer. Being a dedicated overlay (not simultaneousGesture)
-            // means the moment a drag is recognized it blocks all input beneath — buttons, text
-            // selection, scroll views — so the content freezes instantly as the drawer slides in.
-            // Also handles taps so that touches on the left half of the hamburger button
-            // (which overlaps this zone) still open the drawer reliably.
-            // NOTE: Also disabled when the file browser is open so that swiping from the
-            // left edge cannot open the drawer behind the file browser panel.
-            if !showDrawer && !isDraggingFileBrowser && !showFileBrowser {
-                Color.clear
-                    .frame(width: 20)
-                    .frame(maxHeight: .infinity)
-                    .contentShape(Rectangle())
-                    .onTapGesture { toggleDrawer() }
-                    .gesture(
-                        DragGesture(minimumDistance: 12, coordinateSpace: .local)
-                            .onChanged { value in
-                                let horizontal = value.translation.width
-                                let vertical = abs(value.translation.height)
-                                guard abs(horizontal) > vertical, horizontal > 0 else { return }
-                                if !isDraggingDrawer {
-                                    UIApplication.shared.sendAction(
-                                        #selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
-                                }
-                                isDraggingDrawer = true
-                                dragOffset = horizontal
-                            }
-                            .onEnded { value in
-                                guard isDraggingDrawer else { return }
-                                let horizontal = value.translation.width
-                                let velocity = value.velocity.width
-                                isDraggingDrawer = false
-                                if horizontal > drawerWidth * 0.2 || velocity > 300 {
-                                    openDrawerAnimated()
-                                } else {
-                                    closeDrawerAnimated()
-                                }
-                            }
-                    )
-                    .frame(maxWidth: .infinity, alignment: .leading)
-            }
 
             // MARK: Right edge overlay — exclusively captures right-edge swipe to open file browser.
             // Only shown when terminal is active and file browser is closed.
@@ -677,12 +667,20 @@ struct MainChatView: View {
                 }
             )
         }
+        .background((usesPageCardSidebar ? theme.sidebarBackground : .clear).ignoresSafeArea())
     }
 
     // MARK: - Sheets (Settings, Notes, Voice Call, Folders, Rename, Export)
 
     private func applySheets<Content: View>(content: Content, voiceCallBinding: Binding<Bool>) -> some View {
         content
+            .fullScreenCover(isPresented: $showLibrarySearch) {
+                if let api = dependencies.apiClient {
+                    LibrarySearchView(api: api, onSelectChat: openSearchChat, onSelectFolder: openFolder)
+                        .themed(with: dependencies.appearanceManager, accessibility: dependencies.accessibilityManager)
+                        .preferredColorScheme(dependencies.appearanceManager.resolvedColorScheme ?? systemColorScheme)
+                }
+            }
             .sheet(isPresented: $showSettings) {
                 SettingsView(
                     viewModel: dependencies.authViewModel,
@@ -696,16 +694,11 @@ struct MainChatView: View {
                     NotesListView()
                         .toolbar {
                             ToolbarItem(placement: .navigationBarLeading) {
-                                Button {
+                                Button("Close", systemImage: "xmark") {
                                     showNotes = false
-                                } label: {
-                                    Image(systemName: "xmark")
-                                        .font(.system(size: 14, weight: .medium))
-                                        .foregroundStyle(Color.secondary)
-                                        .frame(width: 32, height: 32)
-                                        .background(Color(uiColor: .systemGray5).opacity(0.6))
-                                        .clipShape(Circle())
                                 }
+                                .labelStyle(.iconOnly)
+                                .tint(.secondary)
                             }
                         }
                 }
@@ -715,16 +708,11 @@ struct MainChatView: View {
                     ChannelsListView()
                         .toolbar {
                             ToolbarItem(placement: .navigationBarLeading) {
-                                Button {
+                                Button("Close", systemImage: "xmark") {
                                     showChannels = false
-                                } label: {
-                                    Image(systemName: "xmark")
-                                        .font(.system(size: 14, weight: .medium))
-                                        .foregroundStyle(Color.secondary)
-                                        .frame(width: 32, height: 32)
-                                        .background(Color(uiColor: .systemGray5).opacity(0.6))
-                                        .clipShape(Circle())
                                 }
+                                .labelStyle(.iconOnly)
+                                .tint(.secondary)
                             }
                         }
                 }
@@ -912,16 +900,11 @@ struct MainChatView: View {
                     MemoriesView()
                         .toolbar {
                             ToolbarItem(placement: .navigationBarLeading) {
-                                Button {
+                                Button("Close", systemImage: "xmark") {
                                     showMemories = false
-                                } label: {
-                                    Image(systemName: "xmark")
-                                        .font(.system(size: 14, weight: .medium))
-                                        .foregroundStyle(Color.secondary)
-                                        .frame(width: 32, height: 32)
-                                        .background(Color(uiColor: .systemGray5).opacity(0.6))
-                                        .clipShape(Circle())
                                 }
+                                .labelStyle(.iconOnly)
+                                .tint(.secondary)
                             }
                         }
                 }
@@ -933,16 +916,11 @@ struct MainChatView: View {
                     AdminConsoleView()
                         .toolbar {
                             ToolbarItem(placement: .navigationBarLeading) {
-                                Button {
+                                Button("Close", systemImage: "xmark") {
                                     showAdminConsole = false
-                                } label: {
-                                    Image(systemName: "xmark")
-                                        .font(.system(size: 14, weight: .medium))
-                                        .foregroundStyle(Color.secondary)
-                                        .frame(width: 32, height: 32)
-                                        .background(Color(uiColor: .systemGray5).opacity(0.6))
-                                        .clipShape(Circle())
                                 }
+                                .labelStyle(.iconOnly)
+                                .tint(.secondary)
                             }
                         }
                 }
@@ -1661,6 +1639,7 @@ struct MainChatView: View {
                     // ── FOLDERS SECTION (always visible so user can create new folders) ─
                     let folderVM = listViewModel.folderViewModel
                     let foldersEnabled = dependencies.authViewModel.featurePermissions.folders
+                    let hasFolderSections = foldersEnabled && (!folderVM.featureDisabled || !folderVM.sharedFolders.isEmpty)
                     if foldersEnabled && !folderVM.featureDisabled {
                         drawerFoldersSection(folderVM: folderVM)
                     }
@@ -1673,7 +1652,7 @@ struct MainChatView: View {
                     // ── DIVIDER between Folders & Channels ──────────────
                     let channelsEnabled = dependencies.authViewModel.featurePermissions.channels
                         && (dependencies.authViewModel.backendConfig?.features?.enableChannels ?? true)
-                    if (foldersEnabled && !folderVM.featureDisabled && !folderVM.folders.isEmpty) || (channelsEnabled && !channelListVM.channels.isEmpty) {
+                    if hasFolderSections && channelsEnabled {
                         sidebarDivider
                     }
 
@@ -1745,9 +1724,6 @@ struct MainChatView: View {
                     }
                     } // end if channelsEnabled
 
-                    // ── DIVIDER between Channels & Chats ──────────────
-                    sidebarDivider
-
                     // ── CHATS SECTION (entire section is a drop zone) ─
                     // Compute once — groupedConversations is O(n) + DateFormatter usage;
                     // evaluating it multiple times per render frame wastes CPU during
@@ -1757,6 +1733,10 @@ struct MainChatView: View {
                     let hasAnyChats = !pinnedChats.isEmpty || !groupedChats.isEmpty
 
                     if hasAnyChats || !folderVM.folders.isEmpty {
+                        // ── DIVIDER between the sections above & Chats ─
+                        if hasFolderSections || channelsEnabled {
+                            sidebarDivider
+                        }
                         VStack(alignment: .leading, spacing: 0) {
                             // Collapsible header (also acts as drop zone indicator)
                             Button {
@@ -1866,24 +1846,24 @@ struct MainChatView: View {
                 drawerBottomBar
             }
         }
-        .background(theme.background)
+        .background(theme.sidebarBackground)
         .overlay(alignment: .trailing) {
-            Rectangle()
-                .fill(theme.isDark ? Color.white.opacity(0.06) : Color.black.opacity(0.08))
-                .frame(width: 0.5)
-                .ignoresSafeArea()
+            if !usesPageCardSidebar || isLandscapeSplitActive {
+                Rectangle()
+                    .fill(theme.isDark ? Color.white.opacity(0.06) : Color.black.opacity(0.08))
+                    .frame(width: 0.5)
+                    .ignoresSafeArea()
+            }
         }
     }
 
-    // MARK: - Drawer Header (Clean Action Bar + Animated Search)
+    // MARK: - Drawer Header
 
-    /// Simplified header: just action buttons (no user name/server URL) + animated search pill.
     /// User identity lives exclusively in the bottom bar.
-    @State private var isSearchFocused: Bool = false
 
     private var drawerHeader: some View {
         VStack(spacing: 0) {
-            // Action row: server icon (left), new chat + chat-management menu (right)
+            // Action row: server icon (left), chat-management menu + search (right)
             HStack(spacing: 8) {
                 // Server favicon — tapping opens Settings
                 Button {
@@ -1896,19 +1876,6 @@ struct MainChatView: View {
                 .accessibilityLabel("Server Settings")
 
                 Spacer()
-
-                // New Chat
-                Button {
-                    closeDrawer()
-                    startNewChat()
-                } label: {
-                    Image(systemName: "square.and.pencil")
-                        .scaledFont(size: 16, weight: .medium)
-                        .foregroundStyle(theme.textSecondary)
-                        .frame(width: 36, height: 36)
-                        .contentShape(Rectangle())
-                }
-                .accessibilityLabel("New Chat")
 
                 // Chat management menu (select, archive, delete, archived/shared chats)
                 Menu {
@@ -1941,19 +1908,29 @@ struct MainChatView: View {
                         Label("Shared Chats", systemImage: "link.circle")
                     }
                 } label: {
-                    Image(systemName: "ellipsis.circle")
+                    Image(systemName: "line.3.horizontal.decrease")
                         .scaledFont(size: 16, weight: .medium)
                         .foregroundStyle(theme.textSecondary)
                         .frame(width: 36, height: 36)
                         .contentShape(Rectangle())
                 }
+                .accessibilityLabel("Chat actions")
+
+                Button {
+                    showLibrarySearch = true
+                } label: {
+                    Image(systemName: "magnifyingglass")
+                        .scaledFont(size: 16, weight: .medium)
+                        .foregroundStyle(theme.textSecondary)
+                        .frame(width: 36, height: 36)
+                        .contentShape(Rectangle())
+                }
+                .accessibilityLabel("Search library")
+                .disabled(dependencies.apiClient == nil)
             }
             .padding(.horizontal, Spacing.md)
             .padding(.top, 14)
             .padding(.bottom, 10)
-
-            // Animated search pill
-            sidebarSearchPill
         }
     }
 
@@ -1991,131 +1968,6 @@ struct MainChatView: View {
                 .strokeBorder(theme.isDark ? Color.white.opacity(0.1) : Color.black.opacity(0.08), lineWidth: 0.5)
         )
     }
-
-    // MARK: - Sidebar Search Pill (Animated)
-
-    private var sidebarSearchPill: some View {
-        HStack(spacing: 8) {
-            // Magnifying glass — shifts to brandPrimary when focused or searching
-            Image(systemName: "magnifyingglass")
-                .scaledFont(size: 13, weight: .medium, context: .list)
-                .foregroundStyle(
-                    (isSearchFocused || !listViewModel.searchText.isEmpty)
-                        ? theme.brandPrimary
-                        : theme.textTertiary
-                )
-                .animation(.easeInOut(duration: 0.2), value: isSearchFocused)
-
-            TextField("Search conversations…", text: $listViewModel.searchText) { focused in
-                withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
-                    isSearchFocused = focused
-                }
-            }
-            .scaledFont(size: 14, context: .list)
-            .foregroundStyle(theme.textPrimary)
-            .tint(theme.brandPrimary)
-
-            // Clear button — appears when there's text
-            if !listViewModel.searchText.isEmpty {
-                Button {
-                    withAnimation(.spring(response: 0.3, dampingFraction: 0.75)) {
-                        listViewModel.searchText = ""
-                    }
-                } label: {
-                    Image(systemName: "xmark.circle.fill")
-                        .scaledFont(size: 14, context: .list)
-                        .foregroundStyle(theme.textTertiary)
-                }
-                .transition(.asymmetric(
-                    insertion: .scale(scale: 0.7).combined(with: .opacity),
-                    removal: .scale(scale: 0.7).combined(with: .opacity)
-                ))
-            }
-
-            // Filter icon (idle) OR cancel (searching)
-            if isSearchFocused || !listViewModel.searchText.isEmpty {
-                Button {
-                    withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
-                        listViewModel.searchText = ""
-                        isSearchFocused = false
-                        UIApplication.shared.sendAction(
-                            #selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
-                    }
-                } label: {
-                    Text("Cancel")
-                        .scaledFont(size: 14, weight: .medium, context: .list)
-                        .foregroundStyle(theme.brandPrimary)
-                }
-                .transition(.asymmetric(
-                    insertion: .move(edge: .trailing).combined(with: .opacity),
-                    removal: .move(edge: .trailing).combined(with: .opacity)
-                ))
-            } else {
-                Menu {
-                    if !listViewModel.conversations.isEmpty {
-                        Button {
-                            withAnimation(.easeInOut(duration: 0.2)) { listViewModel.toggleSelectionMode() }
-                        } label: {
-                            Label("Select Chats", systemImage: "checkmark.circle")
-                        }
-                        Button {
-                            listViewModel.showArchiveAllConfirmation = true
-                        } label: {
-                            Label("Archive All", systemImage: "archivebox")
-                        }
-                        Button(role: .destructive) {
-                            showDeleteAllConfirmation = true
-                        } label: {
-                            Label("Delete All", systemImage: "trash")
-                        }
-                        Divider()
-                    }
-                    Button {
-                        closeDrawer(); showArchivedChats = true
-                    } label: {
-                        Label("Archived Chats", systemImage: "archivebox")
-                    }
-                    Button {
-                        closeDrawer(); showSharedChats = true
-                    } label: {
-                        Label("Shared Chats", systemImage: "link.circle")
-                    }
-                } label: {
-                    Image(systemName: "slider.horizontal.3")
-                        .scaledFont(size: 13, weight: .medium, context: .list)
-                        .foregroundStyle(theme.textTertiary)
-                }
-                .transition(.asymmetric(
-                    insertion: .opacity,
-                    removal: .opacity
-                ))
-            }
-        }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 9)
-        .background(
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .fill(
-                    (isSearchFocused || !listViewModel.searchText.isEmpty)
-                        ? theme.surfaceContainer
-                        : theme.surfaceContainer.opacity(0.6)
-                )
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .strokeBorder(
-                    (isSearchFocused || !listViewModel.searchText.isEmpty)
-                        ? theme.brandPrimary.opacity(0.35)
-                        : Color.clear,
-                    lineWidth: 1
-                )
-        )
-        .animation(.spring(response: 0.35, dampingFraction: 0.8), value: isSearchFocused)
-        .animation(.spring(response: 0.35, dampingFraction: 0.8), value: listViewModel.searchText.isEmpty)
-        .padding(.horizontal, Spacing.md)
-        .padding(.bottom, Spacing.sm)
-    }
-
     // MARK: - Sidebar Divider
 
     private var sidebarDivider: some View {
@@ -2210,91 +2062,66 @@ struct MainChatView: View {
         .padding(.bottom, Spacing.sm)
     }
 
-    // MARK: - Search Bar
+    private func openSearchChat(_ id: String) {
+        activeConversationId = id
+        activeChannelId = nil
+        activeFolderWorkspaceId = nil
+        activeFolderForWorkspace = nil
+        SharedDataService.shared.saveLastActiveConversationId(id)
+        closeDrawer()
+    }
 
-    private var searchBar: some View {
-        HStack(spacing: Spacing.sm) {
-            Image(systemName: "magnifyingglass")
-                .scaledFont(size: 14, context: .list)
-                .foregroundStyle(theme.textTertiary)
-
-            TextField("Search conversations...", text: $listViewModel.searchText)
-                .scaledFont(size: 16, context: .list)
-                .foregroundStyle(theme.textPrimary)
-
-            if !listViewModel.searchText.isEmpty {
-                Button {
-                    listViewModel.searchText = ""
-                } label: {
-                    Image(systemName: "xmark.circle.fill")
-                        .scaledFont(size: 14, context: .list)
-                        .foregroundStyle(theme.textTertiary)
+    private func openFolder(_ folderId: String) {
+        let folderVM = listViewModel.folderViewModel
+        activeFolderWorkspaceId = folderId
+        activeConversationId = nil
+        activeChannelId = nil
+        dependencies.activeChatStore.remove(nil)
+        newChatGeneration += 1
+        // Set an immediate placeholder from the flat list (may lack meta)
+        activeFolderForWorkspace = folderVM.folders.first { $0.id == folderId }
+        Task {
+            // Fetch full detail (background image URL, system prompt, models)
+            await folderVM.setActiveFolder(folderId)
+            // Pre-warm the folder background image so ChatDetailView has
+            // an instant cache hit and shows no layout shift.
+            if let bgUrl = folderVM.activeFolderDetail?.backgroundImageUrl,
+               !bgUrl.isEmpty, !bgUrl.hasPrefix("data:"),
+               let api = dependencies.apiClient {
+                let resolvedURL: URL?
+                if bgUrl.hasPrefix("http") {
+                    resolvedURL = URL(string: bgUrl)
+                } else {
+                    resolvedURL = URL(string: api.baseURL + bgUrl)
+                }
+                if let imgURL = resolvedURL {
+                    Task(priority: .userInitiated) {
+                        _ = await ImageCacheService.shared.loadImage(
+                            from: imgURL,
+                            authToken: api.network.authToken,
+                            targetPixelSize: Int(UIScreen.main.bounds.width * UIScreen.main.scale)
+                        )
+                    }
                 }
             }
-
-            if !listViewModel.conversations.isEmpty {
-                Menu {
-                    Button {
-                        withAnimation(.easeInOut(duration: 0.2)) {
-                            listViewModel.toggleSelectionMode()
-                        }
-                    } label: {
-                        Label("Select Chats", systemImage: "checkmark.circle")
-                    }
-
-                    Button {
-                        listViewModel.showArchiveAllConfirmation = true
-                    } label: {
-                        Label("Archive All Chats", systemImage: "archivebox")
-                    }
-
-                    Button(role: .destructive) {
-                        showDeleteAllConfirmation = true
-                    } label: {
-                        Label("Delete All Chats", systemImage: "trash")
-                    }
-
-                    Divider()
-
-                    Button {
-                        closeDrawer()
-                        showArchivedChats = true
-                    } label: {
-                        Label("Archived Chats", systemImage: "archivebox")
-                    }
-
-                    Button {
-                        closeDrawer()
-                        showSharedChats = true
-                    } label: {
-                        Label("Shared Chats", systemImage: "link.circle")
-                    }
-                } label: {
-                    Image(systemName: "ellipsis.circle")
-                        .scaledFont(size: 16, weight: .medium, context: .list)
-                        .foregroundStyle(theme.textSecondary)
-                        .frame(width: 44, height: 44)
-                        .contentShape(Rectangle())
-                }
+            // Load chats — they're fetched lazily and may be empty
+            // if the folder was never expanded in the sidebar.
+            if var flatFolder = folderVM.folders.first(where: { $0.id == folderId }) {
+                flatFolder.isExpanded = true   // satisfy the isExpanded guard in loadChatsIfNeeded
+                await folderVM.loadChatsIfNeeded(for: flatFolder)
             }
-
-            Button {
-                closeDrawer()
-            } label: {
-                Image(systemName: "line.3.horizontal")
-                    .scaledFont(size: 16, weight: .medium, context: .list)
-                    .foregroundStyle(theme.textSecondary)
-                    .frame(width: 44, height: 44)
-                    .contentShape(Rectangle())
+            // Merge: full detail has meta/background, flat list now has chats
+            if let detail = folderVM.activeFolderDetail {
+                var merged = detail
+                if merged.chats.isEmpty,
+                   let flatFolder = folderVM.folders.first(where: { $0.id == folderId }),
+                   !flatFolder.chats.isEmpty {
+                    merged.chats = flatFolder.chats
+                }
+                activeFolderForWorkspace = merged
             }
         }
-        .padding(.horizontal, Spacing.md)
-        .padding(.vertical, Spacing.sm)
-        .background(theme.surfaceContainer.opacity(0.5))
-        .clipShape(RoundedRectangle(cornerRadius: CornerRadius.md, style: .continuous))
-        .padding(.horizontal, Spacing.md)
-        .padding(.top, Spacing.md)
-        .padding(.bottom, Spacing.sm)
+        closeDrawer()
     }
 
     // MARK: - Drawer Section
@@ -2498,57 +2325,7 @@ struct MainChatView: View {
                             SharedDataService.shared.saveLastActiveConversationId(chatId)
                             closeDrawer()
                         },
-                        onSelectFolder: { folderId in
-                            activeFolderWorkspaceId = folderId
-                            activeConversationId = nil
-                            activeChannelId = nil
-                            dependencies.activeChatStore.remove(nil)
-                            newChatGeneration += 1
-                            // Set an immediate placeholder from the flat list (may lack meta)
-                            activeFolderForWorkspace = folderVM.folders.first { $0.id == folderId }
-                            Task {
-                                // Fetch full detail (background image URL, system prompt, models)
-                                await folderVM.setActiveFolder(folderId)
-                                // Pre-warm the folder background image so ChatDetailView has
-                                // an instant cache hit and shows no layout shift.
-                                if let bgUrl = folderVM.activeFolderDetail?.backgroundImageUrl,
-                                   !bgUrl.isEmpty, !bgUrl.hasPrefix("data:"),
-                                   let api = dependencies.apiClient {
-                                    let resolvedURL: URL?
-                                    if bgUrl.hasPrefix("http") {
-                                        resolvedURL = URL(string: bgUrl)
-                                    } else {
-                                        resolvedURL = URL(string: api.baseURL + bgUrl)
-                                    }
-                                    if let imgURL = resolvedURL {
-                                        Task(priority: .userInitiated) {
-                                            _ = await ImageCacheService.shared.loadImage(
-                                                from: imgURL,
-                                                authToken: api.network.authToken,
-                                                targetPixelSize: Int(UIScreen.main.bounds.width * UIScreen.main.scale)
-                                            )
-                                        }
-                                    }
-                                }
-                                // Load chats — they're fetched lazily and may be empty
-                                // if the folder was never expanded in the sidebar.
-                                if var flatFolder = folderVM.folders.first(where: { $0.id == folderId }) {
-                                    flatFolder.isExpanded = true   // satisfy the isExpanded guard in loadChatsIfNeeded
-                                    await folderVM.loadChatsIfNeeded(for: flatFolder)
-                                }
-                                // Merge: full detail has meta/background, flat list now has chats
-                                if let detail = folderVM.activeFolderDetail {
-                                    var merged = detail
-                                    if merged.chats.isEmpty,
-                                       let flatFolder = folderVM.folders.first(where: { $0.id == folderId }),
-                                       !flatFolder.chats.isEmpty {
-                                        merged.chats = flatFolder.chats
-                                    }
-                                    activeFolderForWorkspace = merged
-                                }
-                            }
-                            closeDrawer()
-                        },
+                        onSelectFolder: openFolder,
                         onChatMoved: { chatId, targetFolderId in
                             if let idx = listViewModel.conversations.firstIndex(where: { $0.id == chatId }) {
                                 listViewModel.conversations[idx].folderId = targetFolderId
@@ -3419,7 +3196,7 @@ struct MainChatView: View {
             .padding(.horizontal, Spacing.md)
             .padding(.vertical, 10)
         }
-        .background(theme.background)
+        .background(theme.sidebarBackground)
     }
 
     // MARK: - Title Generation

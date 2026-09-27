@@ -19,6 +19,7 @@ struct iPadMainChatView: View {
     @Environment(AppDependencyContainer.self) private var dependencies
     @Environment(AppRouter.self) private var router
     @Environment(\.theme) private var theme
+    @Environment(\.displayScale) private var displayScale
     @Environment(\.colorScheme) private var systemColorScheme
     @Environment(\.scenePhase) private var scenePhase
 
@@ -44,6 +45,7 @@ struct iPadMainChatView: View {
 
     /// Whether the workspace sheet is visible.
     @State private var showWorkspace = false
+    @State private var showLibrarySearch = false
 
     /// Whether the memories sheet is visible.
     @State private var showMemories = false
@@ -68,6 +70,7 @@ struct iPadMainChatView: View {
 
     /// Cached container width from GeometryReader (avoids deprecated UIScreen.main).
     @State private var containerWidth: CGFloat = 768
+    @State private var containerSafeAreaInsets = EdgeInsets()
 
     /// Whether socket reconnect handler has been registered.
     @State private var hasRegisteredSocketHandlers = false
@@ -176,11 +179,19 @@ struct iPadMainChatView: View {
     /// How far the main content card is pushed right.
     private var mainContentOffset: CGFloat { drawerFraction * drawerWidth }
 
+    private var usesPageCardSidebar: Bool {
+        if #available(iOS 26.0, *) { return true }
+        return false
+    }
+
     // MARK: - Body
 
     var body: some View {
         @Bindable var bindableRouter = router
         rootLayout(voiceCallBinding: $bindableRouter.isVoiceCallPresented)
+            .onGeometryChange(for: EdgeInsets.self) { proxy in
+                proxy.safeAreaInsets
+            } action: { containerSafeAreaInsets = $0 }
             .onGeometryChange(for: CGFloat.self) { proxy in
                 proxy.size.width
             } action: { newWidth in
@@ -349,22 +360,24 @@ struct iPadMainChatView: View {
                 AdminConsoleView()
                     .toolbar {
                         ToolbarItem(placement: .navigationBarLeading) {
-                            Button {
+                            Button("Close", systemImage: "xmark") {
                                 showAdminConsole = false
-                            } label: {
-                                Image(systemName: "xmark")
-                                    .font(.system(size: 14, weight: .medium))
-                                    .foregroundStyle(Color.secondary)
-                                    .frame(width: 32, height: 32)
-                                    .background(Color(uiColor: .systemGray5).opacity(0.6))
-                                    .clipShape(Circle())
                             }
+                            .labelStyle(.iconOnly)
+                            .tint(.secondary)
                         }
                     }
             }
             .environment(dependencies)
             .themed(with: dependencies.appearanceManager, accessibility: dependencies.accessibilityManager)
             .presentationCornerRadius(20)
+        }
+        .fullScreenCover(isPresented: $showLibrarySearch) {
+            if let api = dependencies.apiClient {
+                LibrarySearchView(api: api, onSelectChat: openSearchChat, onSelectFolder: openFolder)
+                    .themed(with: dependencies.appearanceManager, accessibility: dependencies.accessibilityManager)
+                    .preferredColorScheme(dependencies.appearanceManager.resolvedColorScheme ?? systemColorScheme)
+            }
         }
         // Workspace sheet
         .sheet(isPresented: $showWorkspace) {
@@ -378,16 +391,11 @@ struct iPadMainChatView: View {
                 MemoriesView()
                     .toolbar {
                         ToolbarItem(placement: .navigationBarLeading) {
-                            Button {
+                            Button("Close", systemImage: "xmark") {
                                 showMemories = false
-                            } label: {
-                                Image(systemName: "xmark")
-                                    .font(.system(size: 14, weight: .medium))
-                                    .foregroundStyle(Color.secondary)
-                                    .frame(width: 32, height: 32)
-                                    .background(Color(uiColor: .systemGray5).opacity(0.6))
-                                    .clipShape(Circle())
                             }
+                            .labelStyle(.iconOnly)
+                            .tint(.secondary)
                         }
                     }
             }
@@ -590,15 +598,54 @@ struct iPadMainChatView: View {
                     .navigationBarTitleDisplayMode(.inline)
                     .toolbarBackground(.hidden, for: .navigationBar)
             }
+            .gesture(SidebarOpeningGesture(
+                isEnabled: !showDrawer,
+                onChanged: { horizontal in
+                    if !isDraggingDrawer {
+                        UIApplication.shared.sendAction(
+                            #selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
+                    }
+                    isDraggingDrawer = true
+                    dragOffset = horizontal
+                },
+                onEnded: { horizontal, velocity, cancelled in
+                    isDraggingDrawer = false
+                    if !cancelled && (horizontal > drawerWidth * 0.05 || velocity > 200) {
+                        openDrawerAnimated()
+                    } else {
+                        closeDrawerAnimated()
+                    }
+                }
+            ))
             .ignoresSafeArea(.keyboard, edges: .bottom)
-            .offset(x: mainContentOffset)
-            .scaleEffect(1.0 - (drawerFraction * 0.08), anchor: .center)
-            .clipShape(RoundedRectangle(cornerRadius: drawerFraction * 16, style: .continuous))
-            .blur(radius: drawerFraction * 8)
+            // Include the window edges in the mask without moving safe-area content.
+            .padding(.leading, usesPageCardSidebar ? containerSafeAreaInsets.leading : 0)
+            .padding(.trailing, usesPageCardSidebar ? containerSafeAreaInsets.trailing : 0)
+            .background((usesPageCardSidebar ? theme.background : .clear).ignoresSafeArea())
+            .offset(x: usesPageCardSidebar ? 0 : mainContentOffset)
+            .scaleEffect(usesPageCardSidebar ? 1 : 1 - drawerFraction * 0.08)
+            .mask {
+                if #available(iOS 26.0, *) {
+                    ConcentricRectangle(corners: .concentric, isUniform: true)
+                        .ignoresSafeArea()
+                } else {
+                    RoundedRectangle(cornerRadius: drawerFraction * 16, style: .continuous)
+                }
+            }
+            .blur(radius: usesPageCardSidebar ? 0 : drawerFraction * 8)
             .shadow(color: .black.opacity(0.18 * drawerFraction), radius: 20, x: -4)
             .overlay {
+                if #available(iOS 26.0, *) {
+                    ConcentricRectangle(corners: .concentric, isUniform: true)
+                        .stroke(theme.isDark ? Color.white.opacity(0.1) : Color.black.opacity(0.08), lineWidth: 1 / displayScale)
+                        .opacity(drawerFraction)
+                        .ignoresSafeArea()
+                        .allowsHitTesting(false)
+                }
+            }
+            .overlay {
                 Color.black
-                    .opacity(0.12 * drawerFraction)
+                    .opacity(usesPageCardSidebar ? 0 : 0.12 * drawerFraction)
                     .ignoresSafeArea()
                     .allowsHitTesting(false)
             }
@@ -612,7 +659,7 @@ struct iPadMainChatView: View {
                     .allowsHitTesting(panelActive)
                     .onTapGesture { closeDrawerAnimated() }
                     .gesture(
-                        DragGesture(minimumDistance: 12, coordinateSpace: .local)
+                        DragGesture(minimumDistance: 12, coordinateSpace: .global)
                             .onChanged { value in
                                 let h = value.translation.width
                                 guard h < 0 else { return }
@@ -633,13 +680,18 @@ struct iPadMainChatView: View {
                     )
             }
 
+            .offset(x: usesPageCardSidebar ? mainContentOffset : 0)
+            .ignoresSafeArea(.container, edges: usesPageCardSidebar ? .horizontal : [])
+
             // MARK: Drawer panel
             drawerPanel
                 .frame(width: drawerWidth)
-                .offset(x: effectiveDrawerX)
+                .offset(x: usesPageCardSidebar ? 0 : effectiveDrawerX)
+                .zIndex(usesPageCardSidebar ? -1 : 0)
+                .allowsHitTesting(drawerFraction > 0.01)
                 .accessibilityHidden(drawerFraction < 0.01)
                 .gesture(
-                    DragGesture(minimumDistance: 12, coordinateSpace: .local)
+                    DragGesture(minimumDistance: 12, coordinateSpace: .global)
                         .onChanged { value in
                             let h = value.translation.width
                             guard h < 0 else { return }
@@ -659,52 +711,6 @@ struct iPadMainChatView: View {
                         }
                 )
 
-            // MARK: Left-edge strip — swipe right to open (when drawer is closed)
-            // Note: do NOT hide this based on isDraggingDrawer — removing it mid-gesture
-            // cancels the DragGesture before onEnded fires, causing the drawer to open only ~5%.
-            //
-            // The strip is offset below the navigation bar (≈60pt for status bar + nav bar)
-            // so it does NOT intercept taps on the hamburger button in the toolbar. Without
-            // this offset the clear+contentShape layer sits on top of the toolbar and swallows
-            // taps before the Button underneath can fire.
-            if !showDrawer {
-                Color.clear
-                    .frame(width: 44)
-                    .frame(maxHeight: .infinity)
-                    .contentShape(Rectangle())
-                    .gesture(
-                        DragGesture(minimumDistance: 8, coordinateSpace: .local)
-                            .onChanged { value in
-                                let h = value.translation.width
-                                let v = abs(value.translation.height)
-                                guard abs(h) > v, h > 0 else { return }
-                                if !isDraggingDrawer {
-                                    UIApplication.shared.sendAction(
-                                        #selector(UIResponder.resignFirstResponder),
-                                        to: nil, from: nil, for: nil)
-                                }
-                                isDraggingDrawer = true
-                                dragOffset = h
-                            }
-                            .onEnded { value in
-                                guard isDraggingDrawer else { return }
-                                isDraggingDrawer = false
-                                let h = value.translation.width
-                                let v = value.velocity.width
-                                // Low threshold so even a short flick commits the open
-                                if h > drawerWidth * 0.05 || v > 200 {
-                                    openDrawerAnimated()
-                                } else {
-                                    closeDrawerAnimated()
-                                }
-                            }
-                    )
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    // Offset below the status bar + navigation bar so the clear hit-test
-                    // area does not block the hamburger button in the toolbar (~60pt).
-                    .padding(.top, 60)
-            }
-
             // ── Layer 4: AnimatedPhotoPicker at window level ──────────────────
             AnimatedPhotoPicker(
                 isPresented: showAnimatedPhotoPicker,
@@ -721,12 +727,14 @@ struct iPadMainChatView: View {
                 }
             )
         }
+        .background((usesPageCardSidebar ? theme.sidebarBackground : .clear).ignoresSafeArea())
     }
 
     // MARK: - Drawer Panel
 
     private var drawerPanel: some View {
         iPadSidebarContent(
+            showsTrailingDivider: sidebarAlwaysShown || !usesPageCardSidebar,
             listViewModel: listViewModel,
             channelListVM: channelListVM,
             activeConversationId: $activeConversationId,
@@ -750,67 +758,79 @@ struct iPadMainChatView: View {
             renamingConversation: $renamingConversation,
             renameText: $renameText,
             dependencies: dependencies,
+            onSearch: { showLibrarySearch = true },
             onNewChat: {
                 startNewChat()
                 if !sidebarAlwaysShown { closeDrawerAnimated() }
             },
-            onSelectFolder: { folderId in
-                let folderVM = listViewModel.folderViewModel
-                activeFolderWorkspaceId = folderId
-                activeConversationId = nil
-                activeChannelId = nil
-                dependencies.activeChatStore.remove(nil)
-                newChatGeneration += 1
-                // Set immediate placeholder from the flat list (may lack meta)
-                activeFolderForWorkspace = folderVM.folders.first { $0.id == folderId }
-                Task {
-                    // Fetch full detail (background image URL, system prompt, models)
-                    await folderVM.setActiveFolder(folderId)
-                    // Pre-warm the folder background image so ChatDetailView has
-                    // an instant cache hit and shows no layout shift.
-                    if let bgUrl = folderVM.activeFolderDetail?.backgroundImageUrl,
-                       !bgUrl.isEmpty, !bgUrl.hasPrefix("data:"),
-                       let api = dependencies.apiClient {
-                        let resolvedURL: URL?
-                        if bgUrl.hasPrefix("http") {
-                            resolvedURL = URL(string: bgUrl)
-                        } else {
-                            resolvedURL = URL(string: api.baseURL + bgUrl)
-                        }
-                        if let imgURL = resolvedURL {
-                            Task(priority: .userInitiated) {
-                                _ = await ImageCacheService.shared.loadImage(
-                                    from: imgURL,
-                                    authToken: api.network.authToken,
-                                    targetPixelSize: Int(UIScreen.main.bounds.width * UIScreen.main.scale)
-                                )
-                            }
-                        }
-                    }
-                    // Load chats — they're fetched lazily and may be empty
-                    // if the folder was never expanded in the sidebar.
-                    if var flatFolder = folderVM.folders.first(where: { $0.id == folderId }) {
-                        flatFolder.isExpanded = true   // satisfy the isExpanded guard in loadChatsIfNeeded
-                        await folderVM.loadChatsIfNeeded(for: flatFolder)
-                    }
-                    // Merge: full detail has meta/background, flat list now has chats
-                    if let detail = folderVM.activeFolderDetail {
-                        var merged = detail
-                        if merged.chats.isEmpty,
-                           let flatFolder = folderVM.folders.first(where: { $0.id == folderId }),
-                           !flatFolder.chats.isEmpty {
-                            merged.chats = flatFolder.chats
-                        }
-                        activeFolderForWorkspace = merged
-                    }
-                }
-                if !sidebarAlwaysShown { closeDrawerAnimated() }
-            },
+            onSelectFolder: openFolder,
             onExport: { conv, format in Task { await exportChat(conv, format: format) } },
             onShowArchivedChats: { showArchivedChats = true },
             onShowSharedChats: { showSharedChats = true },
             onCloseDrawer: sidebarAlwaysShown ? nil : { closeDrawerAnimated() }
         )
+    }
+
+    private func openSearchChat(_ id: String) {
+        activeConversationId = id
+        activeChannelId = nil
+        activeFolderWorkspaceId = nil
+        activeFolderForWorkspace = nil
+        SharedDataService.shared.saveLastActiveConversationId(id)
+        if !sidebarAlwaysShown { closeDrawerAnimated() }
+    }
+
+    private func openFolder(_ folderId: String) {
+        let folderVM = listViewModel.folderViewModel
+        activeFolderWorkspaceId = folderId
+        activeConversationId = nil
+        activeChannelId = nil
+        dependencies.activeChatStore.remove(nil)
+        newChatGeneration += 1
+        // Set immediate placeholder from the flat list (may lack meta)
+        activeFolderForWorkspace = folderVM.folders.first { $0.id == folderId }
+        Task {
+            // Fetch full detail (background image URL, system prompt, models)
+            await folderVM.setActiveFolder(folderId)
+            // Pre-warm the folder background image so ChatDetailView has
+            // an instant cache hit and shows no layout shift.
+            if let bgUrl = folderVM.activeFolderDetail?.backgroundImageUrl,
+               !bgUrl.isEmpty, !bgUrl.hasPrefix("data:"),
+               let api = dependencies.apiClient {
+                let resolvedURL: URL?
+                if bgUrl.hasPrefix("http") {
+                    resolvedURL = URL(string: bgUrl)
+                } else {
+                    resolvedURL = URL(string: api.baseURL + bgUrl)
+                }
+                if let imgURL = resolvedURL {
+                    Task(priority: .userInitiated) {
+                        _ = await ImageCacheService.shared.loadImage(
+                            from: imgURL,
+                            authToken: api.network.authToken,
+                            targetPixelSize: Int(UIScreen.main.bounds.width * UIScreen.main.scale)
+                        )
+                    }
+                }
+            }
+            // Load chats — they're fetched lazily and may be empty
+            // if the folder was never expanded in the sidebar.
+            if var flatFolder = folderVM.folders.first(where: { $0.id == folderId }) {
+                flatFolder.isExpanded = true   // satisfy the isExpanded guard in loadChatsIfNeeded
+                await folderVM.loadChatsIfNeeded(for: flatFolder)
+            }
+            // Merge: full detail has meta/background, flat list now has chats
+            if let detail = folderVM.activeFolderDetail {
+                var merged = detail
+                if merged.chats.isEmpty,
+                   let flatFolder = folderVM.folders.first(where: { $0.id == folderId }),
+                   !flatFolder.chats.isEmpty {
+                    merged.chats = flatFolder.chats
+                }
+                activeFolderForWorkspace = merged
+            }
+        }
+        if !sidebarAlwaysShown { closeDrawerAnimated() }
     }
 
     // MARK: - Drawer Animations
@@ -1171,6 +1191,7 @@ struct iPadMainChatView: View {
 // MARK: - iPad Sidebar Content
 
 struct iPadSidebarContent: View {
+    var showsTrailingDivider: Bool
     @Bindable var listViewModel: ChatListViewModel
     var channelListVM: ChannelListViewModel
     @Binding var activeConversationId: String?
@@ -1194,6 +1215,7 @@ struct iPadSidebarContent: View {
     @Binding var renamingConversation: Conversation?
     @Binding var renameText: String
     let dependencies: AppDependencyContainer
+    let onSearch: () -> Void
     let onNewChat: () -> Void
     /// Called when the folder name/icon is tapped — opens folder workspace in the detail pane.
     var onSelectFolder: ((String) -> Void)?
@@ -1250,6 +1272,7 @@ struct iPadSidebarContent: View {
 
                     // Folders section
                     let foldersEnabled = dependencies.authViewModel.featurePermissions.folders
+                    let hasFolderSections = foldersEnabled && (!folderVM.featureDisabled || !folderVM.sharedFolders.isEmpty)
                     if foldersEnabled && !folderVM.featureDisabled {
                         foldersSection(folderVM: folderVM)
                     }
@@ -1262,7 +1285,7 @@ struct iPadSidebarContent: View {
                     // Divider between folders and channels
                     let channelsEnabled = dependencies.authViewModel.featurePermissions.channels
                         && (dependencies.authViewModel.backendConfig?.features?.enableChannels ?? true)
-                    if (foldersEnabled && !folderVM.featureDisabled && !folderVM.folders.isEmpty) || (channelsEnabled && !channelListVM.channels.isEmpty) {
+                    if hasFolderSections && channelsEnabled {
                         sidebarDivider
                     }
 
@@ -1271,16 +1294,15 @@ struct iPadSidebarContent: View {
                         channelsSection
                     }
 
-                    // Divider between channels and chats
-                    if channelsEnabled && !channelListVM.channels.isEmpty {
-                        sidebarDivider
-                    }
-
                     // Chats section
                     let hasAnyChats = !listViewModel.pinnedConversations.isEmpty
                         || !listViewModel.groupedConversations.isEmpty
 
                     if hasAnyChats || !folderVM.folders.isEmpty {
+                        // Divider between the sections above and chats
+                        if hasFolderSections || channelsEnabled {
+                            sidebarDivider
+                        }
                         chatsSection(folderVM: folderVM)
                     }
                 }
@@ -1293,12 +1315,14 @@ struct iPadSidebarContent: View {
                 sidebarBottomBar
             }
         }
-        .background(theme.background)
+        .background(theme.sidebarBackground)
         .overlay(alignment: .trailing) {
-            Rectangle()
-                .fill(theme.isDark ? Color.white.opacity(0.06) : Color.black.opacity(0.08))
-                .frame(width: 0.5)
-                .ignoresSafeArea()
+            if showsTrailingDivider {
+                Rectangle()
+                    .fill(theme.isDark ? Color.white.opacity(0.06) : Color.black.opacity(0.08))
+                    .frame(width: 0.5)
+                    .ignoresSafeArea()
+            }
         }
         // Sidebar has no text inputs that need keyboard avoidance — ignore
         // keyboard safe area so the sidebar layout doesn't shift when a
@@ -1365,15 +1389,6 @@ struct iPadSidebarContent: View {
                     }
                 }
             }
-            ToolbarItem(placement: .topBarTrailing) {
-                Button(action: onNewChat) {
-                    Image(systemName: "square.and.pencil")
-                        .scaledFont(size: 15, weight: .medium, context: .list)
-                        .foregroundStyle(theme.textSecondary)
-                }
-                .buttonStyle(.plain)
-                .accessibilityLabel("New Chat")
-            }
         }
         .toolbarBackground(.hidden, for: .navigationBar)
     }
@@ -1434,16 +1449,16 @@ struct iPadSidebarContent: View {
 
                 Spacer()
 
-                // New Chat button
-                Button(action: onNewChat) {
-                    Image(systemName: "square.and.pencil")
+                Button(action: onSearch) {
+                    Image(systemName: "magnifyingglass")
                         .scaledFont(size: 14, weight: .semibold)
                         .foregroundStyle(theme.brandPrimary)
                         .frame(width: 32, height: 32)
                         .background(theme.brandPrimary.opacity(0.1))
                         .clipShape(Circle())
                 }
-                .accessibilityLabel("New Chat")
+                .accessibilityLabel("Search library")
+                .disabled(dependencies.apiClient == nil)
 
                 // More menu
                 Menu {
@@ -1498,53 +1513,7 @@ struct iPadSidebarContent: View {
             .padding(.horizontal, Spacing.md)
             .padding(.top, Spacing.md)
             .padding(.bottom, 10)
-
-            // Search pill
-            sidebarSearchPill
         }
-    }
-
-    // MARK: - Sidebar Search Pill
-
-    private var sidebarSearchPill: some View {
-        HStack(spacing: 8) {
-            Image(systemName: "magnifyingglass")
-                .scaledFont(size: 12, weight: .medium, context: .list)
-                .foregroundStyle(listViewModel.searchText.isEmpty ? theme.textTertiary : theme.brandPrimary)
-                .animation(.easeInOut(duration: 0.15), value: listViewModel.searchText.isEmpty)
-
-            TextField("Search conversations…", text: $listViewModel.searchText)
-                .scaledFont(size: 13, context: .list)
-                .foregroundStyle(theme.textPrimary)
-                .tint(theme.brandPrimary)
-
-            if !listViewModel.searchText.isEmpty {
-                Button {
-                    withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
-                        listViewModel.searchText = ""
-                    }
-                } label: {
-                    Image(systemName: "xmark.circle.fill")
-                        .scaledFont(size: 13, context: .list)
-                        .foregroundStyle(theme.textTertiary)
-                }
-                .transition(.scale.combined(with: .opacity))
-            }
-        }
-        .padding(.horizontal, 11)
-        .padding(.vertical, 8)
-        .background(theme.surfaceContainer.opacity(0.7))
-        .clipShape(RoundedRectangle(cornerRadius: 11, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: 11, style: .continuous)
-                .strokeBorder(
-                    listViewModel.searchText.isEmpty ? Color.clear : theme.brandPrimary.opacity(0.3),
-                    lineWidth: 1
-                )
-        )
-        .animation(.easeInOut(duration: 0.2), value: listViewModel.searchText.isEmpty)
-        .padding(.horizontal, Spacing.md)
-        .padding(.bottom, Spacing.sm)
     }
 
     // MARK: - Sidebar Divider
@@ -1555,12 +1524,6 @@ struct iPadSidebarContent: View {
             .frame(height: 1)
             .padding(.horizontal, Spacing.md)
             .padding(.vertical, 6)
-    }
-
-    // MARK: - Search Bar (kept for backwards compatibility)
-
-    private var sidebarSearchBar: some View {
-        sidebarSearchPill
     }
 
     // MARK: - Selection Mode Header
@@ -2595,7 +2558,7 @@ struct iPadSidebarContent: View {
             .padding(.horizontal, Spacing.md)
             .padding(.vertical, 10)
         }
-        .background(theme.background)
+        .background(theme.sidebarBackground)
     }
 }
 
@@ -2792,16 +2755,11 @@ private extension View {
                     NotesListView()
                         .toolbar {
                             ToolbarItem(placement: .navigationBarLeading) {
-                                Button {
+                                Button("Close", systemImage: "xmark") {
                                     showNotes.wrappedValue = false
-                                } label: {
-                                    Image(systemName: "xmark")
-                                        .font(.system(size: 14, weight: .medium))
-                                        .foregroundStyle(Color.secondary)
-                                        .frame(width: 32, height: 32)
-                                        .background(Color(uiColor: .systemGray5).opacity(0.6))
-                                        .clipShape(Circle())
                                 }
+                                .labelStyle(.iconOnly)
+                                .tint(.secondary)
                             }
                         }
                 }

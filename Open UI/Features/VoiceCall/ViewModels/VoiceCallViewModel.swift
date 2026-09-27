@@ -1,735 +1,411 @@
 import Foundation
 import AVFoundation
+import Speech
 import UIKit
 import os.log
 
-/// Orchestrates voice call functionality by coordinating speech recognition,
-/// text-to-speech, and CallKit services.
-///
-/// Manages the listen → process → speak → listen cycle for hands-free
-/// conversational AI interaction.
-///
-/// Supports two STT backends:
-/// - **Apple on-device** (`SpeechRecognitionService`) — default, works offline
-/// - **Server-side** (`ServerSpeechRecognitionService`) — records mic → uploads to
-///   `POST /api/v1/audio/transcriptions` when `sttEngine == "server"`
+/// Voice call UI state. Delegates the audio pipeline to `CallOrchestrator`
+/// (one shared engine with echo cancellation, VAD turn-taking, streaming TTS).
 @MainActor @Observable
 final class VoiceCallViewModel {
 
-    // MARK: - State
-
     enum CallState: Sendable, Equatable {
-        case idle
-        case connecting
-        case listening
-        case paused
-        case processing
-        case speaking
+        case idle, connecting, listening, paused, processing, speaking
         case error(String)
         case disconnected
     }
 
-    /// Current call state.
     private(set) var callState: CallState = .idle
-
-    /// The current user's speech transcript (shown briefly while listening).
     private(set) var currentTranscript: String = ""
-
-    /// Voice intensity for waveform (0–10).
+    /// Voice intensity for the waveform (0–10).
     private(set) var voiceIntensity: Int = 0
-
-    /// Whether the microphone is muted.
-    private(set) var isMuted: Bool = false
-
-    /// Whether the call is paused.
-    private(set) var isPaused: Bool = false
-
-    /// Whether audio is routed to the loudspeaker.
-    private(set) var isSpeakerOn: Bool = true
-
-    /// The model name being used.
-    private(set) var modelName: String = ""
-
-    /// Call duration in seconds.
+    private(set) var isMuted = false
+    private(set) var isPaused = false
+    private(set) var isSpeakerOn = true
+    private(set) var modelName = ""
     private(set) var callDuration: TimeInterval = 0
-
-    /// Error message if in error state.
     var errorMessage: String?
+    /// Live turn-taking readout (nil unless Diagnostics is on).
+    private(set) var diagnostics: CallDiagnostics?
+
+    /// True when the active STT engine transcribes the whole utterance after the turn ends.
+    private(set) var isUsingServerSTT = false
 
     // MARK: - Dependencies
+    let ttsService: TextToSpeechService
+    let vadModelStore: VADModelStore
+    let settings: VoiceCallSettings
+    let apiClientProvider: @MainActor () -> APIClient?
+    var conversationManager: ConversationManager?
+    var chatViewModel: ChatViewModel?
 
-    /// Apple on-device STT — set when not using server STT.
-    private let speechService: SpeechRecognitionService?
-    /// Server-side STT — set when `sttEngine == "server"`.
-    private let serverSpeechService: ServerSpeechRecognitionService?
-    private let ttsService: TextToSpeechService
-    private let callKitManager: CallKitManager
-    private var conversationManager: ConversationManager?
-    private var chatViewModel: ChatViewModel?
-
-    /// True when using the server-based STT (records → uploads) instead of Apple Speech.
-    var isUsingServerSTT: Bool { serverSpeechService != nil }
-
-    private let logger = Logger(subsystem: "com.openui", category: "VoiceCall")
-    private var durationTimer: Task<Void, Never>?
-    private var intensityTask: Task<Void, Never>?
-    private var callStartTime: Date?
-    /// Tracks the task running `handleFinalTranscript` → `waitForResponseAndSpeak`.
-    /// Cancelled in `endCall()` so TTS stops immediately when the user disconnects.
-    private var responseTask: Task<Void, Never>?
-
-    // MARK: - Init (Apple on-device STT)
+    @ObservationIgnored var orchestrator: CallOrchestrator?
+    @ObservationIgnored let audioSession = CallAudioSession()
+    @ObservationIgnored var durationTimer: Task<Void, Never>?
+    @ObservationIgnored var callStartTime: Date?
+    @ObservationIgnored let logger = Logger(subsystem: "com.openui", category: "VoiceCall")
+    @ObservationIgnored var backgroundObservers: [NSObjectProtocol] = []
+    @ObservationIgnored var wasPausedByInterruption = false
+    @ObservationIgnored let liveActivity = VoiceCallLiveActivityController()
+    /// Short background-task assertion held while a turn is being answered, so
+    /// iOS doesn't suspend networking in the gap between mic and speaker audio.
+    @ObservationIgnored var turnBackgroundTask: UIBackgroundTaskIdentifier = .invalid
 
     init(
-        speechService: SpeechRecognitionService,
         ttsService: TextToSpeechService,
-        callKitManager: CallKitManager
+        vadModelStore: VADModelStore,
+        settings: VoiceCallSettings,
+        apiClientProvider: @escaping @MainActor () -> APIClient?
     ) {
-        self.speechService = speechService
-        self.serverSpeechService = nil
         self.ttsService = ttsService
-        self.callKitManager = callKitManager
-
-        setupCallbacks()
+        self.vadModelStore = vadModelStore
+        self.settings = settings
+        self.apiClientProvider = apiClientProvider
+        self.isSpeakerOn = settings.defaultSpeakerOn
     }
 
-    // MARK: - Init (Server-side STT)
-
-    init(
-        serverSpeechService: ServerSpeechRecognitionService,
-        ttsService: TextToSpeechService,
-        callKitManager: CallKitManager
-    ) {
-        self.speechService = nil
-        self.serverSpeechService = serverSpeechService
-        self.ttsService = ttsService
-        self.callKitManager = callKitManager
-
-        setupCallbacks()
-    }
-
-    // MARK: - Configuration
-
-    /// Configures the voice call with a conversation manager and chat view model.
-    func configure(
-        conversationManager: ConversationManager,
-        chatViewModel: ChatViewModel,
-        modelName: String
-    ) {
+    func configure(conversationManager: ConversationManager, chatViewModel: ChatViewModel, modelName: String) {
         self.conversationManager = conversationManager
         self.chatViewModel = chatViewModel
         self.modelName = modelName
-        // Signal voice mode so every sendMessage() includes features.voice=true,
-        // causing the server to inject the admin-configured VOICE_MODE_PROMPT_TEMPLATE.
+        // features.voice=true → server injects VOICE_MODE_PROMPT_TEMPLATE.
         chatViewModel.isVoiceMode = true
     }
 
-    // MARK: - Call Lifecycle
-
-    /// Starts a new voice call session.
-    func startCall() async {
-        switch callState {
-        case .idle, .disconnected: break
-        case .error:
-            await endCall()
-            setupCallbacks()
-            chatViewModel?.isVoiceMode = true
-        default: return
-        }
-        errorMessage = nil
-
-        callState = .connecting
-        ttsService.readAloudPlayer.stop()
-
-        // Request permissions (both STT backends need mic access)
-        let authorized: Bool
-        if let serverSTT = serverSpeechService {
-            authorized = await serverSTT.requestPermissions()
-        } else {
-            authorized = await speechService?.requestPermissions() ?? false
-        }
-
-        guard callState == .connecting else { return }
-        guard authorized else {
-            callState = .error("Microphone and speech recognition permissions are required.")
-            errorMessage = "Please grant microphone and speech recognition permissions in Settings."
-            return
-        }
-
-        // Prevent the screen from auto-locking during a voice call.
-        // The call requires continuous STT + TTS + LLM streaming — all of which
-        // stop working if the device sleeps. Restored in endCall().
-        UIApplication.shared.isIdleTimerDisabled = true
-
-        // Start CallKit session
-        do {
-            try await callKitManager.startCall(displayName: modelName.isEmpty ? "AI Assistant" : modelName)
-        } catch {
-            logger.warning("CallKit start failed (non-fatal): \(error.localizedDescription)")
-        }
-
-        guard callState == .connecting else { return }
-
-        // Apply the user's TTS configuration so voice calls use identical
-        // settings to the chat read-aloud button (speech rate, voice, engine).
-        let rate = UserDefaults.standard.double(forKey: "ttsSpeechRate")
-        if rate > 0 {
-            ttsService.speechRate = Float(rate) * AVSpeechUtteranceDefaultSpeechRate
-        }
-        let voiceId = UserDefaults.standard.string(forKey: "ttsVoiceIdentifier") ?? ""
-        ttsService.voiceIdentifier = voiceId.isEmpty ? nil : voiceId
-
-        // Preload on-device TTS model if the user chose Kokoro or Qwen3
-        if ttsService.preferredEngine == .kokoro || ttsService.preferredEngine == .qwen3 {
-            let modelName = ttsService.preferredEngine == .qwen3 ? "Qwen3" : "Kokoro"
-            logger.info("Voice call: preloading \(modelName) TTS model...")
-            await ttsService.preloadKokoroModel()
-        }
-
-        guard callState == .connecting else { return }
-
-        // Keep .playAndRecord session alive for the full call duration so the mic
-        // stays active during TTS. Speaker vs earpiece routing is controlled
-        // separately via applySpeakerOverride() — don't tie it to speakerOverrideEnabled.
-        ttsService.speakerOverrideEnabled = true
-
-        // Start call timer
-        callStartTime = Date()
-        startDurationTimer()
-
-        // Start listening
-        await startListening()
-    }
-
-    /// Ends the current voice call.
-    func endCall() async {
-        callState = .disconnected
-        stopActiveSTT(discardRecording: true)
-        // Cancel the response pipeline first so waitForResponseAndSpeak() stops looping
-        // and cannot call finishStreamingTTS() or startListening() after we end the call.
-        responseTask?.cancel()
-        responseTask = nil
-        ttsService.stop()
-        await callKitManager.endCall()
-
-        durationTimer?.cancel()
-        durationTimer = nil
-        currentTranscript = ""
-        voiceIntensity = 0
-
-        // Re-enable auto-lock now that the call is over.
-        UIApplication.shared.isIdleTimerDisabled = false
-
-        // Disable speaker override so TTS outside a call behaves normally
-        ttsService.speakerOverrideEnabled = false
-        ttsService.outputPortOverride = .none
-
-        // Restore the global baseline audio session so HTML audio and regular TTS
-        // continue working after the voice call ends.
-        let session = AVAudioSession.sharedInstance()
-        try? session.setCategory(.playAndRecord, mode: .default,
-                                 options: [.defaultToSpeaker, .allowBluetoothHFP,
-                                           .allowBluetoothA2DP, .mixWithOthers])
-        try? session.setActive(true)
-
-        // Reset voice mode flag so normal chat from the same ChatViewModel
-        // doesn't continue sending features.voice=true after the call ends.
-        chatViewModel?.isVoiceMode = false
-
-        // CRITICAL: Clear all shared service callbacks so a stale VM reference
-        // cannot restart the microphone after the call ends. Without this, the
-        // ttsService.onComplete closure (which calls startListening) remains set
-        // on the shared singleton and fires the next time any TTS plays — causing
-        // the mic to turn on permanently in the background.
-        clearCallbacks()
-    }
-
-    /// Pauses listening.
-    func pauseListening() {
-        isPaused = true
-        stopActiveSTT(discardRecording: true)
-        callState = .paused
-    }
-
-    /// Resumes listening after pause.
-    func resumeListening() async {
-        isPaused = false
-        await startListening()
-    }
-
-    /// Toggles mute state.
-    /// Mute only silences the microphone — it does NOT stop TTS playback,
-    /// interrupt any in-progress response, or change the call state.
-    /// Unmuting restarts the mic only when the call is idle/listening;
-    /// if TTS is still playing the existing onComplete callback will restart it.
-    func toggleMute() {
-        isMuted.toggle()
-        if isMuted {
-            // If we were listening and have a partial transcript, submit it so the
-            // request still goes through even though we're muting mid-listen.
-            let partialTranscript = activeCurrentTranscript
-            stopActiveSTT()
-            if callState == .listening && !partialTranscript.isEmpty {
-                Task { await handleFinalTranscript(partialTranscript) }
-            }
-            // Otherwise just silence the mic — TTS/streaming keep running untouched.
-        } else {
-            // Only restart mic if we're not already speaking/processing a response.
-            // If speaking, ttsService.onComplete will call startListening() when done.
-            if callState != .speaking && callState != .processing {
-                Task { await startListening() }
-            }
-        }
-    }
-
-    /// Cancels the current TTS playback and resumes listening.
-    func cancelSpeaking() async {
-        ttsService.stop()
-        await startListening()
-    }
-
-    /// Toggles audio output between loudspeaker and earpiece.
-    func toggleSpeaker() {
-        isSpeakerOn.toggle()
-        // speakerOverrideEnabled stays true for the whole call (keeps .playAndRecord active).
-        // Only the output port routing needs to change here.
-        applySpeakerOverride()
-    }
-
-    /// Applies the current speaker routing preference to the active audio session.
-    func applySpeakerOverride() {
-        do {
-            let session = AVAudioSession.sharedInstance()
-            // Don't override routing when audio is going through CarPlay or BT HFP —
-            // overrideOutputAudioPort(.speaker) would pull audio away from the car.
-            let isCarPlayOrHFP = session.currentRoute.outputs.contains { output in
-                output.portType == .carAudio || output.portType == .bluetoothHFP
-            }
-            guard !isCarPlayOrHFP else { return }
-            let portOverride: AVAudioSession.PortOverride = isSpeakerOn ? .speaker : .none
-            // Persist into TTS service so it re-applies the override whenever it
-            // reconfigures the audio session (setActive resets overrideOutputAudioPort).
-            ttsService.outputPortOverride = portOverride
-            try session.overrideOutputAudioPort(portOverride)
-        } catch {
-            logger.warning("Speaker override failed: \(error.localizedDescription)")
-        }
-    }
-
-    // MARK: - Formatted Duration
+    // MARK: - Labels
 
     var formattedDuration: String {
-        let mins = Int(callDuration) / 60
-        let secs = Int(callDuration) % 60
-        return String(format: "%02d:%02d", mins, secs)
+        String(format: "%02d:%02d", Int(callDuration) / 60, Int(callDuration) % 60)
     }
-
-    // MARK: - State Label
 
     var stateLabel: String {
         switch callState {
         case .idle: return "Ready"
         case .connecting: return "Connecting…"
-        case .listening:
-            return isUsingServerSTT ? "Recording…" : "Listening…"
+        case .listening: return "Listening…"
         case .paused: return "Paused"
-        case .processing:
-            return isUsingServerSTT ? "Transcribing…" : "Thinking…"
+        case .processing: return isUsingServerSTT ? "Transcribing…" : "Thinking…"
         case .speaking: return "Speaking"
         case .error: return "Error"
         case .disconnected: return "Call Ended"
         }
     }
+}
 
-    // MARK: - Private Helpers
+// MARK: - Call lifecycle
 
-    /// Stops whichever STT service is active.
-    private func stopActiveSTT(discardRecording: Bool = false) {
-        intensityTask?.cancel()
-        intensityTask = nil
-        if let serverSTT = serverSpeechService {
-            if discardRecording { serverSTT.cancelListening() }
-            else { serverSTT.stopListening() }
-        } else {
-            speechService?.stopListening()
+extension VoiceCallViewModel {
+
+    func startCall() async {
+        switch callState {
+        case .idle, .disconnected: break
+        case .error:
+            await endCall()
+            chatViewModel?.isVoiceMode = true
+        default: return
         }
-    }
-
-    /// Current intensity from whichever STT service is active.
-    private var activeIntensity: Int {
-        if let serverSTT = serverSpeechService { return serverSTT.intensity }
-        return speechService?.intensity ?? 0
-    }
-
-    /// Current transcript from whichever STT service is active.
-    private var activeCurrentTranscript: String {
-        if let serverSTT = serverSpeechService { return serverSTT.currentTranscript }
-        return speechService?.currentTranscript ?? ""
-    }
-
-    /// Clears all callbacks installed on shared services.
-    /// Must be called when the call ends to prevent a stale VM from
-    /// restarting the microphone the next time any TTS plays elsewhere in the app.
-    private func clearCallbacks() {
-        speechService?.onFinalTranscript = nil
-        speechService?.onStateChanged = nil
-        speechService?.onError = nil
-        serverSpeechService?.onFinalTranscript = nil
-        serverSpeechService?.onStateChanged = nil
-        serverSpeechService?.onError = nil
-        ttsService.onStart = nil
-        ttsService.onComplete = nil
-        ttsService.onError = nil
-        callKitManager.onCallEnded = nil
-        callKitManager.onMuteToggled = nil
-        callKitManager.onAudioSessionActivated = nil
-    }
-
-    /// Sets up callbacks between services.
-    private func setupCallbacks() {
-        // --- Apple on-device STT callbacks ---
-        speechService?.onFinalTranscript = { [weak self] transcript in
-            Task { @MainActor [weak self] in
-                await self?.handleFinalTranscript(transcript)
-            }
-        }
-
-        speechService?.onStateChanged = { [weak self] state in
-            Task { @MainActor [weak self] in
-                guard let self else { return }
-                switch state {
-                case .listening:
-                    self.voiceIntensity = self.speechService?.intensity ?? 0
-                case .error(let msg):
-                    self.logger.error("Speech error: \(msg)")
-                default:
-                    break
-                }
-            }
-        }
-
-        speechService?.onError = { [weak self] error in
-            Task { @MainActor [weak self] in
-                self?.logger.error("Speech recognition error: \(error)")
-            }
-        }
-
-        // --- Server STT callbacks ---
-        serverSpeechService?.onFinalTranscript = { [weak self] transcript in
-            Task { @MainActor [weak self] in
-                await self?.handleFinalTranscript(transcript)
-            }
-        }
-
-        serverSpeechService?.onStateChanged = { [weak self] state in
-            Task { @MainActor [weak self] in
-                guard let self else { return }
-                switch state {
-                case .listening:
-                    self.voiceIntensity = self.serverSpeechService?.intensity ?? 0
-                case .processing:
-                    // Server is uploading/transcribing — show a processing state
-                    if self.callState == .listening {
-                        self.callState = .processing
-                    }
-                case .error(let msg):
-                    self.logger.error("Server STT error: \(msg)")
-                    // On error, restart listening so the call continues
-                    if !self.isPaused && !self.isMuted {
-                        Task { await self.startListening() }
-                    }
-                default:
-                    break
-                }
-            }
-        }
-
-        // --- TTS callbacks ---
-        ttsService.onStart = { [weak self] in
-            Task { @MainActor [weak self] in
-                guard let self, self.callState != .disconnected else { return }
-                self.callState = .speaking
-            }
-        }
-
-        ttsService.onComplete = { [weak self] in
-            Task { @MainActor [weak self] in
-                guard let self else { return }
-                if !self.isPaused && !self.isMuted {
-                    await self.startListening()
-                }
-            }
-        }
-
-        ttsService.onError = { [weak self] error in
-            Task { @MainActor [weak self] in
-                self?.logger.error("TTS error: \(error)")
-                if let self, !self.isPaused && !self.isMuted {
-                    await self.startListening()
-                }
-            }
-        }
-
-        // --- CallKit callbacks ---
-        callKitManager.onCallEnded = { [weak self] in
-            Task { @MainActor [weak self] in
-                await self?.endCall()
-            }
-        }
-
-        callKitManager.onMuteToggled = { [weak self] muted in
-            Task { @MainActor [weak self] in
-                guard let self else { return }
-                self.isMuted = muted
-                if muted {
-                    // Hardware mute: only silence the mic, leave TTS and response pipeline running
-                    self.stopActiveSTT()
-                } else {
-                    // Only restart mic if not speaking/processing — onComplete handles the rest
-                    if self.callState != .speaking && self.callState != .processing {
-                        await self.startListening()
-                    }
-                }
-            }
-        }
-
-        callKitManager.onAudioSessionActivated = { [weak self] in
-            Task { @MainActor [weak self] in
-                // CallKit reset the audio session — re-apply our speaker preference
-                self?.applySpeakerOverride()
-            }
-        }
-    }
-
-    /// Starts speech recognition using whichever STT backend is active.
-    private func startListening() async {
-        guard callState != .disconnected else { return }
-        guard !isMuted, !isPaused else {
-            callState = .paused
+        guard let chat = chatViewModel else {
+            fail("Voice call isn't configured.")
             return
         }
+        errorMessage = nil
+        callState = .connecting
+        ttsService.stop()
+        ttsService.readAloudPlayer.stop()
 
-        // Reconfigure audio session for recording (TTS may have left it in .playback).
-        // .allowBluetooth enables HFP input (car mic / BT headset mic).
-        // .allowBluetoothA2DP enables A2DP output.
-        // Without .allowBluetooth the CarPlay / BT mic is not routed and STT hears silence.
+        guard await Self.requestPermissions(needsSpeech: settings.sttEngine == "apple") else {
+            fail("Please grant microphone and speech recognition permissions in Settings.")
+            return
+        }
+        guard callState == .connecting else { return }
+
         do {
-            let session = AVAudioSession.sharedInstance()
-            // Do NOT use .defaultToSpeaker here — it overrides overrideOutputAudioPort(.none)
-            // on every cycle and prevents the speaker button from turning off.
-            // Speaker routing is controlled exclusively via applySpeakerOverride().
-            try session.setCategory(.playAndRecord, mode: .voiceChat,
-                                    options: [.allowBluetoothHFP, .allowBluetoothA2DP])
-            try session.setActive(true)
-            applySpeakerOverride()
+            try audioSession.activate(preferSpeaker: isSpeakerOn)
+            audioSession.setSpeakerOverride(isSpeakerOn)
         } catch {
-            logger.warning("Audio session reconfig for listening: \(error.localizedDescription)")
+            fail("Couldn't start audio: \(error.localizedDescription)")
+            return
         }
 
+        // Load engines + VAD models in parallel with each other.
+        let api = apiClientProvider()
+        async let vadReady: Void = vadModelStore.loadIfNeeded()
+        let stt = await CallEngineFactory.makeSTT(settings: settings, apiClient: api)
+        let tts = await CallEngineFactory.makeTTS(settings: settings, apiClient: api, ttsService: ttsService)
+        _ = await vadReady
+        guard callState == .connecting else { stt.shutdown(); tts.shutdown(); return }
+        isUsingServerSTT = stt is ServerCallSTTEngine
+
+        let orch = CallOrchestrator(stt: stt, tts: tts, vadStore: vadModelStore, settings: settings, chat: chat)
+        bind(orch)
+        orchestrator = orch
+        do {
+            try orch.start()
+        } catch {
+            fail("Microphone unavailable: \(error.localizedDescription)")
+            return
+        }
+        orch.isMicMuted = isMuted
+        wireAudioSession()
+        let start = Date()
+        callStartTime = start
+        startDurationTimer()
+        startLiveActivity(startDate: start)
+        // The app may already be leaving the foreground (e.g. locked while
+        // connecting) — make sure GPU engines are swapped out right away.
+        if UIApplication.shared.applicationState != .active { leaveForeground() }
+    }
+
+    func endCall() async {
+        callState = .disconnected
+        unwireAudioSession()
+        orchestrator?.stop()
+        orchestrator = nil
+        durationTimer?.cancel()
+        durationTimer = nil
         currentTranscript = ""
-        callState = .listening
+        voiceIntensity = 0
+        isPaused = false
+        liveActivity.end()
+        endTurnBackgroundTask()
+        audioSession.deactivate()
+        // Restore the app's baseline session so read-aloud / HTML audio keep working.
+        let session = AVAudioSession.sharedInstance()
+        try? session.setCategory(.playAndRecord, mode: .default,
+                                 options: [.defaultToSpeaker, .allowBluetoothHFP, .allowBluetoothA2DP, .mixWithOthers])
+        try? session.setActive(true)
+        chatViewModel?.isVoiceMode = false
+    }
 
-        if let serverSTT = serverSpeechService {
-            // Server STT: record audio → upload → onFinalTranscript fires when done
-            do {
-                try await serverSTT.startListening()
-            } catch {
-                logger.error("Server STT failed to start: \(error.localizedDescription)")
-                callState = .error(error.localizedDescription)
-                errorMessage = error.localizedDescription
-                return
+    func pauseListening() {
+        guard orchestrator != nil else { return }
+        isPaused = true
+        orchestrator?.pause()
+    }
+
+    func resumeListening() async {
+        isPaused = false
+        orchestrator?.resume()
+    }
+
+    /// Mute only silences the mic (voice processing input mute); replies keep playing.
+    func toggleMute() {
+        isMuted.toggle()
+        orchestrator?.isMicMuted = isMuted
+        updateLiveActivity()
+    }
+
+    func cancelSpeaking() async {
+        orchestrator?.interrupt()
+    }
+
+    func toggleSpeaker() {
+        isSpeakerOn.toggle()
+        applySpeakerOverride()
+    }
+
+    func applySpeakerOverride() {
+        let outputs = AVAudioSession.sharedInstance().currentRoute.outputs
+        // Never pull audio away from CarPlay / Bluetooth.
+        guard !outputs.contains(where: { $0.portType == .carAudio || $0.portType == .bluetoothHFP }) else { return }
+        audioSession.setSpeakerOverride(isSpeakerOn)
+    }
+}
+
+
+// MARK: - Helpers
+
+extension VoiceCallViewModel {
+
+    fileprivate func fail(_ message: String) {
+        callState = .error(message)
+        errorMessage = message
+        unwireAudioSession()
+        orchestrator?.stop()
+        orchestrator = nil
+        liveActivity.end()
+        endTurnBackgroundTask()
+    }
+
+    fileprivate static func requestPermissions(needsSpeech: Bool) async -> Bool {
+        guard await AVAudioApplication.requestRecordPermission() else { return false }
+        guard needsSpeech else { return true }
+        let status = await withCheckedContinuation { c in
+            SFSpeechRecognizer.requestAuthorization { c.resume(returning: $0) }
+        }
+        return status == .authorized
+    }
+
+    fileprivate func startLiveActivity(startDate: Date) {
+        liveActivity.onToggleMute = { [weak self] in self?.toggleMute() }
+        liveActivity.onEndCall = { [weak self] in
+            guard let self, self.callState != .disconnected else { return }
+            Task { await self.endCall() }
+        }
+        liveActivity.start(modelName: modelName, startDate: startDate,
+                           phase: activityPhase, isMuted: isMuted)
+    }
+
+    /// Call state mapped onto the Live Activity's phase.
+    fileprivate var activityPhase: VoiceCallActivityAttributes.Phase {
+        switch callState {
+        case .listening: return .listening
+        case .processing: return .thinking
+        case .speaking: return .speaking
+        case .paused: return .paused
+        default: return .connecting
+        }
+    }
+
+    fileprivate func updateLiveActivity() {
+        liveActivity.update(phase: activityPhase, isMuted: isMuted)
+    }
+
+    /// Held from end-of-turn until the reply starts playing (or the turn is
+    /// abandoned). In the background the mic keeps the app alive, but a brief
+    /// assertion makes sure the request/stream isn't throttled in between.
+    fileprivate func updateTurnBackgroundTask() {
+        if callState == .processing {
+            guard turnBackgroundTask == .invalid else { return }
+            turnBackgroundTask = UIApplication.shared.beginBackgroundTask(withName: "VoiceCallTurn") { [weak self] in
+                self?.endTurnBackgroundTask()
             }
-            // Re-apply speaker preference — serverSTT.startListening() calls setCategory
-            // with .defaultToSpeaker internally, which resets overrideOutputAudioPort(.none).
-            applySpeakerOverride()
-            // Monitor intensity from server STT recorder
-            monitorSTTIntensity()
         } else {
-            // Apple on-device STT
-            do {
-                try await speechService?.startListening()
-            } catch {
-                logger.error("Failed to start listening: \(error.localizedDescription)")
-                callState = .error(error.localizedDescription)
-                errorMessage = error.localizedDescription
-                return
-            }
-            // Re-apply speaker preference — speechService.startListening() calls setCategory
-            // with .defaultToSpeaker internally, which resets overrideOutputAudioPort(.none).
-            applySpeakerOverride()
-            monitorSTTIntensity()
+            endTurnBackgroundTask()
         }
     }
 
-    /// Keeps exactly one waveform monitor for the active recognition session.
-    private func monitorSTTIntensity() {
-        intensityTask?.cancel()
-        intensityTask = Task {
-            while !Task.isCancelled && callState == .listening {
-                voiceIntensity = activeIntensity
-                currentTranscript = activeCurrentTranscript
-                try? await Task.sleep(for: .milliseconds(50))
+    fileprivate func endTurnBackgroundTask() {
+        guard turnBackgroundTask != .invalid else { return }
+        UIApplication.shared.endBackgroundTask(turnBackgroundTask)
+        turnBackgroundTask = .invalid
+    }
+
+    fileprivate func bind(_ orch: CallOrchestrator) {
+        orch.onPhaseChanged = { [weak self] phase in
+            guard let self, self.callState != .disconnected else { return }
+            switch phase {
+            case .idle: break
+            case .listening: self.callState = .listening
+            case .processing: self.callState = .processing
+            case .speaking: self.callState = .speaking
+            case .paused: self.callState = .paused
             }
+            self.updateLiveActivity()
+            self.updateTurnBackgroundTask()
+        }
+        orch.onLevel = { [weak self] rms in
+            guard let self else { return }
+            // Map RMS (speech ≈ 0.02–0.25) onto 0–10 for the waveform.
+            let level = self.isMuted ? 0 : Int(min(10, (rms * 40).rounded()))
+            if level != self.voiceIntensity { self.voiceIntensity = level }
+        }
+        orch.onPartialTranscript = { [weak self] text in
+            guard let self, self.currentTranscript != text else { return }
+            self.currentTranscript = text
+        }
+        orch.onUserTurn = { [weak self] text in self?.currentTranscript = text }
+        orch.onDiagnostics = { [weak self] d in
+            guard let self, self.diagnostics != d else { return }
+            self.diagnostics = d
+        }
+        orch.onError = { [weak self] message in
+            self?.errorMessage = message
+            self?.logger.error("Call turn error: \(message)")
         }
     }
 
-    /// Starts the call duration timer.
-    private func startDurationTimer() {
-        durationTimer = Task {
-            while !Task.isCancelled {
-                if let start = callStartTime {
-                    callDuration = Date().timeIntervalSince(start)
-                }
-                try? await Task.sleep(for: .seconds(1))
-            }
-        }
-    }
-
-    /// Handles the final transcript from whichever STT service is active.
-    private func handleFinalTranscript(_ transcript: String) async {
-        guard callState != .disconnected, !isPaused else { return }
-        guard !transcript.isEmpty else {
-            if !isPaused && !isMuted {
-                await startListening()
-            }
-            return
-        }
-
-        // Stop STT first to release the audio session
-        stopActiveSTT()
-
-        callState = .processing
-        currentTranscript = transcript
-
-        guard let chatViewModel else {
-            callState = .error("Chat not configured")
-            return
-        }
-
-        // Wait for speech recognizer / recorder to fully release audio routes.
-        // SFSpeechRecognizer holds the audio session for ~200-300ms after stopListening().
-        // AVAudioRecorder also needs a moment.
-        try? await Task.sleep(for: .milliseconds(400))
-
-        // Pre-configure the audio session before TTS starts.
-        // Keep .allowBluetooth so CarPlay / BT HFP stays routed for the full cycle.
-        for attempt in 1...3 {
-            do {
-                let session = AVAudioSession.sharedInstance()
-                // Do NOT use .defaultToSpeaker — see startListening() comment.
-                try session.setCategory(.playAndRecord, mode: .voiceChat,
-                                        options: [.allowBluetoothHFP, .allowBluetoothA2DP])
-                try session.setActive(true)
-                applySpeakerOverride()
+    /// Interruptions (a phone call, Siri, alarm) pause the call and resume it
+    /// when they end; route changes re-apply the speaker preference (the
+    /// audio engine rebuilds itself on the resulting configuration change).
+    fileprivate func wireAudioSession() {
+        audioSession.onInterruption = { [weak self] type in
+            guard let self, self.orchestrator != nil else { return }
+            switch type {
+            case .began:
+                self.logger.info("Audio interruption began — pausing call")
+                self.wasPausedByInterruption = !self.isPaused
+                self.orchestrator?.pause()
+            case .ended:
+                self.logger.info("Audio interruption ended")
+                guard self.wasPausedByInterruption else { return }
+                self.wasPausedByInterruption = false
+                // Without CallKit the app owns the session: take it back and
+                // resume (resume() rebuilds the audio engine if it stopped).
+                self.audioSession.reactivate()
+                self.applySpeakerOverride()
+                if !self.isPaused { self.orchestrator?.resume() }
+            @unknown default:
                 break
-            } catch {
-                logger.warning("Audio session attempt \(attempt)/3: \(error.localizedDescription)")
-                try? await Task.sleep(for: .milliseconds(200))
             }
         }
-
-        guard callState != .disconnected, !isPaused else { return }
-        chatViewModel.inputText = transcript
-
-        // Fire sendMessage concurrently — DO NOT await it.
-        // Awaiting sendMessage() blocks until the entire stream finishes, which
-        // means waitForResponseAndSpeak()'s polling loop sees isStreaming==false
-        // immediately and never feeds any incremental text to TTS.
-        // By launching it as a detached task, the polling loop below runs
-        // concurrently with the LLM stream, feeding sentences to TTS as they arrive.
-        Task { await chatViewModel.sendMessage() }
-
-        // Wait event-driven until the server has accepted the request and streaming
-        // has actually started. This fixes the "first voice call message not spoken"
-        // bug where the 120ms blind sleep wasn't long enough for the first message
-        // (which must create the conversation on the server before streaming begins).
-        // waitForStreamingToStart() returns instantly on subsequent messages and is
-        // bounded by the server's request timeout — never hangs indefinitely.
-        await chatViewModel.waitForStreamingToStart()
-        guard callState != .disconnected else { return }
-
-        // Store the task so endCall() can cancel it if the user disconnects mid-response.
-        responseTask = Task { [weak self] in
-            await self?.waitForResponseAndSpeak()
+        audioSession.onRouteChange = { [weak self] reason in
+            guard let self, self.orchestrator != nil else { return }
+            self.logger.info("Audio route changed (reason \(reason.rawValue))")
+            switch reason {
+            case .newDeviceAvailable, .oldDeviceUnavailable, .override, .categoryChange:
+                self.applySpeakerOverride()
+            default:
+                break
+            }
+            self.orchestrator?.audioRouteChanged()
         }
-        await responseTask?.value
-        responseTask = nil
+        backgroundObservers.forEach(NotificationCenter.default.removeObserver)
+        backgroundObservers = [
+            // willResignActive (not didEnterBackground) — it fires first, with
+            // enough headroom to stop submitting Metal work before iOS forbids it.
+            NotificationCenter.default.addObserver(
+                forName: UIApplication.willResignActiveNotification, object: nil, queue: .main
+            ) { [weak self] _ in
+                MainActor.assumeIsolated { self?.leaveForeground() }
+            },
+            NotificationCenter.default.addObserver(
+                forName: UIApplication.didBecomeActiveNotification, object: nil, queue: .main
+            ) { _ in
+                MLXCallLock.gpuAllowed = true
+            },
+        ]
     }
 
-    /// Waits for the streaming response and speaks it incrementally.
-    /// Sentences are fed to TTS as soon as they're complete (not waiting for full response).
-    /// When TTS finishes, the `onComplete` callback (set up in `setupCallbacks()`)
-    /// automatically restarts listening — no need to poll state here.
-    ///
-    /// This method runs inside `responseTask` so it can be cancelled immediately by
-    /// `endCall()`. All early-exit paths check `Task.isCancelled` before restarting
-    /// the microphone or feeding text to TTS.
-    private func waitForResponseAndSpeak() async {
-        guard let chatViewModel else { return }
-        guard !Task.isCancelled else { return }
-
-        // Always start TTS regardless of mute state.
-        // Mute only silences the microphone — the user should still hear the AI response.
-        ttsService.startStreamingTTS()
-
-        // Poll for streaming content — feed sentences to TTS pipeline as they arrive.
-        //
-        // IMPORTANT: During streaming, ChatViewModel routes every token delta into
-        // the streamingStore (an isolated @Observable store) rather than
-        // into conversation.messages[idx].content — this is a performance optimisation
-        // that prevents all message views from re-evaluating on every token.
-        // Reading messages.last?.content here would always see "" (the frozen placeholder)
-        // until streaming fully completes. We must read directly from the streaming store.
-        // Use displayContent (the typewriter-drained content) for TTS — it's the
-        // same authoritative text, available from the thin @MainActor wrapper.
-        var lastContent = ""
-        while chatViewModel.isStreaming {
-            guard !Task.isCancelled else {
-                ttsService.stop()
+    /// iOS kills apps that submit Metal work in the background, so the GPU
+    /// gate closes immediately and on-device (MLX) STT/TTS engines are swapped
+    /// for Apple Speech / the system voice for the rest of the call. VAD
+    /// always runs on the CPU and needs no change.
+    fileprivate func leaveForeground() {
+        MLXCallLock.gpuAllowed = false
+        guard let orch = orchestrator else { return }
+        if orch.usesGPUTTS {
+            orch.replaceTTS(CallEngineFactory.makeSystemTTS())
+        }
+        guard orch.usesGPUSTT else { return }
+        Task { [weak self] in
+            let apple = await CallEngineFactory.makeAppleSTT()
+            guard let self, let orch = self.orchestrator, orch.usesGPUSTT else {
+                apple.shutdown()
                 return
             }
-
-            // Prefer live content from the streaming store; fall back to messages array
-            // for socket-based external streams that bypass the store.
-            let newContent: String
-            if chatViewModel.streamingStore.isActive {
-                newContent = chatViewModel.streamingStore.displayContent
-            } else {
-                newContent = chatViewModel.messages.last(where: { $0.role == .assistant })?.content ?? ""
-            }
-
-            if newContent != lastContent {
-                lastContent = newContent
-                ttsService.feedStreamingText(newContent)
-            }
-            try? await Task.sleep(for: .milliseconds(60))
+            orch.replaceSTT(apple)
+            self.isUsingServerSTT = false
         }
+    }
 
-        // Bail out if the call was ended while we were polling
-        guard !Task.isCancelled else {
-            ttsService.stop()
-            return
-        }
+    fileprivate func unwireAudioSession() {
+        audioSession.onInterruption = nil
+        audioSession.onRouteChange = nil
+        backgroundObservers.forEach(NotificationCenter.default.removeObserver)
+        backgroundObservers = []
+        wasPausedByInterruption = false
+    }
 
-        // Send any remaining text to TTS.
-        // After streaming ends, the store has been flushed to conversation.messages,
-        // so reading from messages here is correct for final cleanup.
-        if let finalMessage = chatViewModel.messages.last(where: { $0.role == .assistant }) {
-            let finalContent = finalMessage.content
-            if !finalContent.isEmpty {
-                ttsService.finishStreamingTTS(finalText: finalContent)
-                // onComplete callback will call startListening() when TTS finishes (if not muted)
-            } else {
-                ttsService.stop()
-                if !isPaused && !isMuted {
-                    await startListening()
-                }
-            }
-        } else {
-            ttsService.stop()
-            if !isPaused && !isMuted {
-                await startListening()
+    fileprivate func startDurationTimer() {
+        durationTimer?.cancel()
+        durationTimer = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(1))
+                guard let self, let start = self.callStartTime else { return }
+                self.callDuration = Date().timeIntervalSince(start)
             }
         }
     }
 }
+

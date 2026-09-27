@@ -297,9 +297,6 @@ final class AppDependencyContainer: ServiceContainer {
     /// Text-to-speech service.
     let textToSpeechService = TextToSpeechService()
 
-    /// CallKit manager for native call UI.
-    let callKitManager = CallKitManager()
-
     /// Audio recording service for voice notes.
     let audioRecordingService = AudioRecordingService()
 
@@ -311,6 +308,12 @@ final class AppDependencyContainer: ServiceContainer {
 
     /// On-device ASR service — Parakeet TDT 1.7B.
     let asrService = OnDeviceASRService()
+
+    /// Voice call settings (VAD sensitivity, barge-in, preferred STT/TTS engines).
+    let voiceCallSettings = VoiceCallSettings()
+
+    /// VAD model store — holds Silero VAD + Smart Turn v3 for voice calls.
+    let vadModelStore = VADModelStore()
 
     /// Server-side task configuration (title gen, follow-ups, autocomplete, etc.).
     /// Cached on login/server connect and used to respect admin settings.
@@ -387,7 +390,10 @@ final class AppDependencyContainer: ServiceContainer {
     var pendingAutoSendVersion: Int = 0
 
     init() {
+        Self.migrateLegacySTTEngineKeyIfNeeded()
+        VoiceCallSettings.migrateLegacyKeysIfNeeded()
         self.serverConfigStore = ServerConfigStore()
+
         self.appearanceManager = AppearanceManager()
         self.accessibilityManager = AccessibilityManager()
         // Create AuthViewModel once with all dependencies to avoid
@@ -405,12 +411,37 @@ final class AppDependencyContainer: ServiceContainer {
         startConnectionMonitor()
     }
 
+    /// One-time migration: prior to fixing `OnDeviceASRService`, its `switchVariant()`
+    /// wrote `"qwen3asr"` into the same `"sttEngine"` UserDefaults key that
+    /// `DictationService`/`VoiceCallViewModel` use for the device/server backend choice
+    /// ("device" or "server"). On any install where that happened, `"sttEngine"` would
+    /// read back as `"qwen3asr"` — which is neither "device" nor "server" — silently
+    /// forcing dictation/calls onto Apple's on-device recognizer. This restores the
+    /// correct value once, then never runs again.
+    private static func migrateLegacySTTEngineKeyIfNeeded() {
+        let defaults = UserDefaults.standard
+        let migrationKey = "sttEngineMigrationV1Done"
+        guard !defaults.bool(forKey: migrationKey) else { return }
+        defaults.set(true, forKey: migrationKey)
+
+        if defaults.string(forKey: "sttEngine") == "qwen3asr" {
+            defaults.set("device", forKey: "sttEngine")
+        }
+        // Seed the new dedicated key from the stray value so the ASR variant
+        // preference itself isn't lost.
+        if defaults.string(forKey: "onDeviceASR.model") == nil {
+            defaults.set("qwen3asr", forKey: "onDeviceASR.model")
+        }
+    }
+
+
     /// Rebuilds the API client and socket service for the currently
     /// active server configuration.
     /// - Parameter isServerSwitch: Pass `true` when explicitly switching servers
     ///   or logging out. When `false` (default, used during init), caches are
     ///   preserved so the user doesn't lose their session on app launch.
     func configureServicesForActiveServer(isServerSwitch: Bool = false) {
+        dictationService.unbind()
         // Clear active chat view models on server switch
         activeChatStore.clear()
 
@@ -534,26 +565,27 @@ final class AppDependencyContainer: ServiceContainer {
     }
 
     /// Creates a configured VoiceCallViewModel ready for use.
-    /// Picks the live STT service based on the user's `sttEngine` preference:
-    /// - "server" → `ServerSpeechRecognitionService` (records mic → uploads to server)
+    /// Picks the live STT service based on the `voiceCall.sttEngine` preference
+    /// (falling back to `sttEngine` for backwards compatibility):
+    /// - "server"  → `ServerSpeechRecognitionService` (records mic → uploads)
     /// - anything else → `SpeechRecognitionService` (Apple on-device)
+    ///
+    /// VAD models (Silero + Smart Turn) are loaded automatically on first call
+    /// via `vadModelStore.loadIfNeeded()` inside `VoiceCallViewModel.startCall()`.
+    /// Creates a VoiceCallViewModel. Engines (STT/TTS) are chosen from
+    /// `voiceCallSettings` when the call starts, with automatic fallback to
+    /// Apple Speech / the system voice if the preferred engine is unavailable.
     func makeVoiceCallViewModel() -> VoiceCallViewModel {
-        let useServerSTT = UserDefaults.standard.string(forKey: "sttEngine") == "server"
-            && serverSpeechRecognitionService.isAvailable
-
-        if useServerSTT {
-            return VoiceCallViewModel(
-                serverSpeechService: serverSpeechRecognitionService,
-                ttsService: textToSpeechService,
-                callKitManager: callKitManager
-            )
-        } else {
-            return VoiceCallViewModel(
-                speechService: speechRecognitionService,
-                ttsService: textToSpeechService,
-                callKitManager: callKitManager
-            )
-        }
+        // Start fetching/loading the voice-detection models as soon as a call
+        // screen is being built, so they're ready by the time the call connects.
+        let store = vadModelStore
+        Task { await store.loadIfNeeded() }
+        return VoiceCallViewModel(
+            ttsService: textToSpeechService,
+            vadModelStore: vadModelStore,
+            settings: voiceCallSettings,
+            apiClientProvider: { [weak self] in self?.apiClient }
+        )
     }
 
     /// Processes any pending shared content from the Share Extension.

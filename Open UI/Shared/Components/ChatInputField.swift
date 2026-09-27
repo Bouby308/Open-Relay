@@ -155,7 +155,6 @@ struct ChatInputField: View {
     var onDictationStart: (() -> Void)?
     var onDictationStop: (() -> Void)?
     var onDictationCancel: (() -> Void)?
-    var isDictating: Bool = false
     /// Pass the live DictationService so the overlay can observe it directly.
     var dictationService: DictationService? = nil
     /// Called when the tools/overflow sheet is about to appear.
@@ -244,7 +243,7 @@ struct ChatInputField: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            if isDictating || dictationService?.state == .processing, let svc = dictationService {
+            if let svc = dictationService, svc.isActive || svc.showsRecovery {
                 // Dictation active — replace entire composer with recording bar
                 DictationOverlayView(
                     service: svc,
@@ -296,7 +295,7 @@ struct ChatInputField: View {
             }
         }
         .padding(.top, Spacing.xs)
-        .animation(.spring(response: 0.3, dampingFraction: 0.8), value: isDictating)
+        .animation(.spring(response: 0.3, dampingFraction: 0.8), value: dictationService?.isActive)
         .animation(.spring(response: 0.3, dampingFraction: 0.8), value: dictationService?.state == .processing)
         // Widget deep link — focus the text field and show keyboard when
         // the user taps the "New Chat" action button on the home screen widget.
@@ -452,13 +451,6 @@ struct ChatInputField: View {
                 textField
                     .frame(height: composerIsExpanded && !isCompact ? composerCurrentHeight : nil, alignment: .top)
                     .fixedSize(horizontal: false, vertical: !composerIsExpanded || isCompact)
-                    .background {
-                        Color.clear
-                            .contentShape(Rectangle())
-                            .onTapGesture {
-                                NotificationCenter.default.post(name: .chatInputFieldRequestFocus, object: nil)
-                            }
-                    }
                 inlinePlusButton
                     // Balance the bare plus glyph against the filled trailing circle.
                     .padding(.leading, -8 * uiScale)
@@ -480,26 +472,26 @@ struct ChatInputField: View {
             }
         }
         .clipShape(RoundedRectangle(cornerRadius: composerCornerRadius, style: .continuous))
+        // Whole-box tap target (iMessage-style): any tap on the composer that isn't
+        // consumed by a button, chip or the text view focuses the input. Placed as a
+        // background so every control on top keeps first-touch priority.
         .background {
-            if #available(iOS 26.0, *) {
-                Color.clear.glassEffect(.regular, in: RoundedRectangle(cornerRadius: composerCornerRadius))
-            } else {
-                RoundedRectangle(cornerRadius: composerCornerRadius, style: .continuous)
-                    .fill(.ultraThinMaterial)
-                    .overlay {
-                        RoundedRectangle(cornerRadius: composerCornerRadius, style: .continuous)
-                            .strokeBorder(composerBorderColor, lineWidth: 0.5)
-                    }
-                    .shadow(
-                        color: theme.isDark
-                            ? Color.black.opacity(isFocused ? 0.3 : 0.2)
-                            : Color.black.opacity(isFocused ? 0.14 : 0.08),
-                        radius: theme.isDark ? 8 : 14,
-                        x: 0,
-                        y: theme.isDark ? 2 : 3
-                    )
-            }
+            Color.clear
+                .contentShape(RoundedRectangle(cornerRadius: composerCornerRadius, style: .continuous))
+                .onTapGesture {
+                    guard isEnabled else { return }
+                    NotificationCenter.default.post(name: .chatInputFieldRequestFocus, object: nil)
+                }
         }
+        .modifier(ComposerGlassModifier(
+            cornerRadius: composerCornerRadius,
+            borderColor: composerBorderColor,
+            shadowColor: theme.isDark
+                ? Color.black.opacity(isFocused ? 0.3 : 0.2)
+                : Color.black.opacity(isFocused ? 0.14 : 0.08),
+            isDark: theme.isDark
+        ))
+        .modifier(ComposerPressFeedback(isEnabled: isEnabled && !composerIsExpanded))
         .gesture(composerExpandGesture)
         .animation(.spring(response: 0.35, dampingFraction: 0.78), value: composerIsExpanded)
         .animation(.interactiveSpring(), value: composerExpandDrag)
@@ -540,6 +532,7 @@ struct ChatInputField: View {
             }
         }
         .buttonStyle(.plain)
+        .composerHitTarget()
         .disabled(!isEnabled)
         .opacity(isEnabled ? 1.0 : 0.4)
         .accessibilityLabel("Attachments & tools")
@@ -655,6 +648,7 @@ struct ChatInputField: View {
                     terminalIconLabel
                 }
                 .buttonStyle(.plain)
+                .composerHitTarget()
                 .disabled(!isEnabled)
                 .animation(.easeInOut(duration: 0.15), value: terminalEnabled)
                 .transition(.scale.combined(with: .opacity))
@@ -666,6 +660,7 @@ struct ChatInputField: View {
                     terminalIconLabel
                 }
                 .buttonStyle(.plain)
+                .composerHitTarget()
                 .disabled(!isEnabled)
                 .animation(.easeInOut(duration: 0.15), value: terminalEnabled)
                 .transition(.scale.combined(with: .opacity))
@@ -726,6 +721,7 @@ struct ChatInputField: View {
                     )
             }
             .buttonStyle(.plain)
+            .composerHitTarget()
             .disabled(!isEnabled)
             .opacity(isEnabled ? 1.0 : 0.4)
             .accessibilityLabel("Start dictation")
@@ -753,12 +749,13 @@ struct ChatInputField: View {
                         )
                 }
                 .buttonStyle(.plain)
+                .composerHitTarget()
                 .accessibilityLabel("Stop Generating")
                 .transition(.scale.combined(with: .opacity))
 
-            } else if canSend {
-                // Send message (or queue it when streaming + message queue is enabled)
-                // Send message
+            } else if canSend || onVoiceInput == nil {
+                // Send message (or queue it when streaming + message queue is enabled).
+                // When voice mode is unavailable, a muted disabled send button holds the slot.
                 Button {
                     Haptics.play(.light)
                     withAnimation(.spring(response: 0.35, dampingFraction: 0.78)) {
@@ -768,15 +765,17 @@ struct ChatInputField: View {
                     onSend()
                 } label: {
                     Circle()
-                        .fill(theme.brandPrimary)
+                        .fill(canSend ? theme.brandPrimary : theme.textTertiary.opacity(0.15))
                         .frame(width: 26 * uiScale, height: 26 * uiScale)
                         .overlay(
                             Image(systemName: "arrow.up")
                                 .scaledFont(size: 11 * uiScale, weight: .bold)
-                                .foregroundStyle(theme.brandOnPrimary)
+                                .foregroundStyle(canSend ? theme.brandOnPrimary : theme.textTertiary)
                         )
                 }
                 .buttonStyle(.plain)
+                .composerHitTarget()
+                .disabled(!canSend)
                 .accessibilityLabel("Send message")
                 .transition(.scale.combined(with: .opacity))
 
@@ -806,6 +805,7 @@ struct ChatInputField: View {
                         )
                 }
                 .buttonStyle(.plain)
+                .composerHitTarget()
                 .accessibilityLabel("Voice call")
                 .transition(.scale.combined(with: .opacity))
             }
@@ -854,6 +854,7 @@ struct ChatInputField: View {
                         )
                 }
                 .buttonStyle(.plain)
+                .composerHitTarget()
                 .transition(.scale.combined(with: .opacity))
                 .accessibilityLabel("Voice call")
             }
@@ -1967,8 +1968,86 @@ struct AttachmentPreviewSheet: View {
 
 // MARK: - PDFKit View
 
-/// UIViewRepresentable wrapper for PDFKit's PDFView.
-/// Keeps the same text view (and first responder) when switching between one and two rows.
+/// Composer surface. iOS 26: interactive Liquid Glass applied directly to the composer,
+/// so press-and-hold anywhere on the box gives the native glow/flex response (as in
+/// iMessage) while buttons and the text view keep working normally. Earlier iOS keeps
+/// the frosted material with border and shadow.
+/// Kept as a separate ViewModifier so the branch doesn't multiply the composer's type.
+private struct ComposerGlassModifier: ViewModifier {
+    let cornerRadius: CGFloat
+    let borderColor: Color
+    let shadowColor: Color
+    let isDark: Bool
+
+    func body(content: Content) -> some View {
+        if #available(iOS 26.0, *) {
+            content.glassEffect(
+                .regular.interactive(),
+                in: RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+            )
+        } else {
+            content.background {
+                RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                    .fill(.ultraThinMaterial)
+                    .overlay {
+                        RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                            .strokeBorder(borderColor, lineWidth: 0.5)
+                    }
+                    .shadow(color: shadowColor, radius: isDark ? 8 : 14, x: 0, y: isDark ? 2 : 3)
+            }
+        }
+    }
+}
+
+/// Makes a small composer control easy to hit: the whole circle counts (not just the
+/// glyph strokes of a clear-filled circle), and the touch area extends `slop` points
+/// past the drawn icon toward Apple's 44pt guideline without changing layout.
+private struct ComposerHitTarget: ViewModifier {
+    var slop: CGFloat = 6
+
+    func body(content: Content) -> some View {
+        content
+            .contentShape(Circle())
+            .padding(slop)
+            .contentShape(Rectangle())
+            .padding(-slop)
+    }
+}
+
+private extension View {
+    func composerHitTarget(slop: CGFloat = 6) -> some View {
+        modifier(ComposerHitTarget(slop: slop))
+    }
+}
+
+/// iMessage-style press feedback for the whole composer: while a finger is down
+/// anywhere on the box — including over the text view and buttons — the box
+/// shrinks slightly. Recognised simultaneously, so typing, cursor placement,
+/// selection, button taps and the expand drag all keep working normally.
+/// Releases as soon as the finger moves (scroll, select, expand drag).
+private struct ComposerPressFeedback: ViewModifier {
+    let isEnabled: Bool
+    @State private var isPressed = false
+
+    func body(content: Content) -> some View {
+        content
+            .scaleEffect(isPressed ? 0.985 : 1)
+            .animation(.spring(response: 0.25, dampingFraction: 0.7), value: isPressed)
+            .simultaneousGesture(
+                DragGesture(minimumDistance: 0)
+                    .onChanged { value in
+                        guard isEnabled else { return }
+                        let moved = abs(value.translation.width) > 8 || abs(value.translation.height) > 8
+                        if moved != !isPressed { isPressed = !moved }
+                    }
+                    .onEnded { _ in isPressed = false }
+            )
+            .onChange(of: isEnabled) { _, enabled in
+                if !enabled { isPressed = false }
+            }
+    }
+}
+
 private struct ComposerLayout: Layout {
     var compact: Bool
     var direction: LayoutDirection
@@ -2005,6 +2084,7 @@ private struct ComposerLayout: Layout {
     }
 }
 
+/// UIViewRepresentable wrapper for PDFKit's PDFView.
 private struct PDFKitView: UIViewRepresentable {
     let document: PDFDocument
 
@@ -2022,4 +2102,3 @@ private struct PDFKitView: UIViewRepresentable {
         uiView.document = document
     }
 }
-

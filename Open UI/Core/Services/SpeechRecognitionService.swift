@@ -44,6 +44,14 @@ final class SpeechRecognitionService {
     /// Called when an error occurs.
     var onError: ((String) -> Void)?
 
+    /// Called with raw 16 kHz mono float samples from each audio buffer.
+    /// Used by VADPipeline for on-device voice-activity detection.
+    /// NOTE: samples are at the *mic's native rate* (e.g. 48 kHz); callers that
+    /// need 16 kHz must resample. VADPipeline's `processSamples` handles this via
+    /// `CallAudioEngine`, but when hooked directly here the caller should check the
+    /// sample rate via `SpeechRecognitionService.currentSampleRate`.
+    var onAudioSamples: (([Float]) -> Void)?
+
     // MARK: - Private
 
     private let logger = Logger(subsystem: "com.openui", category: "SpeechRecognition")
@@ -55,6 +63,11 @@ final class SpeechRecognitionService {
     private var intensityDecayTimer: Timer?
     private let silenceDuration: TimeInterval = 2.0
     private var lastSpeechTime: Date = .now
+
+    /// The sample rate of the active audio engine's input node.
+    /// Clients (e.g. VADPipeline) need this to understand what rate the
+    /// `onAudioSamples` callback delivers.
+    private(set) var currentSampleRate: Double = 0
 
     // MARK: - Initialization
 
@@ -183,8 +196,9 @@ final class SpeechRecognitionService {
 
         let inputNode = engine.inputNode
         let recordingFormat = inputNode.outputFormat(forBus: 0)
+        currentSampleRate = recordingFormat.sampleRate
 
-        // Install audio tap for recognition and intensity monitoring
+        // Install audio tap for recognition, intensity monitoring, and VAD sample delivery.
         inputNode.installTap(onBus: 0, bufferSize: 1024, format: recordingFormat) { [weak self] buffer, _ in
             request.append(buffer)
             Task { @MainActor [weak self] in
@@ -396,6 +410,12 @@ final class SpeechRecognitionService {
 
         let scaled = Int((peak * 12).rounded())
         intensity = min(10, max(0, scaled))
+
+        // Deliver raw samples to VAD if a listener is registered.
+        if onAudioSamples != nil {
+            let samples = Array(UnsafeBufferPointer(start: channelData, count: frameLength))
+            onAudioSamples?(samples)
+        }
     }
 
     /// Updates state and fires the callback.

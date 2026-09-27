@@ -1445,11 +1445,10 @@ struct AddAccessSheet: View {
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
-                    Button { onCancel() } label: {
-                        Image(systemName: "xmark")
-                            .scaledFont(size: 14, weight: .semibold)
-                    }
-                    .disabled(isLoading)
+                    Button("Close", systemImage: "xmark") { onCancel() }
+                        .labelStyle(.iconOnly)
+                        .tint(.secondary)
+                        .disabled(isLoading)
                 }
             }
         }
