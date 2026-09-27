@@ -1388,8 +1388,13 @@ final class StreamingTextReveal {
     func finish() { progress.finish() }
 }
 
-/// Both formatted answers and plain reasoning use this clock. Learn the input
-/// cadence instead of emptying every packet at a fixed minimum typing speed.
+/// Both formatted answers and plain reasoning use this clock. While a stream is
+/// live it stays a short, adaptive cushion behind the newest text, so there is
+/// always something left to type: the reveal flows continuously through gaps
+/// between packets instead of catching up, stopping and jumping at each one.
+/// The cushion is about half a second of text at the learned arrival rate; the
+/// reveal eases toward the live edge instead of halting, bursts are absorbed by a
+/// smooth catch-up, and the held-back tail drains quickly once the stream ends.
 @MainActor @Observable
 final class StreamingTypewriter {
     private(set) var visibleCount = 0
@@ -1397,8 +1402,8 @@ final class StreamingTypewriter {
     @ObservationIgnored private var source = ""
     @ObservationIgnored private var shown = 0.0
     @ObservationIgnored private var total = 0
-    @ObservationIgnored private var speed = 90.0
-    @ObservationIgnored private var desiredSpeed = 90.0
+    @ObservationIgnored private var isLive = false
+    @ObservationIgnored private var speed = 0.0
     @ObservationIgnored private var arrivalRate = 90.0
     @ObservationIgnored private var lastArrival: Double?
     @ObservationIgnored private var meanInterval = 0.0
@@ -1407,7 +1412,23 @@ final class StreamingTypewriter {
     @ObservationIgnored private var link: CADisplayLink?
     var isAnimating: Bool { visibleCount < total }
 
+    /// Seconds of already-received text kept in reserve while streaming.
+    private static let cushionSeconds = 0.45
+    /// Reserve bounds, in characters.
+    private static let minCushion = 8.0
+    private static let maxCushion = 240.0
+    /// Backlog beyond the reserve is worked off over roughly this long.
+    private static let catchUpSeconds = 0.9
+    /// Once the stream ends, the remaining tail drains over roughly this long.
+    private static let finishSeconds = 0.3
+    /// Speed smoothing time constant, so rate changes never show as jumps.
+    private static let easing = 0.12
+
     deinit { link?.invalidate() }
+
+    private var cushion: Double {
+        min(Self.maxCushion, max(Self.minCushion, arrivalRate * Self.cushionSeconds))
+    }
 
     func receive(_ source: String, count: Int, streaming: Bool, reduceMotion: Bool = false,
                  now: Double = ProcessInfo.processInfo.systemUptime) {
@@ -1415,11 +1436,12 @@ final class StreamingTypewriter {
         let added = count - total
         total = count
         self.source = source
+        isLive = streaming
         hasStreamed = hasStreamed || streaming
         guard hasStreamed, !reduceMotion, append else {
             lastArrival = nil; meanInterval = 0; meanSize = 0
             arrivalSamples = 0
-            arrivalRate = 90; speed = 90; desiredSpeed = 90
+            arrivalRate = 90; speed = 0
             finish()
             return
         }
@@ -1430,50 +1452,83 @@ final class StreamingTypewriter {
                 // sizes and intervals separately so clustered packets do not
                 // inflate the estimate as averages of instantaneous rates do.
                 if interval > 0, interval < 1.5 {
-                    // Average the first few samples before using a fixed EWMA weight.
                     arrivalSamples += 1
                     let weight = max(0.3, 1 / Double(arrivalSamples))
                     meanInterval += (interval - meanInterval) * weight
                     meanSize += (Double(added) - meanSize) * weight
-                    arrivalRate = meanSize / meanInterval
+                    arrivalRate = min(20_000, max(20, meanSize / meanInterval))
                 }
             }
             lastArrival = now
         }
         shown = min(shown, Double(total))
-        // No startup wait and no fixed character reserve.
-        // Already character-paced input needs no additional animation clock.
-        if link == nil, Double(total) - shown <= 1 { shown = Double(total) }
-        else if shown == 0, total > 0 { shown = 1 }
-        let horizon = max(0.5, min(1, meanInterval * 1.25))
-        desiredSpeed = max(arrivalRate, (Double(total) - shown) / horizon)
-        if link == nil { speed = arrivalRate }
-        visibleCount = Int(shown)
-        if shown >= Double(total) { finish() }
-        else if link == nil {
-            let clock = Clock(self)
-            let displayLink = CADisplayLink(target: clock, selector: #selector(Clock.tick(_:)))
-            displayLink.preferredFrameRateRange = CAFrameRateRange(minimum: 30, maximum: 60, preferred: 60)
-            displayLink.add(to: .main, forMode: .common)
-            link = displayLink
+        if shown == 0, total > 0 {
+            // Joining a reply already in progress (opening a chat mid-stream, or a
+            // continued message): start just short of the live edge instead of
+            // retyping everything. A brand-new reply starts at its first character.
+            shown = max(1, Double(total) - cushion)
+        }
+        setVisible()
+        if shown < Double(total) {
+            startLinkIfNeeded()
+        } else if !streaming {
+            finish()
         }
     }
 
     func advance(by seconds: Double) {
-        guard seconds > 0, seconds.isFinite, shown < Double(total) else { return }
-        // Ease rate changes rather than visibly accelerating at each packet.
-        // Keep the catch-up target until the next input; recalculating it from
-        // the shrinking remainder every frame produces a long exponential tail.
-        speed += (desiredSpeed - speed) * (1 - exp(-seconds / 0.08))
-        shown = min(Double(total), shown + speed * seconds)
-        visibleCount = Int(shown)
-        if shown >= Double(total) { finish() }
+        guard seconds > 0, seconds.isFinite else { return }
+        // Clamp after a hitch or backgrounding so the text never leaps forward.
+        let dt = min(seconds, 0.1)
+        let lead = Double(total) - shown
+        guard lead > 0 else {
+            // Caught up: idle until the next packet restarts the clock.
+            if isLive { stopLink() } else { finish() }
+            return
+        }
+        let target: Double
+        if isLive {
+            let reserve = cushion
+            // Beyond the reserve: arrival rate plus a gentle catch-up of the excess.
+            // Within it: slow in proportion to what is left, so a server pause reads
+            // as a smooth deceleration rather than a dead stop.
+            target = lead > reserve
+                ? arrivalRate + (lead - reserve) / Self.catchUpSeconds
+                : arrivalRate * max(0.12, lead / reserve)
+        } else {
+            target = max(arrivalRate, lead / Self.finishSeconds)
+        }
+        speed += (target - speed) * (1 - exp(-dt / Self.easing))
+        shown = min(Double(total), shown + max(0, speed) * dt)
+        setVisible()
+        if shown >= Double(total) {
+            if isLive { stopLink() } else { finish() }
+        }
     }
 
     func finish() {
         shown = Double(total)
-        visibleCount = total
-        speed = arrivalRate
+        setVisible()
+        stopLink()
+    }
+
+    /// Publish only whole-character changes, so observers re-render at most once
+    /// per newly visible character rather than on every display frame.
+    private func setVisible() {
+        let next = Int(shown)
+        if next != visibleCount { visibleCount = next }
+    }
+
+    private func startLinkIfNeeded() {
+        guard link == nil else { return }
+        let clock = Clock(self)
+        let displayLink = CADisplayLink(target: clock, selector: #selector(Clock.tick(_:)))
+        displayLink.preferredFrameRateRange = CAFrameRateRange(minimum: 30, maximum: 60, preferred: 60)
+        displayLink.add(to: .main, forMode: .common)
+        link = displayLink
+    }
+
+    private func stopLink() {
         link?.invalidate()
         link = nil
     }
