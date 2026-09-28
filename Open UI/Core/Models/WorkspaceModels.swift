@@ -1226,11 +1226,15 @@ struct ModelDetail: Identifiable, Sendable {
     // Knowledge (meta.knowledge)
     var knowledgeItems: [ModelKnowledgeEntry]
 
-    // Tools, Filters, Actions (meta.toolIds, meta.filterIds, meta.actionIds, meta.defaultFilterIds)
+    // Tools, Filters, Actions, Skills
+    // (meta.toolIds, meta.filterIds, meta.actionIds, meta.skillIds, meta.defaultFilterIds)
     var toolIds: [String]
     var filterIds: [String]
     var defaultFilterIds: [String]
+    /// Per-model action function IDs (meta.actionIds).
     var actionIds: [String]
+    /// Selected skill IDs (meta.skillIds) — independent from actions.
+    var skillIds: [String]
 
     // Suggestion Prompts (meta.suggestion_prompts)
     var suggestionPrompts: [SuggestionPrompt]
@@ -1327,6 +1331,7 @@ struct ModelDetail: Identifiable, Sendable {
         self.builtinImageGen = builtinImageGen; self.builtinCodeInterpreter = builtinCodeInterpreter
         self.knowledgeItems = knowledgeItems; self.suggestionPrompts = suggestionPrompts
         self.toolIds = []; self.filterIds = []; self.defaultFilterIds = []; self.actionIds = []
+        self.skillIds = []
         self.ttsVoice = ttsVoice; self.customParams = []
         self.advStreamResponse = nil; self.advStreamDeltaChunkSize = nil; self.advFunctionCalling = nil
         self.advReasoningEffort = nil; self.advReasoningTagsEnabled = nil
@@ -1391,11 +1396,9 @@ struct ModelDetail: Identifiable, Sendable {
         self.toolIds = meta["toolIds"] as? [String] ?? []
         self.filterIds = meta["filterIds"] as? [String] ?? []
         self.defaultFilterIds = meta["defaultFilterIds"] as? [String] ?? []
-        // OpenWebUI stores skill IDs under both "actionIds" and "skillIds" in meta.
-        // Prefer "actionIds" but fall back to "skillIds" for compatibility with the web UI.
-        self.actionIds = meta["actionIds"] as? [String]
-            ?? meta["skillIds"] as? [String]
-            ?? []
+        // Actions and Skills are separate native selections.
+        self.actionIds = meta["actionIds"] as? [String] ?? []
+        self.skillIds = meta["skillIds"] as? [String] ?? []
 
         let caps = meta["capabilities"] as? [String: Any] ?? [:]
         self.capVision = caps["vision"] as? Bool ?? true
@@ -1492,8 +1495,13 @@ struct ModelDetail: Identifiable, Sendable {
             "mirostat_tau", "repeat_last_n", "tfs_z", "repeat_penalty", "use_mmap", "use_mlock",
             "think", "format", "num_keep", "num_ctx", "num_batch", "num_thread", "num_gpu", "keep_alive"
         ]
+        // Custom params are shown as JSON so numbers, booleans, and nested objects
+        // round-trip with their original types (plain strings appear quoted).
         self.customParams = params.filter { !knownParamKeys.contains($0.key) }
-            .map { (key: $0.key, value: "\($0.value)") }.sorted { $0.key < $1.key }
+            .map { entry in
+                let json = try? JSONSerialization.data(withJSONObject: entry.value, options: [.fragmentsAllowed, .sortedKeys])
+                return (key: entry.key, value: json.flatMap { String(data: $0, encoding: .utf8) } ?? "\(entry.value)")
+            }.sorted { $0.key < $1.key }
     }
 
     // MARK: - Payload Builders
@@ -1537,7 +1545,10 @@ struct ModelDetail: Identifiable, Sendable {
         if let v = advNumThread { p["num_thread"] = v }
         if let v = advNumGpu { p["num_gpu"] = v }
         if let v = advKeepAlive, !v.isEmpty { p["keep_alive"] = v }
-        for cp in customParams where !cp.key.isEmpty { p[cp.key] = cp.value }
+        // Values that parse as JSON keep their type; anything else is sent as plain text.
+        for cp in customParams where !cp.key.isEmpty {
+            p[cp.key] = (try? JSONSerialization.jsonObject(with: Data(cp.value.utf8), options: .fragmentsAllowed)) ?? cp.value
+        }
         return p
     }
 
@@ -1563,7 +1574,9 @@ struct ModelDetail: Identifiable, Sendable {
         meta["capabilities"] = caps
 
         // Default features — only features whose capability is enabled (matches web UI).
-        var defF: [String] = []
+        // Preserve feature IDs this editor doesn't manage.
+        let managedFeatures = ["web_search", "image_generation", "code_interpreter"]
+        var defF = (meta["defaultFeatureIds"] as? [String] ?? []).filter { !managedFeatures.contains($0) }
         if defaultFeatureWebSearch && capWebSearch { defF.append("web_search") }
         if defaultFeatureImageGen && capImageGeneration { defF.append("image_generation") }
         if defaultFeatureCodeInterpreter && capCodeInterpreter { defF.append("code_interpreter") }
@@ -1597,7 +1610,7 @@ struct ModelDetail: Identifiable, Sendable {
         meta["filterIds"] = filterIds
         meta["defaultFilterIds"] = defaultFilterIds
         meta["actionIds"] = actionIds
-        meta["skillIds"] = actionIds
+        meta["skillIds"] = skillIds
         meta["suggestion_prompts"] = suggestionPrompts.isEmpty
             ? NSNull()
             : suggestionPrompts.map { $0.toJSON() }

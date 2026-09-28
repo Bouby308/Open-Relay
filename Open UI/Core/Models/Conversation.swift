@@ -26,6 +26,8 @@ nonisolated struct Conversation: Identifiable, Hashable, Sendable {
     var updatedAt: Date
     var model: String?
     var systemPrompt: String?
+    /// Native chat-level variables, separate from prompt substitution variables.
+    var chatVariables: [String: Any] = [:]
 
     /// The tree-based message history — **source of truth** for all messages.
     ///
@@ -52,6 +54,7 @@ nonisolated struct Conversation: Identifiable, Hashable, Sendable {
     var chatParams: ChatAdvancedParams?
     /// Tasks created and managed by the model's built-in task management tools.
     var tasks: [ChatTask]
+    var contextUsage: ChatContextUsage?
 
     /// Top-level files attached to this conversation (mirrors OWUI `chat.files`).
     ///

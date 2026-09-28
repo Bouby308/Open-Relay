@@ -17,7 +17,8 @@ extension WatchPhoneSpeaker {
         pendingBuffers += 1
         let id = turnId
         player.scheduleBuffer(buffer, at: nil, options: [], completionCallbackType: .dataPlayedBack) { [weak self] _ in
-            Task { @MainActor in self?.bufferPlayed(turn: id) }
+            // Rebind weakly inside the main-actor task so no captured var crosses isolation.
+            Task { @MainActor [weak self] in self?.bufferPlayed(turn: id) }
         }
         if !player.isPlaying { player.play() }
     }

@@ -47,7 +47,15 @@ struct Channel: Identifiable, Hashable, Sendable {
     var archivedAt: Date?
     /// Server-computed write access — `true` means the current user can post. Nil if not yet loaded.
     var writeAccess: Bool?
-    
+    /// Server-computed: whether the current user can manage this channel (group channels).
+    var isManager: Bool = false
+    /// Server-computed total member count (from `/channels/{id}`).
+    var userCount: Int?
+    /// When the current user last read this channel.
+    var lastReadAt: Date?
+    /// Member user IDs (group/DM channels).
+    var userIds: [String] = []
+
     // Local-only state
     var unreadCount: Int = 0
     var lastMessage: ChannelMessage?
@@ -176,7 +184,11 @@ struct Channel: Identifiable, Hashable, Sendable {
         channel.lastMessage = lastMessage
         // Trust server's computed write permission directly
         channel.writeAccess = json["write_access"] as? Bool
-        
+        channel.isManager = json["is_manager"] as? Bool ?? false
+        channel.userCount = json["user_count"] as? Int
+        channel.lastReadAt = TimestampParser.parseOptional(json["last_read_at"])
+        channel.userIds = json["user_ids"] as? [String] ?? []
+
         // Parse inline `users` array from ChannelListItemResponse / ChannelFullResponse.
         // The server returns this for DM (and group) channels, including presence_state.
         // Parsing here eliminates N separate getChannelMembers() calls and ensures
@@ -298,9 +310,25 @@ struct ChannelMember: Identifiable, Hashable, Sendable {
     /// Populated from the `is_active` field on `UserIdNameStatusResponse` (channel list/detail)
     /// and `ChannelMemberResponse` (members endpoint).
     var isActive: Bool
-    
+    /// Custom status (emoji shortcode + message), bio and groups — optional server fields.
+    var statusEmoji: String?
+    var statusMessage: String?
+    var bio: String?
+    var groupNames: [String] = []
+
     var displayName: String {
         name ?? email
+    }
+
+    /// Whether this member has a custom status to show.
+    var hasStatus: Bool {
+        !(statusEmoji ?? "").isEmpty || !(statusMessage ?? "").isEmpty
+    }
+
+    /// Status emoji rendered as a Unicode character (server stores shortcodes).
+    var statusEmojiCharacter: String? {
+        guard let e = statusEmoji, !e.isEmpty else { return nil }
+        return e.trimmingCharacters(in: CharacterSet(charactersIn: ":")).emojiFromShortcode
     }
     
     /// Whether the user is currently online.
@@ -329,8 +357,8 @@ struct ChannelMember: Identifiable, Hashable, Sendable {
         // The server computes is_active = last_active_at >= now-180s on every response.
         // Default false (not active) — do not default true, which would show everyone online.
         let isActive = json["is_active"] as? Bool ?? false
-        
-        return ChannelMember(
+
+        var member = ChannelMember(
             id: id,
             name: name,
             email: email,
@@ -338,5 +366,57 @@ struct ChannelMember: Identifiable, Hashable, Sendable {
             role: role,
             isActive: isActive
         )
+        member.statusEmoji = json["status_emoji"] as? String
+        member.statusMessage = json["status_message"] as? String
+        member.bio = json["bio"] as? String
+        if let groups = json["groups"] as? [[String: Any]] {
+            member.groupNames = groups.compactMap { $0["name"] as? String }
+        }
+        return member
+    }
+}
+
+// MARK: - Channel Webhook
+
+/// An incoming webhook that lets external services post messages into a channel.
+/// Matches `ChannelWebhookModel` from the Open WebUI API.
+struct ChannelWebhook: Identifiable, Hashable, Sendable {
+    let id: String
+    let channelId: String
+    let userId: String
+    var name: String
+    var profileImageURL: String?
+    let token: String
+    var lastUsedAt: Date?
+    var createdAt: Date
+    var updatedAt: Date
+    /// Creator's name, when the server includes it.
+    var creatorName: String?
+
+    static func fromJSON(_ json: [String: Any]) -> ChannelWebhook? {
+        guard let id = json["id"] as? String,
+              let token = json["token"] as? String else { return nil }
+        return ChannelWebhook(
+            id: id,
+            channelId: json["channel_id"] as? String ?? "",
+            userId: json["user_id"] as? String ?? "",
+            name: json["name"] as? String ?? "Webhook",
+            profileImageURL: json["profile_image_url"] as? String,
+            token: token,
+            lastUsedAt: TimestampParser.parseOptional(json["last_used_at"]),
+            createdAt: TimestampParser.parse(json["created_at"]),
+            updatedAt: TimestampParser.parse(json["updated_at"]),
+            creatorName: (json["user"] as? [String: Any])?["name"] as? String
+        )
+    }
+
+    /// Avatar URL. External http(s) avatars are proxied through the server (as on web);
+    /// data URLs are rendered locally by the caller.
+    func avatarURL(serverBaseURL: String) -> URL? {
+        guard let img = profileImageURL, !img.isEmpty else { return nil }
+        if img.lowercased().hasPrefix("http") {
+            return URL(string: "\(serverBaseURL)/api/v1/channels/webhooks/\(id)/profile/image")
+        }
+        return nil
     }
 }

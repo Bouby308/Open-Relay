@@ -594,7 +594,7 @@ final class AdminIntegrationsViewModel {
 
         // Use search to resolve — this is a simple approach
         do {
-            let allUsers = try await api.searchUsers()
+            let allUsers = try await api.searchAllUsers()
             for user in allUsers {
                 resolvedUsers[user.id] = user
             }

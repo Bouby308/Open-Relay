@@ -42,7 +42,7 @@ final class SystemCallTTSEngine: CallTTSEngine {
                 ))
             }
             continuation.onTermination = { [weak self] _ in
-                Task { @MainActor in self?.synthesizer.stopSpeaking(at: .immediate) }
+                Task { @MainActor [weak self] in self?.synthesizer.stopSpeaking(at: .immediate) }
             }
         }
     }

@@ -199,6 +199,9 @@ extension Notification.Name {
     /// Fired from TerminalBrowserView when "Insert Path" is tapped on a file row.
     /// Object: the file path string to append to the chat input.
     static let terminalInsertPath = Notification.Name("com.openui.terminal.insertPath")
+    /// Posted by ChatViewModel for `terminal:*` tool events from the model.
+    /// userInfo: `type` (String), `chatId` (String), optional `path` (String).
+    static let terminalFileEvent = Notification.Name("com.openui.terminal.fileEvent")
     /// Fired from the folder workspace chat list when the user taps a recent chat row.
     /// Object: the conversation ID (String).
     static let folderWorkspaceChatSelected = Notification.Name("com.openui.folder.chatSelected")

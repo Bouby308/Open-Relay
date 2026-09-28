@@ -7,14 +7,6 @@ import MarkdownView
 import Litext
 import os.log
 
-// A hidden navigation bar gets native status blur only on iOS 27 with an iOS 27 SDK build.
-private let hasNativeStatusBlur: Bool = {
-    guard #available(iOS 27.0, *),
-          let sdk = Bundle.main.object(forInfoDictionaryKey: "DTSDKName") as? String,
-          let major = Int(sdk.drop(while: { !$0.isNumber }).prefix(while: \.isNumber))
-    else { return false }
-    return major >= 27
-}()
 
 // MARK: - Scroll Geometry Snapshot
 //
@@ -569,33 +561,7 @@ struct ChatDetailView: View {
             }
         }
         // Keep the explicit backdrop unless this build supports native status-area blur.
-        .overlay {
-            GeometryReader { geometry in
-                Group {
-                    if hasNativeStatusBlur {
-                        EmptyView()
-                    } else if #available(iOS 26.0, *) {
-                        Color.clear
-                            // Keep the glass rim outside the visible status-area band.
-                            .glassEffect(.clear, in: Rectangle().inset(by: -geometry.safeAreaInsets.top))
-                            .mask(LinearGradient(stops: [
-                                .init(color: .black, location: 0.35),
-                                .init(color: .clear, location: 1)
-                            ], startPoint: .top, endPoint: .bottom))
-                    } else {
-                        theme.background.opacity(0.8)
-                            .background(.ultraThinMaterial)
-                            .mask(LinearGradient(stops: [
-                                .init(color: .black, location: 0.45),
-                                .init(color: .clear, location: 1)
-                            ], startPoint: .top, endPoint: .bottom))
-                    }
-                }
-                .frame(height: geometry.safeAreaInsets.top)
-                .offset(y: -geometry.safeAreaInsets.top)
-            }
-            .allowsHitTesting(false)
-        }
+        .statusBarGlassBackdrop(background: theme.background)
         .navigationBarHidden(true)
         // Configure the view model synchronously on first appearance so that the
         // toolbar (model selector, terminal icon) is fully populated before the
@@ -757,6 +723,7 @@ struct ChatDetailView: View {
             CameraPickerView { image in processCameraImage(image) }
                 .ignoresSafeArea()
         }
+        .modifier(WebSearchConsentAlert(consent: viewModel.isVoiceMode ? nil : viewModel.webSearchConsent))
         .alert("Add Web Link", isPresented: $showWebURLAlert) {
             TextField("https://example.com", text: $webURLInput)
                 .textContentType(.URL)
@@ -819,6 +786,9 @@ struct ChatDetailView: View {
             .themed()
             .presentationDetents([.medium, .large])
             .presentationDragIndicator(.visible)
+        }
+        .sheet(item: $viewModel.chatVariableForm) { form in
+            ChatVariablesSheet(viewModel: viewModel, form: form).themed()
         }
         // Prompt variable input sheet — shown when a selected prompt has {{variables}}
         .sheet(isPresented: Binding<Bool>(
@@ -889,6 +859,8 @@ struct ChatDetailView: View {
             Text(downloadErrorMessage)
         }
         // MARK: Action event modifiers (input dialog, confirmation, notification toast)
+        // Live tool confirmation / input / notification socket events.
+        .modifier(ChatEventPromptModifier(prompts: viewModel.toolEventPrompts))
         .applyActionEventModifiers(
             actionInputRequest: $actionInputRequest,
             actionConfirmRequest: $actionConfirmRequest,
@@ -1361,10 +1333,7 @@ struct ChatDetailView: View {
             if !vm.tasks.isEmpty {
                 TaskListView(
                     tasks: vm.tasks,
-                    isStreaming: vm.isStreaming,
-                    onToggleStatus: { taskId, newStatus in
-                        viewModel.updateTaskStatus(taskId: taskId, newStatus: newStatus)
-                    }
+                    isStreaming: vm.isStreaming
                 )
                 .transition(.asymmetric(
                     insertion: .move(edge: .bottom).combined(with: .opacity),
@@ -1380,20 +1349,15 @@ struct ChatDetailView: View {
                     questions: askPrompt.questions,
                     allowOther: askPrompt.allowOther,
                     timeoutMs: vm.liveAskUserPrompt != nil ? askPrompt.timeoutMs : nil,
+                    errorMessage: vm.askUserError,
                     onSubmit: { answers in
-                        let msgId = askPrompt.messageId
-                        let cId = askPrompt.callId
-                        Task { await viewModel.answerAskUser(
-                            messageId: msgId, callId: cId,
-                            answers: answers, timedOut: false
-                        )}
+                        Task { await viewModel.resolveAskUser(askPrompt, answers: answers) }
                     },
                     onCancel: {
-                        let msgId = askPrompt.messageId
-                        let cId = askPrompt.callId
-                        Task { await viewModel.rejectAskUser(messageId: msgId, callId: cId) }
+                        Task { await viewModel.resolveAskUser(askPrompt) }
                     }
                 )
+                .id(askPrompt.id)
                 .disabled(vm.isResolvingAskUser)
             }
 
@@ -1417,7 +1381,7 @@ struct ChatDetailView: View {
                 attachmentUsage: vm.attachmentUsage,
                 placeholder: placeholderText,
                 isKeyboardVisible: keyboard.isVisible,
-                isEnabled: !vm.isStreaming || vm.enableMessageQueue,
+                isEnabled: !vm.isCreatingConversation && (!vm.isStreaming || vm.enableMessageQueue),
                 onSend: { Task { await viewModel.sendMessage() } },
                 onStopGenerating: vm.isStreaming ? { viewModel.stopStreaming() } : nil,
                 webSearchEnabled: $vm.webSearchEnabled,
@@ -1577,6 +1541,7 @@ struct ChatDetailView: View {
                     Task { await viewModel.handleToolApprovalModeChange(to: mode) }
                 }
             )
+            .disabled(vm.isCreatingConversation)
         }
         .background(Color.clear)
         .animation(.easeOut(duration: 0.2), value: vm.isShowingKnowledgePicker)
@@ -4853,6 +4818,7 @@ struct ChatDetailView: View {
     }
 
     private func handleDisappear() {
+        viewModel.webSearchConsent.cancelPending()
         if dependencies.dictationService.context == dictationContext {
             dependencies.dictationService.unbind()
         }
@@ -6565,52 +6531,6 @@ private extension View {
                     .allowsHitTesting(false)
                 }
             }
-    }
-}
-
-// MARK: - Chat chrome
-// Native glass controls with compatible backgrounds on older iOS.
-private extension View {
-    @ViewBuilder
-    func chatControlGlass<S: Shape, F: ShapeStyle>(in shape: S, fallback: F) -> some View {
-        if #available(iOS 26.0, *) {
-            self.glassEffect(.regular.interactive(), in: shape)
-        } else {
-            self.background(fallback, in: shape)
-        }
-    }
-
-    /// Wraps the chat chrome bar in a ViewModifier so the host view's (very large)
-    /// type appears once per call instead of once per availability/edge branch.
-    /// The branching lives in the modifier's own body, which SwiftUI resolves
-    /// separately — this keeps `ChatDetailView.body`'s type shallow enough that
-    /// runtime metadata instantiation does not overflow the main-thread stack.
-    func chatChromeBar<Content: View>(edge: VerticalEdge, @ViewBuilder content: () -> Content) -> some View {
-        modifier(ChatChromeBarModifier(edge: edge, bar: content()))
-    }
-}
-
-private struct ChatChromeBarModifier<Bar: View>: ViewModifier {
-    let edge: VerticalEdge
-    let bar: Bar
-
-    func body(content: Content) -> some View {
-        if #available(iOS 27.0, *), hasNativeStatusBlur {
-            if edge == .top {
-                // Reserve toolbar space without extending the status-area blur behind it.
-                content.safeAreaInset(edge: edge, spacing: 0) { bar }
-            } else {
-                content.safeAreaBar(edge: edge, spacing: 0) { bar }
-                    .scrollEdgeEffectHidden(true, for: .bottom)
-            }
-        } else if #available(iOS 26.0, *) {
-            // The custom status-bar glass handles the top blur, so hide the native
-            // scroll-edge effect on both edges (avoids a double blur).
-            content.safeAreaBar(edge: edge, spacing: 0) { bar }
-                .scrollEdgeEffectHidden(true, for: [.top, .bottom])
-        } else {
-            content.safeAreaInset(edge: edge, spacing: 0) { bar }
-        }
     }
 }
 

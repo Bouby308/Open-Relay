@@ -34,6 +34,9 @@ enum CalendarViewMode: String, CaseIterable {
 @MainActor
 final class CalendarViewModel {
     private let apiClient: APIClient
+    private let calendarScope: String?
+    private let calendarUserId: String?
+    var isManagingCalendars = false
 
     // MARK: - State
 
@@ -70,8 +73,10 @@ final class CalendarViewModel {
 
     // MARK: - Init
 
-    init(apiClient: APIClient) {
+    init(apiClient: APIClient, userId: String? = nil) {
         self.apiClient = apiClient
+        calendarScope = apiClient.network.conversationCacheScope
+        calendarUserId = userId
     }
 
     // MARK: - Loading
@@ -92,11 +97,14 @@ final class CalendarViewModel {
     }
 
     func loadEventsForDisplayedMonth() async {
+        let scope = apiClient.network.conversationCacheScope
         let (start, end) = monthRange(for: displayedMonth)
         do {
             let fetched = try await apiClient.getCalendarEvents(start: start, end: end)
+            guard scope == apiClient.network.conversationCacheScope else { return }
             events = fetched
         } catch {
+            guard scope == apiClient.network.conversationCacheScope else { return }
             errorMessage = error.localizedDescription
         }
     }
@@ -158,32 +166,25 @@ final class CalendarViewModel {
 
     // MARK: - CRUD
 
-    func createEvent(
-        calendarId: String,
-        title: String,
-        description: String?,
-        startAt: Date,
-        endAt: Date?,
-        allDay: Bool,
-        location: String?,
-        alertMinutes: Int?
-    ) async {
-        let meta: CalendarEventMeta? = alertMinutes.map { CalendarEventMeta(alertMinutes: $0) }
-        let req = CalendarEventCreateRequest(
-            calendarId: calendarId,
-            title: title,
-            description: description,
-            startAt: Int64(startAt.timeIntervalSince1970 * 1_000_000_000),
-            endAt: endAt.map { Int64($0.timeIntervalSince1970 * 1_000_000_000) },
-            allDay: allDay,
-            location: location,
-            meta: meta
-        )
-        do {
-            let created = try await apiClient.createCalendarEvent(req)
-            events.append(created)
-        } catch {
-            errorMessage = error.localizedDescription
+    func eventForEditing(_ event: CalendarEvent) async throws -> CalendarEvent {
+        // Fetch the series dates, not the displayed recurrence instance's dates.
+        try await apiClient.getCalendarEvent(id: event.id)
+    }
+
+    func saveEvent(_ draft: CalendarEventDraft) async throws {
+        let selectedInstance = selectedEvent?.instanceId
+        let saved = try await apiClient.saveCalendarEvent(draft)
+        if selectedEvent?.id == saved.id { selectedEvent = saved }
+        events.removeAll { $0.id == saved.id }
+        events.append(saved)
+        errorMessage = nil
+        await loadEventsForDisplayedMonth()
+        if selectedEvent?.id == saved.id,
+           let refreshed = events.first(where: { $0.id == saved.id && $0.instanceId == selectedInstance }) {
+            selectedEvent = refreshed
+        }
+        if let errorMessage {
+            self.errorMessage = "The event was saved, but the calendar couldn’t refresh. \(errorMessage)"
         }
     }
 
@@ -196,6 +197,50 @@ final class CalendarViewModel {
         } catch {
             errorMessage = error.localizedDescription
         }
+    }
+
+    // MARK: - Calendar management
+
+    private func manageCalendar<T>(_ action: () async throws -> T) async throws -> T {
+        guard !isManagingCalendars, calendarScope == apiClient.network.conversationCacheScope else {
+            throw APIError.cancelled
+        }
+        isManagingCalendars = true
+        defer { isManagingCalendars = false }
+        let result = try await action()
+        guard calendarScope == apiClient.network.conversationCacheScope else { throw APIError.cancelled }
+        return result
+    }
+
+    func saveCalendar(_ calendar: OWCalendar?, name: String, color: String?) async throws {
+        let name = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty, calendar?.isSystem != true else { throw APIError.cancelled }
+        let saved = try await manageCalendar {
+            try await apiClient.saveCalendar(id: calendar?.id, name: name, color: color)
+        }
+        if let index = calendars.firstIndex(where: { $0.id == saved.id }) {
+            calendars[index] = saved
+        } else {
+            calendars.append(saved)
+            visibleCalendarIds.insert(saved.id)
+        }
+    }
+
+    func makeDefaultCalendar(_ calendar: OWCalendar, userId: String) async throws {
+        guard !calendar.isSystem, calendar.userId == userId else { throw APIError.cancelled }
+        let saved = try await manageCalendar { try await apiClient.setDefaultCalendar(id: calendar.id) }
+        for index in calendars.indices where calendars[index].userId == saved.userId {
+            calendars[index].isDefault = calendars[index].id == saved.id
+        }
+    }
+
+    func removeCalendar(_ calendar: OWCalendar) async throws {
+        guard !calendar.isSystem, !calendar.isDefault else { throw APIError.cancelled }
+        try await manageCalendar { try await apiClient.deleteCalendar(id: calendar.id) }
+        calendars.removeAll { $0.id == calendar.id }
+        visibleCalendarIds.remove(calendar.id)
+        events.removeAll { $0.calendarId == calendar.id }
+        if selectedEvent?.calendarId == calendar.id { selectedEvent = nil }
     }
 
     // MARK: - Computed Helpers
@@ -308,7 +353,9 @@ final class CalendarViewModel {
     }
 
     var defaultCalendarId: String? {
-        calendars.first(where: { $0.isDefault })?.id ?? calendars.first?.id
+        let owned = calendars.filter { !$0.isSystem && $0.userId == calendarUserId }
+        return owned.first(where: { $0.isDefault })?.id ?? owned.first?.id
+            ?? calendars.first(where: { !$0.isSystem })?.id
     }
 
     /// Returns user-editable calendars (non-system).

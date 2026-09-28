@@ -12,7 +12,7 @@ struct NotesListView: View {
         Group {
             if viewModel.isLoading && viewModel.notes.isEmpty {
                 loadingView
-            } else if viewModel.notes.isEmpty {
+            } else if viewModel.notes.isEmpty && viewModel.searchText.isEmpty {
                 emptyStateView
             } else {
                 notesList
@@ -31,6 +31,8 @@ struct NotesListView: View {
             text: $viewModel.searchText,
             prompt: "Search Notes"
         )
+        .onChange(of: viewModel.searchText) { _, _ in viewModel.triggerSearch() }
+        .onDisappear { viewModel.clearSearch() }
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
                 Button {
@@ -46,6 +48,14 @@ struct NotesListView: View {
         }
         .refreshable {
             await viewModel.refreshNotes()
+        }
+        .alert("Could Not Update Note", isPresented: .init(
+            get: { viewModel.pinErrorMessage != nil },
+            set: { if !$0 { viewModel.pinErrorMessage = nil } }
+        )) {
+            Button("OK", role: .cancel) { viewModel.pinErrorMessage = nil }
+        } message: {
+            Text(viewModel.pinErrorMessage ?? "")
         }
         .task {
             if let manager = dependencies.notesManager {
@@ -106,6 +116,24 @@ struct NotesListView: View {
 
     private var notesList: some View {
         List {
+            // Search status (loading / error / no results)
+            if viewModel.isSearching && viewModel.filteredNotes.isEmpty {
+                HStack(spacing: Spacing.sm) {
+                    ProgressView()
+                    Text("Searching notes…")
+                        .foregroundStyle(theme.textSecondary)
+                }
+            } else if let error = viewModel.errorMessage, !viewModel.searchText.isEmpty {
+                Section {
+                    Text(error)
+                        .foregroundStyle(theme.textSecondary)
+                    Button("Retry") { Task { await viewModel.retrySearch() } }
+                }
+            } else if !viewModel.searchText.isEmpty && viewModel.filteredNotes.isEmpty {
+                Text("No matching notes")
+                    .foregroundStyle(theme.textSecondary)
+            }
+
             // Pinned section
             if !viewModel.pinnedNotes.isEmpty {
                 Section {
@@ -130,6 +158,16 @@ struct NotesListView: View {
                     }
                 }
             }
+
+            // Pagination for server search results
+            if !viewModel.searchText.isEmpty && !viewModel.filteredNotes.isEmpty {
+                if viewModel.isSearching {
+                    HStack { Spacer(); ProgressView(); Spacer() }
+                } else if viewModel.hasMoreSearchResults && viewModel.errorMessage == nil {
+                    Button("Load More") { Task { await viewModel.loadMoreSearchResults() } }
+                        .frame(maxWidth: .infinity)
+                }
+            }
         }
         .listStyle(.insetGrouped)
         .animation(.easeInOut(duration: AnimDuration.medium), value: viewModel.notes.count)
@@ -150,7 +188,7 @@ struct NotesListView: View {
         }
         .swipeActions(edge: .leading) {
             Button {
-                viewModel.togglePin(note)
+                Task { await viewModel.togglePin(note) }
             } label: {
                 SwiftUI.Label(
                     isPinned ? "Unpin" : "Pin",
@@ -158,16 +196,18 @@ struct NotesListView: View {
                 )
             }
             .tint(theme.brandPrimary)
+            .disabled(viewModel.pinningNoteIDs.contains(note.id))
         }
         .contextMenu {
             Button {
-                viewModel.togglePin(note)
+                Task { await viewModel.togglePin(note) }
             } label: {
                 SwiftUI.Label(
                     isPinned ? "Unpin" : "Pin",
                     systemImage: isPinned ? "pin.slash" : "pin"
                 )
             }
+            .disabled(viewModel.pinningNoteIDs.contains(note.id))
             Button(role: .destructive) {
                 viewModel.deletingNote = note
             } label: {

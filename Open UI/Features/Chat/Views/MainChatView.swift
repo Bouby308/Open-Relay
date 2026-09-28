@@ -1210,6 +1210,11 @@ struct MainChatView: View {
                 if showFileBrowser { closeFileBrowserAnimated() }
                 terminalBrowserVM.reset()
             }
+            // Model tool events: open displayed files in the panel and refresh
+            // the listing when files are written or commands run.
+            .onReceive(NotificationCenter.default.publisher(for: .terminalFileEvent)) { note in
+                handleTerminalFileEvent(note)
+            }
             .onChange(of: activeChannelId) { _, newId in
                 // When entering a channel, the server marks it as read via GET /channels/{id}.
                 // Refresh the channel list after a short delay to clear the unread badge.
@@ -1484,7 +1489,8 @@ struct MainChatView: View {
         guard let apiClient = dependencies.apiClient else { return }
         let vm = dependencies.activeChatStore.viewModel(for: activeConversationId)
         guard vm.terminalEnabled, let server = vm.selectedTerminalServer else { return }
-        terminalBrowserVM.configure(apiClient: apiClient, serverId: server.id)
+        terminalBrowserVM.configure(apiClient: apiClient, server: server,
+                                    chatId: vm.conversationId ?? vm.conversation?.id)
     }
 
     /// Animates the file browser to fully open.
@@ -1510,6 +1516,22 @@ struct MainChatView: View {
         }
         // Cleanly disconnect the WebSocket when the panel is dismissed
         terminalBrowserVM.handlePanelClosed()
+    }
+
+    /// Handles `terminal:*` tool events for the active chat.
+    /// `display_file` opens the panel and the file (like the web FileNav);
+    /// the others just refresh the listing if the panel is configured.
+    private func handleTerminalFileEvent(_ note: Notification) {
+        guard let type = note.userInfo?["type"] as? String,
+              let chatId = note.userInfo?["chatId"] as? String else { return }
+        let vm = dependencies.activeChatStore.viewModel(for: activeConversationId)
+        guard (vm.conversationId ?? vm.conversation?.id) == chatId, isTerminalActiveInCurrentChat else { return }
+        configureTerminalBrowserIfNeeded()
+        if type == "terminal:display_file" && !showFileBrowser && !showDrawer {
+            UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
+            openFileBrowserAnimated()
+        }
+        terminalBrowserVM.handleChatEvent(type: type, path: note.userInfo?["path"] as? String)
     }
 
     // MARK: - New Chat
@@ -2631,54 +2653,12 @@ struct MainChatView: View {
             activeConversationId = nil
             closeDrawer()
         } label: {
-            HStack(spacing: 6) {
-                // DM: show participant avatar with online dot; others: show icon
-                if channel.type == .dm, let participant = channel.dmParticipants.first {
-                    ZStack(alignment: .bottomTrailing) {
-                        UserAvatar(
-                            size: 22,
-                            imageURL: participant.resolveAvatarURL(serverBaseURL: dependencies.apiClient?.baseURL ?? ""),
-                            name: participant.displayName,
-                            authToken: dependencies.apiClient?.network.authToken
-                        )
-                        Circle()
-                            .fill(participant.isOnline ? Color.green : Color.gray.opacity(0.5))
-                            .frame(width: 7, height: 7)
-                            .overlay(Circle().stroke(theme.background, lineWidth: 1))
-                            .offset(x: 2, y: 2)
-                    }
-                } else {
-                    Image(systemName: channel.sidebarIcon)
-                        .scaledFont(size: 11, context: .list)
-                        .foregroundStyle(activeChannelId == channel.id ? theme.brandPrimary : theme.textTertiary)
-                }
-                Text(channel.type == .dm
-                    ? (channel.dmParticipants.first?.displayName ?? channel.displayName)
-                    : channel.displayName)
-                    .scaledFont(size: 14, context: .list)
-                    .fontWeight(activeChannelId == channel.id || channel.unreadCount > 0 ? .semibold : .regular)
-                    .foregroundStyle(activeChannelId == channel.id ? theme.textPrimary : theme.textSecondary)
-                    .lineLimit(1)
-                Spacer()
-                if channel.unreadCount > 0 {
-                    Text("\(channel.unreadCount)")
-                        .scaledFont(size: 11, weight: .bold, context: .list)
-                        .foregroundStyle(.white)
-                        .padding(.horizontal, 6)
-                        .padding(.vertical, 2)
-                        .background(theme.brandPrimary)
-                        .clipShape(Capsule())
-                }
-            }
-            .padding(.horizontal, Spacing.md)
-            .padding(.vertical, 7)
-            .background(
-                activeChannelId == channel.id
-                    ? theme.brandPrimary.opacity(0.08)
-                    : Color.clear
+            ChannelSidebarRowLabel(
+                channel: channel,
+                isActive: activeChannelId == channel.id,
+                serverBaseURL: dependencies.apiClient?.baseURL ?? "",
+                authToken: dependencies.apiClient?.network.authToken
             )
-            .clipShape(RoundedRectangle(cornerRadius: CornerRadius.sm))
-            .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
         .contextMenu {
@@ -2689,7 +2669,9 @@ struct MainChatView: View {
                 } label: {
                     Label("Hide Conversation", systemImage: "eye.slash")
                 }
-            } else {
+            } else if dependencies.authViewModel.currentUser?.role == .admin
+                        || channel.userId == dependencies.authViewModel.currentUser?.id {
+                // Web parity (ChannelItem.svelte): only admins or the channel owner can manage it.
                 Button(role: .destructive) {
                     deletingChannelId = channel.id
                 } label: {
@@ -3266,14 +3248,7 @@ struct MainChatView: View {
                 showExportShareSheet = true
 
             case .pdf:
-                guard let api = dependencies.apiClient else { return }
-                // Use the server's raw message format for PDF generation.
-                // The API fetches the full chat JSON and passes native messages
-                // to the PDF renderer, avoiding any format mismatches.
-                let pdfData = try await api.downloadChatAsPDF(chatId: fullConversation.id)
-                let url = tmpDir.appendingPathComponent("\(title).pdf")
-                try pdfData.write(to: url)
-                exportFileURL = url
+                exportFileURL = try await ChatPDFExporter.export(title: title, messages: messages)
                 showExportShareSheet = true
             }
         } catch {

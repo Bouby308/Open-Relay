@@ -520,7 +520,10 @@ final class SocketIOService: NSObject, @unchecked Sendable, URLSessionWebSocketD
     /// Sends a Socket.IO ACK packet in response to a server event that carried an ack ID.
     /// The server uses `sio.call()` to send events that require a client acknowledgement;
     /// the client must reply with `43<ackId>[responseValue]` so the server's await can resume.
-    func emitAck(_ ackId: Int, data: Any?) {
+    /// `sessionId` is the socket sid the ack ID was issued on — a prompt may outlive its
+    /// connection, so an ack is never replayed on a different (reconnected) session.
+    func emitAck(_ ackId: Int, data: Any?, sessionId: String?) {
+        guard let sessionId, isConnected, sid == sessionId else { return }
         let payload: [Any]
         if let data {
             payload = [data]
@@ -1030,6 +1033,7 @@ final class SocketIOService: NSObject, @unchecked Sendable, URLSessionWebSocketD
     }
 
     private func dispatchChatEvent(_ event: [String: Any], ackId: Int? = nil) {
+        let connectionId = sid
         let chatId = event["chat_id"] as? String
         if let chatId, let scope = ConversationCache.scope(server: serverConfig.url,
             token: authToken, headers: serverConfig.customHeaders) {
@@ -1037,6 +1041,14 @@ final class SocketIOService: NSObject, @unchecked Sendable, URLSessionWebSocketD
         }
         let eventSessionId = extractSessionId(from: event)
         let eventType = (event["data"] as? [String: Any])?["type"] as? String ?? event["type"] as? String ?? "?"
+
+        // Client-executed RPCs need a reply even when their chat has no registered view.
+        // Never claim execution succeeded, or fan a single callback out to many views.
+        if let response = ClientExecutionRPC.unsupportedResponse(for: eventType) {
+            guard eventSessionId == nil || eventSessionId == connectionId else { return }
+            if let ackId { emitAck(ackId, data: response, sessionId: connectionId) }
+            return
+        }
 
         handlerLock.lock()
         let handlers = Array(chatHandlers.values)
@@ -1056,8 +1068,9 @@ final class SocketIOService: NSObject, @unchecked Sendable, URLSessionWebSocketD
                 // so __event_call__ handlers can reply and unblock sio.call() on the server.
                 let ackCallback: ((Any?) -> Void)? = ackId.map { id in
                     { [weak self] data in
-                        self?.logger.info("🔁 [Socket] emitAck id=\(id, privacy: .public) data=\(String(describing: data), privacy: .public)")
-                        self?.emitAck(id, data: data)
+                        // Don't log ack contents — they can contain user-entered text.
+                        self?.logger.info("🔁 [Socket] emitAck id=\(id, privacy: .public)")
+                        self?.emitAck(id, data: data, sessionId: connectionId)
                     }
                 }
                 reg.handler(event, ackCallback)
@@ -1339,4 +1352,34 @@ private struct ChannelHandlerRegistration: Sendable {
     let conversationId: String?
     let sessionId: String?
     let handler: SocketIOService.EventHandler
+}
+
+// MARK: - Client execution RPC
+
+/// Replies for server RPCs that expect the client to execute code/tools/models.
+/// Open Relay does not run browser code or client-side connections, so these
+/// fail clearly and promptly instead of timing out or faking success.
+nonisolated enum ClientExecutionRPC {
+    static func unsupportedResponse(for type: String) -> [String: Any]? {
+        let message: String
+        switch type {
+        case "execute":
+            message = "Browser JavaScript execution is not supported in Open Relay."
+        case "execute:python":
+            message = "Browser Python execution is not supported in Open Relay. Use a server-side code interpreter."
+        case "execute:tool":
+            message = "Client-side tool connections are not supported in Open Relay. Use a server-managed tool connection."
+        case "request:chat:completion":
+            message = "Client-side model connections are not supported in Open Relay. Use a server-managed model connection."
+        default:
+            return nil
+        }
+        var response: [String: Any] = ["error": message, "status": false]
+        if type == "execute:python" {
+            response["stdout"] = ""
+            response["stderr"] = message
+            response["result"] = NSNull()
+        }
+        return response
+    }
 }

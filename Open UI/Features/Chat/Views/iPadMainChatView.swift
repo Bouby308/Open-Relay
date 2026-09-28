@@ -267,6 +267,10 @@ struct iPadMainChatView: View {
                 terminalBrowserVM.handleAppBackground()
             }
         }
+        // Model tool events: open displayed files in the panel and refresh the listing.
+        .onReceive(NotificationCenter.default.publisher(for: .terminalFileEvent)) { note in
+            handleTerminalFileEvent(note)
+        }
         // Channel-specific lifecycle wiring
         .task {
             // Configure and load channels — must pass currentUserId for DM participant filtering
@@ -494,7 +498,7 @@ struct iPadMainChatView: View {
                                     terminalBrowserVM.handlePanelClosed()
                                 }
                             )
-                            .frame(width: 340)
+                            .frame(width: terminalPanelWidth)
                             .background(theme.background)
                             .shadow(color: .black.opacity(0.12), radius: 16, x: -4)
                             .offset(x: max(0, terminalDragOffset))
@@ -547,7 +551,7 @@ struct iPadMainChatView: View {
                                         let v = abs(value.translation.height)
                                         guard abs(h) > v, h < 0 else { return }
                                         isDraggingTerminal = true
-                                        terminalDragOffset = 340 + h // start off-screen, slide in
+                                        terminalDragOffset = terminalPanelWidth + h // start off-screen, slide in
                                     }
                                     .onEnded { value in
                                         guard isDraggingTerminal else { return }
@@ -875,7 +879,7 @@ struct iPadMainChatView: View {
                         terminalBrowserVM.handlePanelClosed()
                         }
                     )
-                    .frame(width: 340)
+                    .frame(width: terminalPanelWidth)
                     .background(theme.background)
                     .transition(.move(edge: .trailing))
                     .onAppear {
@@ -904,7 +908,7 @@ struct iPadMainChatView: View {
                         }
                         Haptics.play(.light)
                     } label: {
-                        Image(systemName: showTerminalBrowser ? "sidebar.right" : "sidebar.right")
+                        Image(systemName: "sidebar.right")
                             .scaledFont(size: 14, weight: .medium)
                             .foregroundStyle(showTerminalBrowser ? theme.brandPrimary : theme.textSecondary)
                             .symbolVariant(showTerminalBrowser ? .fill : .none)
@@ -1056,11 +1060,29 @@ struct iPadMainChatView: View {
 
     // MARK: - Terminal Configuration
 
+    /// Width of the trailing terminal/files column.
+    private var terminalPanelWidth: CGFloat { 380 }
+
+    /// Handles `terminal:*` tool events for the active chat (see MainChatView).
+    private func handleTerminalFileEvent(_ note: Notification) {
+        guard let type = note.userInfo?["type"] as? String,
+              let chatId = note.userInfo?["chatId"] as? String else { return }
+        let vm = dependencies.activeChatStore.viewModel(for: activeConversationId)
+        guard (vm.conversationId ?? vm.conversation?.id) == chatId, isTerminalActiveInCurrentChat else { return }
+        configureTerminalBrowserIfNeeded()
+        if type == "terminal:display_file" && !showTerminalBrowser {
+            withAnimation(MicroAnimation.panelOpen) { showTerminalBrowser = true }
+            terminalBrowserVM.handlePanelOpened()
+        }
+        terminalBrowserVM.handleChatEvent(type: type, path: note.userInfo?["path"] as? String)
+    }
+
     private func configureTerminalBrowserIfNeeded() {
         guard let apiClient = dependencies.apiClient else { return }
         let vm = dependencies.activeChatStore.viewModel(for: activeConversationId)
         guard vm.terminalEnabled, let server = vm.selectedTerminalServer else { return }
-        terminalBrowserVM.configure(apiClient: apiClient, serverId: server.id)
+        terminalBrowserVM.configure(apiClient: apiClient, server: server,
+                                    chatId: vm.conversationId ?? vm.conversation?.id)
     }
 
     // MARK: - Actions
@@ -1150,11 +1172,7 @@ struct iPadMainChatView: View {
                 exportFileURL = url
                 showExportShareSheet = true
             case .pdf:
-                guard let api = dependencies.apiClient else { return }
-                let pdfData = try await api.downloadChatAsPDF(chatId: fullConversation.id)
-                let url = tmpDir.appendingPathComponent("\(title).pdf")
-                try pdfData.write(to: url)
-                exportFileURL = url
+                exportFileURL = try await ChatPDFExporter.export(title: title, messages: messages)
                 showExportShareSheet = true
             }
         } catch {
@@ -2034,57 +2052,12 @@ struct iPadSidebarContent: View {
             activeConversationId = nil
             onCloseDrawer?()
         } label: {
-            HStack(spacing: 6) {
-                if channel.type == .dm, let participant = channel.dmParticipants.first {
-                    ZStack(alignment: .bottomTrailing) {
-                        UserAvatar(
-                            size: 22,
-                            imageURL: participant.resolveAvatarURL(serverBaseURL: dependencies.apiClient?.baseURL ?? ""),
-                            name: participant.displayName,
-                            authToken: dependencies.apiClient?.network.authToken
-                        )
-                        Circle()
-                            .fill(participant.isOnline ? Color.green : Color.gray.opacity(0.5))
-                            .frame(width: 7, height: 7)
-                            .overlay(Circle().stroke(theme.background, lineWidth: 1))
-                            .offset(x: 2, y: 2)
-                    }
-                } else {
-                    Image(systemName: channel.sidebarIcon)
-                        .scaledFont(size: 11, context: .list)
-                        .foregroundStyle(activeChannelId == channel.id ? theme.brandPrimary : theme.textTertiary)
-                }
-                Text(channel.type == .dm
-                    ? (channel.dmParticipants.first?.displayName ?? channel.displayName)
-                    : channel.displayName)
-                    .scaledFont(size: 14, context: .list)
-                    .fontWeight(activeChannelId == channel.id || channel.unreadCount > 0 ? .semibold : .regular)
-                    .foregroundStyle(activeChannelId == channel.id ? theme.textPrimary : theme.textSecondary)
-                    .lineLimit(1)
-                Spacer()
-                if activeChannelId == channel.id {
-                    Circle()
-                        .fill(theme.brandPrimary)
-                        .frame(width: 6, height: 6)
-                } else if channel.unreadCount > 0 {
-                    Text("\(channel.unreadCount)")
-                        .scaledFont(size: 11, weight: .bold, context: .list)
-                        .foregroundStyle(.white)
-                        .padding(.horizontal, 6)
-                        .padding(.vertical, 2)
-                        .background(theme.brandPrimary)
-                        .clipShape(Capsule())
-                }
-            }
-            .padding(.horizontal, Spacing.md)
-            .padding(.vertical, 7)
-            .background(
-                activeChannelId == channel.id
-                    ? theme.brandPrimary.opacity(0.1)
-                    : Color.clear
+            ChannelSidebarRowLabel(
+                channel: channel,
+                isActive: activeChannelId == channel.id,
+                serverBaseURL: dependencies.apiClient?.baseURL ?? "",
+                authToken: dependencies.apiClient?.network.authToken
             )
-            .clipShape(RoundedRectangle(cornerRadius: CornerRadius.sm, style: .continuous))
-            .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
         .contextMenu {
@@ -2095,7 +2068,9 @@ struct iPadSidebarContent: View {
                 } label: {
                     Label("Hide Conversation", systemImage: "eye.slash")
                 }
-            } else {
+            } else if dependencies.authViewModel.currentUser?.role == .admin
+                        || channel.userId == dependencies.authViewModel.currentUser?.id {
+                // Web parity (ChannelItem.svelte): only admins or the channel owner can manage it.
                 Button(role: .destructive) {
                     deletingChannelId = channel.id
                 } label: {

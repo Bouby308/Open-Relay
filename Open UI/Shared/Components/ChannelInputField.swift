@@ -3,15 +3,26 @@ import PhotosUI
 
 // MARK: - Channel Input Field
 //
-// Shared input component used by:
+// Shared glass composer used by:
 //   • ChannelDetailView  (main channel message input)
 //   • ThreadDetailSheet  (thread reply input)
 //
-// Key features vs the raw PasteableTextView usage it replaces:
-//   • Respects the "Send on Enter" user toggle (@AppStorage "sendOnEnter")
-//   • Displays an attachment preview strip above the composer
-//   • Provides an optional @mention trigger and #channel-link trigger
-//   • Matches the same rounded-card visual style as ChatInputField
+// Visual language matches ChatInputField: an interactive Liquid Glass shell on
+// iOS 26 (frosted material on earlier iOS) with press feedback, a bare plus glyph,
+// optional dictation button and a filled send circle. Context chips (reply target,
+// @model mention, "model will respond") live *inside* the glass shell.
+
+/// A contextual chip shown at the top of the channel composer.
+struct ChannelComposerChip: Identifiable {
+    enum Style { case reply, model }
+    let id: String
+    let style: Style
+    let icon: String
+    let title: String
+    let subtitle: String?
+    let onTap: (() -> Void)?
+    let onRemove: (() -> Void)?
+}
 
 struct ChannelInputField: View {
 
@@ -23,6 +34,10 @@ struct ChannelInputField: View {
     var isEnabled: Bool = true
     var onSend: () async -> Void
     var canSend: Bool
+
+    // MARK: - Context chips (reply / model mention)
+
+    var chips: [ChannelComposerChip] = []
 
     // MARK: - Attachment callbacks
 
@@ -36,12 +51,21 @@ struct ChannelInputField: View {
     /// Used by ChannelDetailView to emit typing indicators to the server.
     var onTextChange: (() -> Void)?
 
-    // MARK: - Mention / channel-link trigger callbacks
+    // MARK: - Mention / channel-link / prompt trigger callbacks
 
     var onAtTrigger: ((String) -> Void)?
     var onAtDismiss: (() -> Void)?
     var onHashTrigger: ((String) -> Void)?
     var onHashDismiss: (() -> Void)?
+    var onSlashTrigger: ((String) -> Void)?
+    var onSlashDismiss: (() -> Void)?
+
+    // MARK: - Dictation (same service + overlay as the main chat)
+
+    var dictationService: DictationService? = nil
+    var onDictationStart: (() -> Void)?
+    var onDictationStop: (() -> Void)?
+    var onDictationCancel: (() -> Void)?
 
     // MARK: - Environment
 
@@ -70,32 +94,75 @@ struct ChannelInputField: View {
         return base
     }
 
+    private var cornerRadius: CGFloat {
+        (text.contains("\n") || text.count > 60 || !chips.isEmpty || !attachments.isEmpty) ? 20 : 22
+    }
+
+    private var isDictating: Bool {
+        guard let svc = dictationService else { return false }
+        return svc.isActive || svc.showsRecovery
+    }
+
     // MARK: - Body
 
     var body: some View {
+        Group {
+            if let svc = dictationService, isDictating {
+                DictationOverlayView(
+                    service: svc,
+                    onStop: { onDictationStop?() },
+                    onCancel: { onDictationCancel?() }
+                )
+                .transition(.asymmetric(
+                    insertion: .move(edge: .bottom).combined(with: .opacity),
+                    removal: .opacity
+                ))
+            } else {
+                composerShell
+                    .padding(.horizontal, Spacing.screenPadding)
+            }
+        }
+        .padding(.top, 4)
+        .padding(.bottom, 8)
+        .animation(.easeInOut(duration: 0.15), value: canSend)
+        .animation(.easeOut(duration: 0.2), value: attachments.count)
+        .animation(.spring(response: 0.3, dampingFraction: 0.82), value: chips.map(\.id))
+        .animation(.spring(response: 0.3, dampingFraction: 0.8), value: isDictating)
+        // Fire onTextChange whenever text changes — used by ChannelDetailView to emit typing indicators.
+        .onChange(of: text) { _, _ in
+            onTextChange?()
+        }
+    }
+
+    // MARK: - Glass Shell
+
+    private var composerShell: some View {
         VStack(spacing: 0) {
-            // Invisible full-coverage tap target so tapping anywhere on the
-            // composer (including padding areas) focuses the text field.
-            Color.clear
-                .frame(height: 0)
-                .contentShape(Rectangle())
-                .onTapGesture {
-                    NotificationCenter.default.post(name: .chatInputFieldRequestFocus, object: nil)
+            if !chips.isEmpty {
+                VStack(spacing: 4) {
+                    ForEach(chips) { chip in
+                        chipRow(chip)
+                    }
                 }
-            // Attachment preview strip
+                .padding(.horizontal, 10)
+                .padding(.top, 8)
+                .transition(.asymmetric(
+                    insertion: .move(edge: .top).combined(with: .opacity),
+                    removal: .opacity
+                ))
+            }
+
             if !attachments.isEmpty {
                 attachmentStrip
-                    .padding(.horizontal, Spacing.screenPadding)
-                    .padding(.bottom, 4)
+                    .padding(.horizontal, 12)
+                    .padding(.top, 8)
                     .transition(.asymmetric(
                         insertion: .move(edge: .bottom).combined(with: .opacity),
                         removal: .opacity
                     ))
             }
 
-            // Composer row
-            HStack(alignment: .center, spacing: 8) {
-                // Plus / attachment button
+            HStack(alignment: .bottom, spacing: 8) {
                 if let onAttachmentTapped {
                     Button {
                         onAttachmentTapped()
@@ -107,11 +174,12 @@ struct ChannelInputField: View {
                             .frame(width: 28 * uiScale, height: 28 * uiScale)
                     }
                     .buttonStyle(.plain)
+                    .composerHitTarget()
                     .disabled(!isEnabled)
                     .opacity(isEnabled ? 1.0 : 0.4)
+                    .accessibilityLabel("Add attachment")
                 }
 
-                // Text input
                 PasteableTextView(
                     text: $text,
                     placeholder: placeholder,
@@ -136,57 +204,124 @@ struct ChannelInputField: View {
                     onHashDismiss: onHashDismiss,
                     onAtTrigger: onAtTrigger,
                     onAtDismiss: onAtDismiss,
+                    onSlashTrigger: onSlashTrigger,
+                    onSlashDismiss: onSlashDismiss,
                     sendOnReturn: sendOnEnter
                 )
                 .fixedSize(horizontal: false, vertical: true)
+                .frame(minHeight: 28 * uiScale)
                 .accessibilityLabel(placeholder)
 
-                // Send button
-                if canSend {
-                    Button {
-                        Task { await onSend() }
-                        Haptics.play(.light)
-                    } label: {
-                        Circle()
-                            .fill(theme.brandPrimary)
-                            .frame(width: 30 * uiScale, height: 30 * uiScale)
-                            .overlay(
-                                Image(systemName: "arrow.up")
-                                    .scaledFont(size: 13 * uiScale, weight: .bold)
-                                    .foregroundStyle(theme.brandOnPrimary)
-                            )
-                    }
-                    .buttonStyle(.plain)
-                    .transition(.scale.combined(with: .opacity))
-                    .accessibilityLabel("Send message")
-                }
+                trailingControls
             }
             .padding(.horizontal, 12)
-            .padding(.vertical, 10)
+            .padding(.vertical, 9)
         }
-        .background(
-            theme.isDark
-                ? theme.cardBackground.opacity(0.95)
-                : theme.inputBackground
-        )
-        .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: 22, style: .continuous)
-                .strokeBorder(theme.cardBorder.opacity(0.4), lineWidth: 0.5)
-        )
-        .shadow(
-            color: .black.opacity(theme.isDark ? 0.2 : 0.06),
-            radius: 8, x: 0, y: 2
-        )
-        .padding(.horizontal, Spacing.screenPadding)
-        .padding(.top, 4)
-        .padding(.bottom, 8)
-        .animation(.easeInOut(duration: 0.15), value: canSend)
-        .animation(.easeOut(duration: 0.2), value: attachments.count)
-        // Fire onTextChange whenever text changes — used by ChannelDetailView to emit typing indicators.
-        .onChange(of: text) { _, _ in
-            onTextChange?()
+        .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
+        // Whole-box tap target: any tap not consumed by a control focuses the input.
+        .background {
+            Color.clear
+                .contentShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
+                .onTapGesture {
+                    guard isEnabled else { return }
+                    NotificationCenter.default.post(name: .chatInputFieldRequestFocus, object: nil)
+                }
         }
+        .modifier(ComposerGlassModifier(
+            cornerRadius: cornerRadius,
+            borderColor: Color(uiColor: .separator),
+            shadowColor: Color.black.opacity(theme.isDark ? 0.2 : 0.08),
+            isDark: theme.isDark
+        ))
+        .modifier(ComposerPressFeedback(isEnabled: isEnabled))
+    }
+
+    private var trailingControls: some View {
+        HStack(spacing: 8) {
+            if onDictationStart != nil && !canSend {
+                Button {
+                    Haptics.play(.medium)
+                    onDictationStart?()
+                } label: {
+                    Image(systemName: "mic")
+                        .scaledFont(size: 13 * uiScale, weight: .semibold)
+                        .foregroundStyle(theme.textTertiary)
+                        .frame(width: 28 * uiScale, height: 28 * uiScale)
+                }
+                .buttonStyle(.plain)
+                .composerHitTarget()
+                .disabled(!isEnabled)
+                .accessibilityLabel("Start dictation")
+                .transition(.scale.combined(with: .opacity))
+            }
+
+            Button {
+                Task { await onSend() }
+                Haptics.play(.light)
+            } label: {
+                Circle()
+                    .fill(canSend ? theme.brandPrimary : theme.textTertiary.opacity(0.15))
+                    .frame(width: 28 * uiScale, height: 28 * uiScale)
+                    .overlay(
+                        Image(systemName: "arrow.up")
+                            .scaledFont(size: 12 * uiScale, weight: .bold)
+                            .foregroundStyle(canSend ? theme.brandOnPrimary : theme.textTertiary)
+                    )
+            }
+            .buttonStyle(.plain)
+            .composerHitTarget()
+            .disabled(!canSend || !isEnabled)
+            .accessibilityLabel("Send message")
+        }
+    }
+
+    // MARK: - Context Chip
+
+    private func chipRow(_ chip: ChannelComposerChip) -> some View {
+        let tint: Color = chip.style == .model ? theme.mentionModelText : theme.replyBorder
+        return HStack(spacing: 8) {
+            RoundedRectangle(cornerRadius: 1.5, style: .continuous)
+                .fill(tint)
+                .frame(width: 3)
+                .frame(maxHeight: .infinity)
+            Image(systemName: chip.icon)
+                .scaledFont(size: 11, weight: .bold)
+                .foregroundStyle(tint)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(chip.title)
+                    .scaledFont(size: 12, weight: .semibold)
+                    .foregroundStyle(theme.textPrimary)
+                    .lineLimit(1)
+                if let subtitle = chip.subtitle, !subtitle.isEmpty {
+                    Text(subtitle)
+                        .scaledFont(size: 11)
+                        .foregroundStyle(theme.textTertiary)
+                        .lineLimit(1)
+                }
+            }
+            Spacer(minLength: 4)
+            if let onRemove = chip.onRemove {
+                Button {
+                    onRemove()
+                    Haptics.play(.light)
+                } label: {
+                    Image(systemName: "xmark")
+                        .scaledFont(size: 10, weight: .bold)
+                        .foregroundStyle(theme.textTertiary)
+                        .frame(width: 22, height: 22)
+                        .background(theme.textTertiary.opacity(0.12), in: Circle())
+                }
+                .buttonStyle(.plain)
+                .composerHitTarget()
+                .accessibilityLabel("Remove")
+            }
+        }
+        .fixedSize(horizontal: false, vertical: true)
+        .padding(.horizontal, 8)
+        .padding(.vertical, 6)
+        .background(tint.opacity(0.1), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .contentShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .onTapGesture { chip.onTap?() }
     }
 
     // MARK: - Attachment Strip
@@ -198,50 +333,58 @@ struct ChannelInputField: View {
                     attachmentThumbnail(attachment)
                 }
             }
+            .padding(.top, 4)
+            .padding(.trailing, 4)
         }
     }
 
     private func attachmentThumbnail(_ attachment: ChatAttachment) -> some View {
         ZStack(alignment: .topTrailing) {
-            if let thumbnail = attachment.thumbnail {
-                thumbnail
-                    .resizable()
-                    .aspectRatio(contentMode: .fill)
-                    .frame(width: 50, height: 50)
-                    .clipShape(RoundedRectangle(cornerRadius: 8))
-            } else {
-                RoundedRectangle(cornerRadius: 8)
-                    .fill(theme.surfaceContainer)
-                    .frame(width: 50, height: 50)
-                    .overlay(
-                        VStack(spacing: 2) {
-                            if attachment.isUploading {
-                                ProgressView().controlSize(.small)
-                            } else {
-                                Image(systemName: "doc")
-                                    .scaledFont(size: 14)
-                                    .foregroundStyle(theme.textTertiary)
-                            }
-                            Text(attachment.name)
-                                .scaledFont(size: 7)
+            Group {
+                if let thumbnail = attachment.thumbnail {
+                    thumbnail
+                        .resizable()
+                        .aspectRatio(contentMode: .fill)
+                } else {
+                    VStack(spacing: 2) {
+                        if attachment.isUploading {
+                            ProgressView().controlSize(.small)
+                        } else {
+                            Image(systemName: "doc")
+                                .scaledFont(size: 14)
                                 .foregroundStyle(theme.textTertiary)
-                                .lineLimit(1)
                         }
-                    )
+                        Text(attachment.name)
+                            .scaledFont(size: 7)
+                            .foregroundStyle(theme.textTertiary)
+                            .lineLimit(1)
+                            .padding(.horizontal, 3)
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .background(theme.surfaceContainer.opacity(0.6))
+                }
+            }
+            .frame(width: 54, height: 54)
+            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+            .overlay {
+                if attachment.isUploading && attachment.thumbnail != nil {
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        .fill(.black.opacity(0.35))
+                        .overlay(ProgressView().controlSize(.small).tint(.white))
+                }
             }
 
-            // Remove button
             Button {
                 withAnimation(.easeOut(duration: 0.15)) {
                     onRemoveAttachment?(attachment)
                 }
             } label: {
                 Image(systemName: "xmark.circle.fill")
-                    .scaledFont(size: 16)
+                    .scaledFont(size: 17)
                     .symbolRenderingMode(.palette)
-                    .foregroundStyle(.white, .black.opacity(0.55))
+                    .foregroundStyle(.white, .black.opacity(0.6))
             }
-            .offset(x: 4, y: -4)
+            .offset(x: 5, y: -5)
             .accessibilityLabel("Remove \(attachment.name)")
         }
     }

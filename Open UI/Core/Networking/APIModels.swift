@@ -101,6 +101,10 @@ struct BackendConfig: Codable, Sendable {
         let enableSignupPasswordConfirmation: Bool?
         let enableLoginForm: Bool?
         let enableWebSearch: Bool?
+        /// Whether users must confirm before a web-search-enabled request is sent.
+        let enableWebSearchConfirmation: Bool?
+        /// Optional admin-configured notice shown in the web search confirmation.
+        let webSearchConfirmationContent: String?
         let enableImageGeneration: Bool?
         let enableCommunitySharing: Bool?
         let enableAdminExport: Bool?
@@ -130,6 +134,8 @@ struct BackendConfig: Codable, Sendable {
             case enableSignupPasswordConfirmation = "enable_signup_password_confirmation"
             case enableLoginForm = "enable_login_form"
             case enableWebSearch = "enable_web_search"
+            case enableWebSearchConfirmation = "enable_web_search_confirmation"
+            case webSearchConfirmationContent = "web_search_confirmation_content"
             case enableImageGeneration = "enable_image_generation"
             case enableCommunitySharing = "enable_community_sharing"
             case enableAdminExport = "enable_admin_export"
@@ -154,6 +160,8 @@ struct BackendConfig: Codable, Sendable {
             enableSignupPasswordConfirmation = try container.decodeIfPresent(Bool.self, forKey: .enableSignupPasswordConfirmation)
             enableLoginForm = try container.decodeIfPresent(Bool.self, forKey: .enableLoginForm)
             enableWebSearch = try container.decodeIfPresent(Bool.self, forKey: .enableWebSearch)
+            enableWebSearchConfirmation = try container.decodeIfPresent(Bool.self, forKey: .enableWebSearchConfirmation)
+            webSearchConfirmationContent = try container.decodeIfPresent(String.self, forKey: .webSearchConfirmationContent)
             enableImageGeneration = try container.decodeIfPresent(Bool.self, forKey: .enableImageGeneration)
             enableCommunitySharing = try container.decodeIfPresent(Bool.self, forKey: .enableCommunitySharing)
             enableAdminExport = try container.decodeIfPresent(Bool.self, forKey: .enableAdminExport)
@@ -291,6 +299,8 @@ struct ChatCompletionRequest: Sendable {
     /// forwarded to the LLM. Always sent as an object (empty `{}` when no vars),
     /// matching web-client behaviour. Required for pipe model compatibility.
     var variables: [String: Any]?
+    /// Fallback for temporary chats; saved conversations use server-side variables.
+    var chatVariables: [String: Any]?
     /// Full model JSON from the server. Sent as `model_item` so the backend can
     /// route the request to the correct pipe function. Required for pipe models;
     /// should be sent for ALL models so the backend has full routing context.
@@ -375,6 +385,7 @@ struct ChatCompletionRequest: Sendable {
         // The top-level `variables` key is kept for pipe model compatibility.
         let resolvedVars = variables ?? [String: Any]()
         data["variables"] = resolvedVars
+        if let chatVariables { data["chat_variables"] = chatVariables }
         data["metadata"] = ["variables": resolvedVars]
 
         // model_item: send when available (critical for pipe routing)

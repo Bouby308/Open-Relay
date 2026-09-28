@@ -38,7 +38,7 @@ final class WatchRelayService {
             _ = deps.authViewModel.currentUser?.id
             _ = deps.serverConfigStore.activeServer?.id
         } onChange: { [weak self] in
-            Task { @MainActor in
+            Task { @MainActor [weak self] in
                 guard let self else { return }
                 self.authStateChanged()
                 self.observeAuthState()

@@ -1335,7 +1335,9 @@ struct ModelEditorView: View {
         selectedToolIds = Set(model.toolIds)
         selectedFilterIds = Set(model.filterIds)
         defaultFilterIds = Set(model.defaultFilterIds)
-        selectedActionIds = Set(model.actionIds)
+        // Skills (meta.skillIds) and action functions (meta.actionIds) are independent.
+        selectedActionIds = Set(model.skillIds)
+        selectedActionFunctionIds.formUnion(model.actionIds)
 
         logger.info("[Populate] Done. baseModelId='\(model.baseModelId ?? "none")' knowledgeItems=\(model.knowledgeItems.count) toolIds=\(model.toolIds.count) filterIds=\(model.filterIds.count) actionIds=\(model.actionIds.count)")
     }
@@ -1597,16 +1599,11 @@ struct ModelEditorView: View {
         let globalFilterIds = Set(allFilters.filter(\.isGlobal).map(\.id))
         detail.filterIds = Array(selectedFilterIds.subtracting(globalFilterIds))
         detail.defaultFilterIds = Array(defaultFilterIds)
-        // Action IDs: merge skill selections with non-global action function selections.
+        // Actions and Skills are separate native selections.
         // Global action functions are excluded — the server applies them automatically.
-        // Filter out any action function IDs from selectedActionIds to avoid double-counting
-        // (populateIfEditing puts all model.actionIds into selectedActionIds before we
-        // know which ones are skills vs action functions).
-        let allActionFunctionIds = Set(allActionFunctions.map(\.id))
         let globalActionIds = Set(allActionFunctions.filter(\.isGlobal).map(\.id))
-        let skillOnlyIds = selectedActionIds.subtracting(allActionFunctionIds)
-        let perModelActionFunctionIds = selectedActionFunctionIds.subtracting(globalActionIds)
-        detail.actionIds = Array(skillOnlyIds) + Array(perModelActionFunctionIds)
+        detail.actionIds = selectedActionFunctionIds.subtracting(globalActionIds).sorted()
+        detail.skillIds = selectedActionIds.sorted()
         return detail
     }
 
@@ -2299,7 +2296,7 @@ struct ModelAdvancedParamsSection: View {
 
                     Text(":").foregroundStyle(theme.textTertiary)
 
-                    TextField("Value", text: Binding(
+                    TextField("JSON or text", text: Binding(
                         get: { customParams[idx].value },
                         set: { customParams[idx].value = $0 }
                     ))

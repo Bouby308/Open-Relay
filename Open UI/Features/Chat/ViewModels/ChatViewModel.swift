@@ -106,6 +106,51 @@ final class ChatViewModel {
     /// Populated from the server on load and updated in real-time during streaming.
     var tasks: [ChatTask] = []
     var errorMessage: String?
+    var isCompactingContext = false
+    var contextNeedsRefresh = false
+    var contextCompactionNotice: String?
+    var contextCompactionError: String?
+
+    /// Refresh-only recovery avoids repeating a compaction whose response may have been lost.
+    func compactContext(refreshOnly: Bool = false) async {
+        guard !isCompactingContext, !isStreaming, refreshOnly || !contextNeedsRefresh,
+              let chatId = conversationId ?? conversation?.id, !chatId.hasPrefix("local:"),
+              let manager else { return }
+        let scope = manager.apiClient.network.conversationCacheScope
+        func isCurrent() -> Bool {
+            scope == self.manager?.apiClient.network.conversationCacheScope
+                && chatId == (conversationId ?? conversation?.id)
+        }
+        isCompactingContext = true
+        contextNeedsRefresh = true
+        contextCompactionError = nil
+        contextCompactionNotice = nil
+        defer { isCompactingContext = false }
+        do {
+            if !refreshOnly {
+                let result = try await manager.apiClient.compactChat(id: chatId, model: selectedModelId)
+                guard isCurrent() else { return }
+                contextCompactionNotice = result.message
+            }
+            if let scope { await ConversationCache.shared.invalidate(scope: scope, id: chatId) }
+            guard isCurrent() else { return }
+            let refreshed = try await manager.fetchConversation(id: chatId)
+            guard isCurrent() else { return }
+            applyContextMetadata(refreshed)
+        } catch {
+            guard isCurrent() else { return }
+            contextCompactionError = error.localizedDescription
+        }
+    }
+
+    private func applyContextMetadata(_ refreshed: Conversation) {
+        guard refreshed.id == (conversationId ?? conversation?.id) else { return }
+        conversation?.contextUsage = refreshed.contextUsage
+        for (id, node) in refreshed.history.nodes {
+            conversation?.history.updateNode(id: id) { $0.contextSummary = node.contextSummary }
+        }
+        contextNeedsRefresh = false
+    }
 
     /// Bumped each time a regenerate begins. Observed by ChatDetailView to trigger scroll-to-bottom.
     var regenerateScrollToken: UUID = UUID()
@@ -144,8 +189,11 @@ final class ChatViewModel {
             }
         }
     }
+    /// Per-chat consent for the server's web search confirmation policy.
+    let webSearchConsent = WebSearchConsent()
     var webSearchEnabled: Bool = false {
         didSet {
+            if !webSearchEnabled { webSearchConsent.reset() }
             guard !suppressBuiltinFeatureTracking else { return }
             if webSearchEnabled {
                 userDisabledBuiltinFeatures.remove("web_search")
@@ -213,8 +261,16 @@ final class ChatViewModel {
     /// Has a countdown timer; expires by rejecting automatically.
     var liveAskUserPrompt: PendingAskUserPrompt?
 
+    /// Live tool `confirmation` / `input` requests and `notification` toasts.
+    /// Only an explicit user response can approve a tool call.
+    let toolEventPrompts = ChatEventPrompts()
+
     /// True while a resolve (answer/reject) API call is in-flight for ask_user.
     var isResolvingAskUser: Bool = false
+    /// Retryable error shown on the ask_user card when submitting a saved answer failed.
+    var askUserError: String?
+    /// Call IDs already answered so a stale history scan doesn't re-show the card.
+    private var resolvedAskUserCallIds: Set<String> = []
 
     /// Messages queued to send after the current stream completes.
     var messageQueue: [QueuedMessage] = []
@@ -283,6 +339,8 @@ final class ChatViewModel {
     /// terminal server list to load before it can be selected.
     @ObservationIgnored private var pendingModelDefaultTerminalId: String?
     var terminalDisplayFiles: [String: [TerminalFileAttachment]] = [:]
+    /// De-duplicates terminal tool events delivered by both socket listeners.
+    @ObservationIgnored private var recentTerminalEvents: [String: Date] = [:]
     /// True if the currently selected model has the terminal capability enabled.
     var isTerminalCapableForSelectedModel: Bool {
         selectedModel?.supportsTerminal ?? false
@@ -317,6 +375,50 @@ final class ChatViewModel {
     var pendingPromptForVariables: PromptItem?
     /// The parsed variables for the pending prompt.
     var pendingPromptVariables: [PromptVariable] = []
+    var chatVariableForm: ChatVariableForm?
+    var isSavingChatVariables = false
+    var isCreatingConversation = false
+    private var pendingChatVariables: [String: Any] = [:]
+    private var chatVariablesDraftGeneration = 0
+
+    func makeChatVariableForm(modelID: String? = nil) -> ChatVariableForm? {
+        guard let model = availableModels.first(where: { $0.id == (modelID ?? selectedModelId) }) else { return nil }
+        let form = ChatVariableForm(model: model, values: conversation?.chatVariables ?? pendingChatVariables,
+            chatID: conversationId ?? conversation?.id, scope: manager?.apiClient.network.conversationCacheScope,
+            draftGeneration: chatVariablesDraftGeneration)
+        return form.fields.isEmpty ? nil : form
+    }
+
+    private func needsChatVariables(modelID: String?) -> Bool {
+        guard let form = makeChatVariableForm(modelID: modelID), form.needsInput else { return false }
+        chatVariableForm = form
+        return true
+    }
+
+    func saveChatVariables(_ input: [String: String], form: ChatVariableForm) async throws {
+        guard !isSavingChatVariables, !isCreatingConversation, !isStreaming, let manager else { throw APIError.cancelled }
+        func isCurrent() -> Bool {
+            !Task.isCancelled && form.draftGeneration == chatVariablesDraftGeneration
+                && form.chatID == (conversationId ?? conversation?.id)
+                && form.scope == self.manager?.apiClient.network.conversationCacheScope
+        }
+        guard isCurrent() else { throw APIError.cancelled }
+        isSavingChatVariables = true
+        defer { isSavingChatVariables = false }
+        var saved = conversation?.chatVariables ?? pendingChatVariables
+        if let id = form.chatID, !id.hasPrefix("local:") {
+            // Refresh before merging to preserve variables belonging to other models/clients.
+            saved = try await manager.fetchConversation(id: id).chatVariables
+            guard isCurrent() else { throw APIError.cancelled }
+        }
+        let values = try form.merging(input, into: saved)
+        if let id = form.chatID, !id.hasPrefix("local:") {
+            try await manager.apiClient.updateChatVariables(id: id, values: values)
+        }
+        guard isCurrent() else { throw APIError.cancelled }
+        if conversation != nil { conversation?.chatVariables = values }
+        else { pendingChatVariables = values }
+    }
     /// The model ID selected via `@` mention in the chat input.
     /// Persists across messages until the user explicitly clears it.
     var mentionedModelId: String?
@@ -392,10 +494,6 @@ final class ChatViewModel {
     /// so it can detect when a new stream has started (e.g., via queue drain) and
     /// skip cleanup that would otherwise tear down the new stream.
     private var streamingSessionId: Int = 0
-    /// Tracks the content length at the last `extractAndApplyTasksFromContent` call.
-    /// Prevents the O(n) task-extraction scan from running on every single token;
-    /// it only fires when the content has grown by ≥ 100 chars since the last scan.
-    private var lastTaskExtractionLength: Int = 0
     private var activeTaskId: String?
     private var recoveryTimer: Timer?
     /// Cancellable delay task for the initial recovery timer delay.
@@ -552,7 +650,8 @@ final class ChatViewModel {
         let notBlocked = (enableMessageQueue && isStreaming)
             || (!isStreaming
                 && !attachments.contains(where: { $0.type == .audio && $0.isTranscribing }))
-        return notBlocked
+        return notBlocked && !isCompactingContext && !contextNeedsRefresh
+            && !isSavingChatVariables && !isCreatingConversation
             && (!inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                 || !attachments.isEmpty)
     }
@@ -638,9 +737,9 @@ final class ChatViewModel {
                 let (fileId, fileObject) = try await mgr.uploadFile(
                     data: textData,
                     fileName: fileName,
-                    onUploaded: { [weak self] _ in
-                        Task { @MainActor [weak self] in
-                            guard let self else { return }
+                    onUploaded: { _ in
+                        // The enclosing Task already retains self for the whole upload.
+                        Task { @MainActor in
                             if let idx = self.attachments.firstIndex(where: { $0.id == attachmentId }) {
                                 self.attachments[idx].uploadStatus = .processing
                             }
@@ -704,9 +803,9 @@ final class ChatViewModel {
                 let (fileId, fileObject) = try await manager.uploadFile(
                     data: data,
                     fileName: fileName,
-                    onUploaded: { [weak self] _ in
-                        Task { @MainActor [weak self] in
-                            guard let self else { return }
+                    onUploaded: { _ in
+                        // The enclosing Task already retains self for the whole upload.
+                        Task { @MainActor in
                             if let idx = self.attachments.firstIndex(where: { $0.id == attachmentId }) {
                                 self.attachments[idx].uploadStatus = .processing
                             }
@@ -779,6 +878,7 @@ final class ChatViewModel {
     private(set) var isConfigured: Bool = false
 
     func configure(with manager: ConversationManager, socket: SocketIOService? = nil, store: ActiveChatStore? = nil, asr: OnDeviceASRService? = nil, notes: NotesManager? = nil) {
+        webSearchConsent.reset()
         self.manager = manager
         self.notesManager = notes
         self.socketService = socket
@@ -1191,6 +1291,11 @@ final class ChatViewModel {
         do {
             let serverConversation = try await manager.fetchConversation(id: chatId)
             lastSyncTime = Date()
+            if !isCompactingContext,
+               manager.apiClient.network.conversationCacheScope == self.manager?.apiClient.network.conversationCacheScope {
+                applyContextMetadata(serverConversation)
+            }
+            if !isSavingChatVariables { conversation?.chatVariables = serverConversation.chatVariables }
 
             let serverMessages = serverConversation.messages
             let localMessages = conversation?.messages ?? []
@@ -1677,6 +1782,9 @@ final class ChatViewModel {
     }
 
     deinit {
+        // Decline any tool prompts still waiting so the server's sio.call() resumes.
+        let prompts = toolEventPrompts
+        Task { @MainActor in prompts.cancelAll() }
         configurationObservers.forEach { NotificationCenter.default.removeObserver($0) }
         let fgObserver = foregroundObserver
         let bgObserver = backgroundObserver
@@ -2466,8 +2574,21 @@ final class ChatViewModel {
 
         // --- Metadata events: ALWAYS process (title, tags, follow-ups) ---
         switch type {
+        case "embeds", "chat:message:embeds":
+            applyMessageEmbeds(payload, messageId: messageId, chatId: event["chat_id"] as? String)
+            return
+        case "chat:outlet":
+            applyOutletMessages(payload, chatId: event["chat_id"] as? String)
+            return
         case "terminal:display_file":
             receiveTerminalFile(payload, messageId: messageId, chatId: event["chat_id"] as? String, serverId: nil)
+            forwardTerminalEvent(type: "terminal:display_file", payload: payload, chatId: event["chat_id"] as? String)
+            return
+        case "terminal:write_file", "terminal:replace_file_content", "terminal:run_command":
+            forwardTerminalEvent(type: type ?? "", payload: payload, chatId: event["chat_id"] as? String)
+            return
+        case "chat:message:tasks":
+            applyTaskUpdate(payload)
             return
         case "chat:title":
             var newTitle: String?
@@ -3048,6 +3169,9 @@ final class ChatViewModel {
 
     func startNewConversation() {
         conversation = nil
+        pendingChatVariables = [:]
+        chatVariableForm = nil
+        chatVariablesDraftGeneration += 1
         inputText = ""
         attachments = []
         errorMessage = nil
@@ -3100,7 +3224,8 @@ final class ChatViewModel {
                 messages: conversation.messages,
                 chatParams: conversation.chatParams,
                 folderId: folderContextId,
-                chatFiles: conversation.files
+                chatFiles: conversation.files,
+                variables: conversation.chatVariables
             )
             // Swap the local ID for the server-assigned one — in-place, no reload.
             self.conversation?.id = created.id
@@ -3120,9 +3245,11 @@ final class ChatViewModel {
     /// bound `inputText` — this avoids the prompt briefly flashing in the input
     /// field before being sent.
     func sendMessage(directText: String? = nil) async {
+        guard !isCompactingContext, !contextNeedsRefresh,
+              !isSavingChatVariables, !isCreatingConversation else { return }
         let text = (directText ?? inputText).trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty || !attachments.isEmpty else { return }
-
+        guard await authorizeWebSearch() else { return }
 
         // If message queue is enabled and we're currently streaming, enqueue the text
         // (only text messages can be queued — attachments are sent normally when not streaming)
@@ -3147,6 +3274,34 @@ final class ChatViewModel {
         guard let modelId = mentionedModelId ?? selectedModelId else {
             errorMessage = "Please select a model first."
             return
+        }
+        if needsChatVariables(modelID: modelId) {
+            inputText = text
+            return
+        }
+        // Persist variables before consuming the draft. If creation fails, keep
+        // the text and attachments and let the user retry explicitly.
+        if conversation == nil && !isTemporaryChat {
+            let scope = manager.apiClient.network.conversationCacheScope
+            let draftGeneration = chatVariablesDraftGeneration
+            isCreatingConversation = true
+            defer { isCreatingConversation = false }
+            do {
+                var created = try await manager.createConversation(title: String(text.prefix(50)),
+                    model: modelId, folderId: folderContextId, variables: pendingChatVariables)
+                guard scope == self.manager?.apiClient.network.conversationCacheScope,
+                      draftGeneration == chatVariablesDraftGeneration, !Task.isCancelled else { return }
+                created.chatParams = pendingChatParams
+                pendingChatParams = nil
+                conversation = created
+                pendingChatVariables = [:]
+                NotificationService.shared.activeConversationId = created.id
+            } catch {
+                if scope == self.manager?.apiClient.network.conversationCacheScope {
+                    errorMessage = error.localizedDescription
+                }
+                return
+            }
         }
 
         // Process audio attachments depending on transcription mode.
@@ -3317,21 +3472,12 @@ final class ChatViewModel {
         // Ensure conversation exists on server (skip for temporary chats)
         if conversation == nil {
             let chatTitle = String(currentText.prefix(50))
-            var serverId: String?
-            if !isTemporaryChat {
-                do {
-                    let created = try await manager.createConversation(
-                        title: chatTitle, messages: [], model: modelId,
-                        folderId: folderContextId)
-                    serverId = created.id
-                } catch {
-                    logger.warning("Pre-create failed: \(error.localizedDescription)")
-                }
-            }
-            let localId = isTemporaryChat ? "local:\(UUID().uuidString)" : (serverId ?? UUID().uuidString)
+            let localId = "local:\(UUID().uuidString)"
             var newConv = Conversation(
                 id: localId,
                 title: chatTitle, model: modelId, messages: [userMessage])
+            newConv.chatVariables = pendingChatVariables
+            pendingChatVariables = [:]
             // Apply any chat params that were set before the conversation existed
             if let pending = pendingChatParams {
                 newConv.chatParams = pending
@@ -3757,12 +3903,15 @@ final class ChatViewModel {
     /// The streaming pipeline is pre-seeded with the existing content so the typewriter
     /// starts at the END of what's already displayed — old content is never re-streamed.
     func continueLastResponse() async {
+        guard !isCompactingContext, !contextNeedsRefresh, !isSavingChatVariables else { return }
         guard !isStreaming || isExternallyStreaming else { return }
         guard let lastAssistant = conversation?.messages.last(where: { $0.role == .assistant }) else { return }
+        guard await authorizeWebSearch() else { return }
         let assistantId = lastAssistant.id
         let existingContent = lastAssistant.content
 
         let modelId = lastAssistant.model ?? selectedModelId ?? conversation?.model ?? ""
+        guard !needsChatVariables(modelID: modelId) else { return }
         guard let lastUser = conversation?.messages.last(where: { $0.role == .user }) else { return }
 
         let apiMessages = await buildAPIMessagesAsync()
@@ -3898,8 +4047,11 @@ final class ChatViewModel {
     /// matching the OpenWebUI web client's regeneration behavior for mid-conversation
     /// messages.
     func regenerateResponse(messageId: String) async {
+        guard !isCompactingContext, !contextNeedsRefresh, !isSavingChatVariables,
+              !needsChatVariables(modelID: selectedModelId ?? conversation?.model) else { return }
         guard !isStreaming || isExternallyStreaming else { return }
         guard conversation != nil else { return }
+        guard await authorizeWebSearch() else { return }
 
         // Cancel any in-flight completion task from the previous stream.
         // Without this, sendMessage's completionTask continues running its
@@ -4128,8 +4280,11 @@ final class ChatViewModel {
     /// files (allowing attachment removal); otherwise it inherits the original
     /// node's files unchanged.
     func editMessage(id: String, newContent: String, files: [ChatMessageFile]? = nil) async {
+        guard !isCompactingContext, !contextNeedsRefresh, !isSavingChatVariables,
+              !needsChatVariables(modelID: selectedModelId ?? conversation?.model) else { return }
         guard !isStreaming || isExternallyStreaming else { return }
         guard conversation != nil else { return }
+        guard await authorizeWebSearch() else { return }
 
         // ── Tree-first edit (replicates OpenWebUI exactly) ─────────────────
         // 1. Look up the old user node in the history tree.
@@ -4710,6 +4865,12 @@ final class ChatViewModel {
                 if type == "terminal:display_file" {
                     self.receiveTerminalFile(data["data"] as? [String: Any], messageId: assistantMessageId,
                                              chatId: effectiveChatId, serverId: terminalServerId)
+                    self.forwardTerminalEvent(type: "terminal:display_file", payload: data["data"] as? [String: Any],
+                                              chatId: effectiveChatId)
+                    return
+                }
+                if let type, type == "terminal:write_file" || type == "terminal:replace_file_content" || type == "terminal:run_command" {
+                    self.forwardTerminalEvent(type: type, payload: data["data"] as? [String: Any], chatId: effectiveChatId)
                     return
                 }
                 self.handleChatEvent(
@@ -4754,6 +4915,63 @@ final class ChatViewModel {
         return terminalDisplayFiles[chatId + "\0" + messageId] ?? []
     }
 
+    /// Forwards `terminal:*` tool events (display_file, write_file,
+    /// replace_file_content, run_command) to the terminal side panel so it can
+    /// open the file or refresh — same as the web FileNav. Both socket
+    /// listeners may deliver an event, so repeats within a second are dropped.
+    func forwardTerminalEvent(type: String, payload: [String: Any]?, chatId: String?) {
+        guard type.hasPrefix("terminal:"),
+              let current = conversationId ?? conversation?.id,
+              chatId == nil || chatId == current else { return }
+        let path = payload?["path"] as? String
+        let key = type + "\0" + (path ?? "")
+        let now = Date()
+        if let last = recentTerminalEvents[key], now.timeIntervalSince(last) < 1 { return }
+        recentTerminalEvents = recentTerminalEvents.filter { now.timeIntervalSince($0.value) < 5 }
+        recentTerminalEvents[key] = now
+        var info: [String: Any] = ["type": type, "chatId": current]
+        if let path { info["path"] = path }
+        NotificationCenter.default.post(name: .terminalFileEvent, object: nil, userInfo: info)
+    }
+
+    private func applyMessageEmbeds(_ payload: [String: Any]?, messageId: String?, chatId: String?) {
+        guard let messageId, let embeds = payload?["embeds"] as? [String],
+              chatId == nil || chatId == (conversationId ?? conversation?.id) else { return }
+        // Snapshots replace, rather than append: active and passive listeners may both receive one.
+        conversation?.history.updateNode(id: messageId) { $0.embeds = embeds }
+        if let index = conversation?.messages.firstIndex(where: { $0.id == messageId }),
+           conversation?.messages[index].embeds != embeds {
+            conversation?.messages[index].embeds = embeds
+        }
+    }
+
+    /// Backend outlet filters run after completion. Their text is authoritative,
+    /// including empty replacements; never replay an older typewriter tail over it.
+    private func applyOutletMessages(_ payload: [String: Any]?, chatId: String?) {
+        guard let currentId = conversationId ?? conversation?.id,
+              chatId == nil || chatId == currentId,
+              let messages = payload?["messages"] as? [[String: Any]] else { return }
+        for message in messages {
+            guard let id = message["id"] as? String,
+                  let content = message["content"] as? String,
+                  var node = conversation?.history.nodes[id], node.content != content else { continue }
+            // A delayed outlet must not interrupt a newer continuation of this ID.
+            if streamingStore.streamingMessageId == id && streamingStore.isActive && !streamingStore.isFinishing { continue }
+            node.originalContent = node.content
+            node.content = content
+            if let output = message["output"] as? [[String: Any]] { node.output = output }
+            if node.role == .assistant { node.done = true }
+            conversation?.history.nodes[id] = node
+            if let index = conversation?.messages.firstIndex(where: { $0.id == id }) {
+                conversation?.messages[index].content = content
+                conversation?.messages[index].isStreaming = false
+            }
+            if streamingStore.streamingMessageId == id && streamingStore.isFinishing {
+                streamingStore.abortStreaming()
+            }
+        }
+    }
+
     private func handleChatEvent(
         _ event: [String: Any], ack: ((Any?) -> Void)?,
         assistantMessageId: String, modelId: String,
@@ -4770,6 +4988,16 @@ final class ChatViewModel {
 
         switch type {
         // --- Events that MUST work after streaming finishes ---
+
+        case "chat:message:tasks":
+            applyTaskUpdate(payload)
+
+        case "embeds", "chat:message:embeds":
+            applyMessageEmbeds(payload, messageId: event["message_id"] as? String ?? assistantMessageId,
+                               chatId: event["chat_id"] as? String ?? effectiveChatId)
+
+        case "chat:outlet":
+            applyOutletMessages(payload, chatId: event["chat_id"] as? String ?? effectiveChatId)
 
         case "chat:title":
             // Title can be a direct string or nested in payload
@@ -4840,15 +5068,10 @@ final class ChatViewModel {
                 appendSources(id: assistantMessageId, sources: sources)
             }
 
-        case "notification":
-            if let msg = payload?["content"] as? String { logger.info("Notification: \(msg)") }
-
-        case "confirmation":
-            ack?(true)
-
-        case "execute":
-            logger.info("🔧 [Socket] Acknowledging execute event for tool pipeline")
-            ack?(true)
+        case "notification", "confirmation", "input":
+            // Never auto-approve: queue for an explicit user response.
+            toolEventPrompts.receive(type: type ?? "", payload: payload,
+                                     active: !hasFinishedStreaming, reply: ack)
 
         case "context_compaction":
             // Context compaction is a server-side operation that runs before the model
@@ -4929,54 +5152,11 @@ final class ChatViewModel {
                 updateAssistantMessage(id: assistantMessageId, content: acc.content, isStreaming: false)
                 cleanupStreaming()
 
-            case "request:chat:completion":
-                if let ch = payload?["channel"] as? String, !ch.isEmpty {
-                    logger.info("Channel request: \(ch)")
-                }
-
-            case "execute:tool":
-                if let name = payload?["name"] as? String, !name.isEmpty {
-                    let su = ChatStatusUpdate(action: name, description: "Executing \(name)…", done: false)
-                    appendStatusUpdate(id: assistantMessageId, status: su)
-                }
-
             case "request:user_input":
-                // Live ask_user request from server during streaming.
-                // Parse and store as `liveAskUserPrompt` so the AskUserCard appears above the input.
-                if let p = payload,
-                   let questions = p["questions"] as? [[String: Any]],
-                   !questions.isEmpty {
-                    let globalAllowOther = p["allow_other"] as? Bool ?? true
-                    let timeoutMs = p["timeout_ms"] as? Int
-                    let parsed: [AskUserQuestion] = questions.compactMap { qDict -> AskUserQuestion? in
-                        guard let id = qDict["id"] as? String, !id.isEmpty,
-                              let qText = qDict["question"] as? String, !qText.isEmpty,
-                              let optsArr = qDict["options"] as? [[String: Any]] else { return nil }
-                        let opts: [AskUserOption] = optsArr.compactMap { o -> AskUserOption? in
-                            guard let lbl = o["label"] as? String, !lbl.isEmpty,
-                                  let desc = o["description"] as? String else { return nil }
-                            return AskUserOption(label: lbl, description: desc)
-                        }
-                        guard !opts.isEmpty else { return nil }
-                        return AskUserQuestion(
-                            id: id, header: qDict["header"] as? String ?? "",
-                            question: qText, options: opts,
-                            allowOther: qDict["allow_other"] as? Bool ?? globalAllowOther
-                        )
-                    }
-                    if !parsed.isEmpty {
-                        // The call_id will be resolved when the user answers via the output array scan
-                        // For live requests we use the assistantMessageId as a placeholder;
-                        // the real callId comes from scanForPendingToolActions() after the output updates.
-                        liveAskUserPrompt = PendingAskUserPrompt(
-                            messageId: assistantMessageId,
-                            callId: "",   // updated by scanForPendingToolActions after output arrives
-                            questions: parsed,
-                            allowOther: globalAllowOther,
-                            timeoutMs: timeoutMs
-                        )
-                    }
-                }
+                // Live ask_user request — answered through its Socket.IO ack callback
+                // so the server's sio.call() resumes the tool. The real callId is filled in
+                // by handleChatCompletion once the output array arrives.
+                receiveAskUser(payload, messageId: assistantMessageId, reply: ack)
 
             default:
                 break
@@ -5010,11 +5190,7 @@ final class ChatViewModel {
                 // For live ask_user: update callId once we have the real output
                 if let livePrompt = liveAskUserPrompt, livePrompt.callId.isEmpty,
                    let info = MessageHistory.findPendingAskUser(messageId: assistantMessageId, in: outputArr) {
-                    liveAskUserPrompt = PendingAskUserPrompt(
-                        messageId: livePrompt.messageId, callId: info.callId,
-                        questions: livePrompt.questions, allowOther: livePrompt.allowOther,
-                        timeoutMs: livePrompt.timeoutMs
-                    )
+                    liveAskUserPrompt?.callId = info.callId
                 }
             }
 
@@ -5031,7 +5207,7 @@ final class ChatViewModel {
                 // Guard: if ask_user is pending, the LLM has finished writing the tool call
                 // but the tool itself is still waiting for user input. Do NOT finalize
                 // streaming yet — we must wait for the user to answer (or time out).
-                // liveAskUserPrompt is cleared in answerAskUser/rejectAskUser, at which
+                // liveAskUserPrompt is cleared in resolveAskUser, at which
                 // point the server resumes and will emit another done:true to finalize.
                 if liveAskUserPrompt != nil {
                     logger.info("done:true (output path) with ask_user pending — deferring finalization until user responds")
@@ -5789,25 +5965,22 @@ final class ChatViewModel {
         )
     }
 
-    /// Updates a task status locally and syncs to server.
-    /// Called from TaskListView when the user taps a task row.
-    func updateTaskStatus(taskId: String, newStatus: String) {
-        // Update locally immediately (optimistic)
-        if let idx = tasks.firstIndex(where: { $0.id == taskId }) {
-            tasks[idx].status = newStatus
-        }
-        if let idx = conversation?.tasks.firstIndex(where: { $0.id == taskId }) {
-            conversation?.tasks[idx].status = newStatus
-        }
-        // Sync to server
-        guard let chatId = conversationId ?? conversation?.id,
-              let apiClient = manager?.apiClient else { return }
-        Task {
-            _ = try? await apiClient.updateChatTask(chatId: chatId, taskId: taskId, status: newStatus)
-        }
+    /// Applies a native `chat:message:tasks` snapshot from the server.
+    /// Task status is server-controlled; the snapshot replaces the whole list
+    /// (an empty snapshot clears the panel).
+    private func applyTaskUpdate(_ payload: [String: Any]?) {
+        guard let rawTasks = payload?["tasks"] as? [[String: Any]],
+              let data = try? JSONSerialization.data(withJSONObject: rawTasks),
+              let updated = try? JSONDecoder().decode([ChatTask].self, from: data),
+              Set(updated.map(\.id)).count == updated.count else { return }
+        tasks = updated
+        conversation?.tasks = updated
     }
 
     private func cleanupStreaming() {
+        // The stream ended: decline any tool prompts / live questions still waiting.
+        toolEventPrompts.cancelAll()
+        cancelLiveAskUser()
         guard !hasFinishedStreaming else { return }
         stopSwitchStatusPolling()
         hasFinishedStreaming = true
@@ -5824,7 +5997,6 @@ final class ChatViewModel {
         }
         selfInitiatedStream = false
         activeTaskId = nil
-        lastTaskExtractionLength = 0
 
         // Always fire the notification — the UNUserNotificationCenterDelegate's
         // willPresent handler suppresses the banner when the user is actively
@@ -6021,6 +6193,22 @@ final class ChatViewModel {
     ///
     /// IMPORTANT: Uses `applyIncrementalModelDefaults` instead of `syncUIWithModelDefaults`
     /// to avoid wiping tools/features the user has manually toggled during the session.
+    /// Refreshes model defaults, then asks for web search consent when the server
+    /// requires it. Returns `false` if the request must not be sent.
+    func authorizeWebSearch() async -> Bool {
+        // Refresh first: a newly enabled model default must not bypass consent.
+        let revision = webSearchConsent.revision
+        await refreshSelectedModelMetadata()
+        guard revision == webSearchConsent.revision, !Task.isCancelled else { return false }
+        guard webSearchEnabled else { return true }
+        guard let api = manager?.apiClient else { return false }
+        do { return try await webSearchConsent.request(using: api) }
+        catch {
+            errorMessage = "Could not check web search confirmation. Please try again."
+            return false
+        }
+    }
+
     private func refreshSelectedModelMetadata() async {
         guard let modelId = selectedModelId, let manager else { return }
         do {
@@ -6482,8 +6670,8 @@ final class ChatViewModel {
     ///
     /// Call this after constructing the basic ChatCompletionRequest and before sending.
     private func populateCommonRequestFields(_ request: inout ChatCompletionRequest) async {
-        // Refresh model metadata to pick up live admin changes
-        await refreshSelectedModelMetadata()
+        // Model metadata was refreshed in authorizeWebSearch() — before consent and
+        // before any draft/history changes — so a newly enabled default can't bypass it.
         if var mi = selectedModel?.rawModelItem {
             // Ensure owned_by and object are non-null strings for pipe model routing.
             // The single-model endpoint omits these fields; without them the server's
@@ -6579,6 +6767,9 @@ final class ChatViewModel {
         var mergedVars = request.variables ?? [:]
         for (k, v) in sysVars { mergedVars[k] = v }
         request.variables = mergedVars
+        if isTemporaryChat || request.chatId == nil || request.chatId?.hasPrefix("local:") == true {
+            request.chatVariables = conversation?.chatVariables ?? pendingChatVariables
+        }
 
         // Also substitute directly into the overridden system prompt string.
         // The server uses params.system as-is without re-substituting variables,
@@ -6995,124 +7186,6 @@ final class ChatViewModel {
         return "An unexpected error occurred"
     }
 
-    /// Extracts and updates tasks from a create_tasks or update_task tool call block
-    /// embedded in the streaming assistant message content.
-    /// Only processes tool calls that are fully complete (isDone == true) to avoid
-    /// parsing truncated/invalid JSON that arrives token-by-token during streaming.
-    private func extractAndApplyTasksFromContent(_ content: String) {
-        guard content.contains("create_tasks") || content.contains("update_task") else { return }
-
-        let ordered = ToolCallParser.parseOrdered(content)
-        for segment in ordered.segments {
-            guard case .toolCall(let tc) = segment else { continue }
-            guard tc.name == "create_tasks" || tc.name == "update_task" else { continue }
-            // Only process complete tool calls — streaming delivers truncated JSON
-            // in the arguments attribute which JSONSerialization cannot parse.
-            guard tc.isDone else { continue }
-
-            if tc.name == "create_tasks" {
-                // Prefer tc.result (server-authoritative, contains assigned IDs),
-                // fall back to tc.arguments using robust multi-strategy parsing.
-                let taskDict = parseTaskJSON(tc.result) ?? parseTaskJSON(tc.arguments)
-                if let taskArray = taskDict?["tasks"] as? [[String: Any]] {
-                    let parsed = taskArray.compactMap { t -> ChatTask? in
-                        guard let id = t["id"] as? String,
-                              let content = t["content"] as? String,
-                              let status = t["status"] as? String
-                        else { return nil }
-                        return ChatTask(id: id, content: content, status: status)
-                    }
-                    if !parsed.isEmpty {
-                        tasks = parsed
-                        conversation?.tasks = parsed
-                    }
-                }
-            } else if tc.name == "update_task" {
-                // Prefer tc.result — server returns the full updated task list after each update_task call.
-                // Fall back to single-task delta from tc.arguments if result is unavailable.
-                if let resultDict = parseTaskJSON(tc.result),
-                   let taskArray = resultDict["tasks"] as? [[String: Any]] {
-                    let parsed = taskArray.compactMap { t -> ChatTask? in
-                        guard let id = t["id"] as? String,
-                              let content = t["content"] as? String,
-                              let status = t["status"] as? String
-                        else { return nil }
-                        return ChatTask(id: id, content: content, status: status)
-                    }
-                    if !parsed.isEmpty {
-                        tasks = parsed
-                        conversation?.tasks = parsed
-                    }
-                } else {
-                    // Fallback: apply a single-task status change from arguments
-                    let argsDict = parseTaskJSON(tc.arguments)
-                    if let json = argsDict,
-                       let taskId = json["id"] as? String ?? json["task_id"] as? String,
-                       let newStatus = json["status"] as? String {
-                        if let idx = tasks.firstIndex(where: { $0.id == taskId }) {
-                            tasks[idx].status = newStatus
-                        }
-                        if let convIdx = conversation?.tasks.firstIndex(where: { $0.id == taskId }) {
-                            conversation?.tasks[convIdx].status = newStatus
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    /// Robustly parses a JSON string into a `[String: Any]` dictionary.
-    /// Handles four encoding variations seen in server-sent tool call attributes:
-    /// 1. Plain JSON object string
-    /// 2. Double-encoded: outer JSON is a string whose value is a JSON object
-    /// 3. Backslash-escaped quotes (`\"`) that must be stripped before parsing
-    /// 4. Regex extraction of individual task objects as a last resort
-    private func parseTaskJSON(_ source: String?) -> [String: Any]? {
-        guard let source, !source.isEmpty else { return nil }
-
-        // Strategy 1: direct parse
-        if let data = source.data(using: .utf8),
-           let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-            return json
-        }
-
-        // Strategy 2: double-encoded — outer value is a JSON string wrapping another JSON object
-        if let data = source.data(using: .utf8),
-           let str = try? JSONSerialization.jsonObject(with: data) as? String,
-           let innerData = str.data(using: .utf8),
-           let json = try? JSONSerialization.jsonObject(with: innerData) as? [String: Any] {
-            return json
-        }
-
-        // Strategy 3: strip backslash-escaped quotes produced by HTML attribute encoding
-        let unescaped = source.replacingOccurrences(of: "\\\"", with: "\"")
-        if let data = unescaped.data(using: .utf8),
-           let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-            return json
-        }
-
-        // Strategy 4: regex extraction — pull task objects directly from the raw string
-        let taskPattern = #"\{[^{}]*"id"\s*:\s*"[^"]+[^{}]*"content"\s*:\s*"[^"]+[^{}]*"status"\s*:\s*"[^"]+"[^{}]*\}"#
-        if let regex = try? NSRegularExpression(pattern: taskPattern),
-           let tasksRange = source.range(of: #""tasks"\s*:\s*\["#, options: .regularExpression) {
-            let searchString = String(source[tasksRange.lowerBound...])
-            let nsSearch = searchString as NSString
-            let matches = regex.matches(in: searchString, range: NSRange(location: 0, length: nsSearch.length))
-            let taskDicts: [[String: Any]] = matches.compactMap { match in
-                let raw = nsSearch.substring(with: match.range)
-                guard let d = raw.data(using: .utf8),
-                      let obj = try? JSONSerialization.jsonObject(with: d) as? [String: Any]
-                else { return nil }
-                return obj
-            }
-            if !taskDicts.isEmpty {
-                return ["tasks": taskDicts]
-            }
-        }
-
-        return nil
-    }
-
     private func updateAssistantMessage(
         id: String, content: String, isStreaming: Bool,
         sources: [ChatSourceReference]? = nil,
@@ -7214,17 +7287,6 @@ final class ChatViewModel {
             if let error { conversation?.messages[index].error = error }
         }
 
-        // Extract and apply task list updates live from the streaming content.
-        // Gate on a 100-char delta to avoid the O(n) string scan on every token.
-        // The function also guards internally (only fires when the magic keywords are present),
-        // so normal messages pay only the cheap length comparison.
-        // utf8.count is O(1) for native strings; `count` walks every character.
-        let contentLength = content.utf8.count
-        if contentLength - lastTaskExtractionLength >= 100 {
-            lastTaskExtractionLength = contentLength
-            extractAndApplyTasksFromContent(content)
-        }
-
     }
 
     private func appendStatusUpdate(id: String, status: ChatStatusUpdate) {
@@ -7298,6 +7360,11 @@ final class ChatViewModel {
     private func refreshConversationMetadata(chatId: String, assistantMessageId: String) async throws {
         guard let manager else { return }
         let refreshed = try await manager.fetchConversation(id: chatId)
+
+        if !isCompactingContext,
+           manager.apiClient.network.conversationCacheScope == self.manager?.apiClient.network.conversationCacheScope {
+            applyContextMetadata(refreshed)
+        }
 
         // Update title
         if !refreshed.title.isEmpty && refreshed.title != "New Chat" {
@@ -7450,9 +7517,12 @@ final class ChatViewModel {
 
             // Check for pending ask_user first (takes visual priority)
             if let info = MessageHistory.findPendingAskUser(messageId: message.id, in: rawOutput),
+               !resolvedAskUserCallIds.contains(info.callId),
                let prompt = PendingAskUserPrompt.fromInfo(info) {
-                if liveAskUserPrompt?.callId != prompt.callId {
+                if liveAskUserPrompt == nil,
+                   pendingAskUserPrompt?.messageId != prompt.messageId || pendingAskUserPrompt?.callId != prompt.callId {
                     pendingAskUserPrompt = prompt
+                    askUserError = nil
                 }
                 pendingToolApprovalCall = nil
                 return
@@ -7541,48 +7611,62 @@ final class ChatViewModel {
         }
     }
 
-    /// Submits answers to a pending ask_user call.
-    func answerAskUser(
-        messageId: String, callId: String,
-        answers: [String: AskUserAnswerDraft],
-        timedOut: Bool = false
-    ) async {
-        guard let chatId = conversationId ?? conversation?.id,
-              let apiClient = manager?.apiClient else { return }
-        isResolvingAskUser = true
-        defer { isResolvingAskUser = false }
-        let payload: [String: Any] = answers.mapValues { $0.toServerPayload() }
-        do {
-            _ = try await apiClient.resolveToolCall(
-                chatId: chatId, messageId: messageId, callId: callId,
-                action: "answer",
-                answers: timedOut ? nil : payload,
-                timedOut: timedOut
-            )
-        } catch {
-            logger.error("[HITL] answerAskUser failed: \(error.localizedDescription)")
-            await reloadConversation()
+    /// Stores a live `request:user_input` prompt with its socket ack callback.
+    /// Malformed or concurrent requests are declined immediately so the tool doesn't hang.
+    private func receiveAskUser(_ payload: [String: Any]?, messageId: String, reply: ((Any?) -> Void)?) {
+        guard let reply else { return }
+        guard liveAskUserPrompt == nil, let payload,
+              var prompt = PendingAskUserPrompt.fromArguments(payload, messageId: messageId) else {
+            reply(["status": "cancelled", "answers": [:]] as [String: Any])
+            return
         }
-        liveAskUserPrompt = nil
+        prompt.reply = reply
+        askUserError = nil
+        liveAskUserPrompt = prompt
         pendingAskUserPrompt = nil
     }
 
-    /// Rejects/cancels the currently pending ask_user call.
-    func rejectAskUser(messageId: String, callId: String) async {
-        guard let chatId = conversationId ?? conversation?.id,
+    /// Cancels an outstanding live ask_user prompt (stream ended / chat closed).
+    private func cancelLiveAskUser() {
+        let reply = liveAskUserPrompt?.reply
+        liveAskUserPrompt = nil
+        reply?(["status": "cancelled", "answers": [:]] as [String: Any])
+    }
+
+    /// Answers (or cancels, when `answers` is nil) an ask_user prompt.
+    /// Live requests reply through their socket acknowledgment; saved calls use REST.
+    /// A failed saved response leaves the same card (and its answer draft) intact for retry.
+    func resolveAskUser(_ prompt: PendingAskUserPrompt, answers: [String: AskUserAnswerDraft]? = nil) async {
+        guard !isResolvingAskUser,
+              (liveAskUserPrompt ?? pendingAskUserPrompt)?.id == prompt.id else { return }
+        let payload = answers?.mapValues { $0.toServerPayload() }
+        askUserError = nil
+        if let reply = prompt.reply {
+            if let callId = liveAskUserPrompt?.callId, !callId.isEmpty {
+                resolvedAskUserCallIds.insert(callId)
+            }
+            liveAskUserPrompt = nil
+            pendingAskUserPrompt = nil
+            reply(["status": answers == nil ? "cancelled" : "answered", "answers": payload ?? [:]] as [String: Any])
+            return
+        }
+        guard !prompt.callId.isEmpty, let chatId = conversationId ?? conversation?.id,
               let apiClient = manager?.apiClient else { return }
         isResolvingAskUser = true
         defer { isResolvingAskUser = false }
         do {
             _ = try await apiClient.resolveToolCall(
-                chatId: chatId, messageId: messageId, callId: callId, action: "reject"
+                chatId: chatId, messageId: prompt.messageId, callId: prompt.callId,
+                action: answers == nil ? "reject" : "answer", answers: payload
             )
+            resolvedAskUserCallIds.insert(prompt.callId)
+            if pendingAskUserPrompt?.id == prompt.id { pendingAskUserPrompt = nil }
         } catch {
-            logger.error("[HITL] rejectAskUser failed: \(error.localizedDescription)")
+            logger.error("[HITL] resolveAskUser failed: \(error.localizedDescription)")
+            if pendingAskUserPrompt?.id == prompt.id {
+                askUserError = "Could not send your response. Please try again."
+            }
         }
-        liveAskUserPrompt = nil
-        pendingAskUserPrompt = nil
-        await reloadConversation()
     }
 
     /// Switches tool approval mode and persists the preference.

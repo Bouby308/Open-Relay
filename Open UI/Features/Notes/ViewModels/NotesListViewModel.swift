@@ -14,6 +14,10 @@ final class NotesListViewModel {
     var searchText: String = ""
     var isLoading: Bool = false
     var errorMessage: String?
+    /// Pin failures are shown in an alert, separate from the inline search error.
+    var pinErrorMessage: String?
+    /// Notes with a pin request in flight (duplicate toggles are disabled).
+    private(set) var pinningNoteIDs: Set<String> = []
 
     /// Whether the notes feature is enabled on the server.
     var isFeatureEnabled: Bool = true
@@ -26,21 +30,24 @@ final class NotesListViewModel {
     private var manager: NotesManager?
     private let logger = Logger(subsystem: "com.openui", category: "NotesListVM")
 
-    /// Cached search results (updated asynchronously by `performSearch`).
-    private var searchResults: [Note]?
+    /// Accumulated server search results across loaded pages.
+    private var searchResults: [Note] = []
+    /// True while a search page request is in flight.
+    var isSearching = false
+    /// True when the server reports more matches than are loaded.
+    var hasMoreSearchResults = false
+    private var searchPage = 0
+    /// Changes on every new query so stale/cancelled responses are ignored.
+    private var searchGeneration = UUID()
 
     /// Task for debounced search.
     private var searchTask: Task<Void, Never>?
 
     // MARK: - Computed
 
-    /// Notes filtered by search text.
+    /// Notes filtered by search text (server results while searching).
     var filteredNotes: [Note] {
-        if searchText.isEmpty { return notes }
-        return searchResults ?? notes.filter {
-            $0.title.localizedCaseInsensitiveContains(searchText) ||
-            $0.content.localizedCaseInsensitiveContains(searchText)
-        }
+        searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? notes : searchResults
     }
 
     /// Pinned notes.
@@ -108,6 +115,7 @@ final class NotesListViewModel {
         notes = await manager.fetchNotes()
         isFeatureEnabled = manager.isServerEnabled
         isLoading = false
+        if !searchText.isEmpty { triggerSearch() }
     }
 
     /// Refreshes the notes list from the server.
@@ -115,6 +123,7 @@ final class NotesListViewModel {
         guard let manager else { return }
         notes = await manager.fetchNotes()
         isFeatureEnabled = manager.isServerEnabled
+        if !searchText.isEmpty { triggerSearch() }
     }
 
     /// Creates a new note on the server and returns it.
@@ -143,29 +152,74 @@ final class NotesListViewModel {
 
     /// Triggers a debounced server-side search. Call from onChange of searchText.
     func triggerSearch() {
-        searchTask?.cancel()
-        guard searchText.count >= 2 else {
-            searchResults = nil
-            return
-        }
+        clearSearch()
+        let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty else { return }
+        let generation = searchGeneration
+        isSearching = true
         searchTask = Task {
             try? await Task.sleep(for: .milliseconds(300))
-            guard !Task.isCancelled, let manager else { return }
-            let results = await manager.searchNotes(query: searchText)
-            guard !Task.isCancelled else { return }
-            searchResults = results
+            guard !Task.isCancelled, searchGeneration == generation else { return }
+            await fetchSearchPage(query: query, page: 1, generation: generation)
         }
     }
 
-    /// Clears search results when search text is cleared.
+    /// Resets search state and cancels any in-flight search.
     func clearSearch() {
-        searchResults = nil
         searchTask?.cancel()
+        searchGeneration = UUID()
+        searchResults = []
+        searchPage = 0
+        isSearching = false
+        hasMoreSearchResults = false
+        errorMessage = nil
     }
 
-    /// Toggles a note's pinned state (local-only).
-    func togglePin(_ note: Note) {
-        manager?.togglePin(id: note.id)
-        notes = manager?.fetchLocalNotes() ?? []
+    /// Loads the next page of server search results.
+    func loadMoreSearchResults() async {
+        guard hasMoreSearchResults, !isSearching else { return }
+        await retrySearch()
+    }
+
+    /// Retries (or continues) the search from the next unloaded page.
+    func retrySearch() async {
+        let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty, !isSearching else { return }
+        isSearching = true
+        await fetchSearchPage(query: query, page: searchPage + 1, generation: searchGeneration)
+    }
+
+    private func fetchSearchPage(query: String, page: Int, generation: UUID) async {
+        guard let manager else { isSearching = false; return }
+        errorMessage = nil
+        defer { if searchGeneration == generation { isSearching = false } }
+        do {
+            let result = try await manager.searchNotes(query: query, page: page)
+            guard !Task.isCancelled, searchGeneration == generation else { return }
+            let existing = Set(searchResults.map(\.id))
+            searchResults += result.notes.filter { !existing.contains($0.id) }
+            searchPage = page
+            hasMoreSearchResults = !result.notes.isEmpty && searchResults.count < result.total
+        } catch {
+            guard !Task.isCancelled, searchGeneration == generation else { return }
+            logger.error("Notes search failed: \(error.localizedDescription)")
+            errorMessage = "Couldn't search notes. Try again."
+        }
+    }
+
+    /// Toggles a note's pin via the server (local-only notes toggle locally) and
+    /// applies the confirmed state to the list and any loaded search results.
+    /// Single attempt: a toggle is not idempotent, so failures are never retried.
+    func togglePin(_ note: Note) async {
+        guard let manager, pinningNoteIDs.insert(note.id).inserted else { return }
+        defer { pinningNoteIDs.remove(note.id) }
+        do {
+            let pinned = try await manager.togglePin(note)
+            if let index = notes.firstIndex(where: { $0.id == note.id }) { notes[index].isPinned = pinned }
+            if let index = searchResults.firstIndex(where: { $0.id == note.id }) { searchResults[index].isPinned = pinned }
+        } catch {
+            logger.error("Note pin toggle failed: \(error.localizedDescription)")
+            pinErrorMessage = "Could not update the pin. Refresh Notes before retrying. \(error.localizedDescription)"
+        }
     }
 }

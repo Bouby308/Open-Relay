@@ -148,57 +148,50 @@ struct ChannelReplyPreview: View {
             onTap?()
             Haptics.play(.light)
         } label: {
-            HStack(alignment: .center, spacing: 6) {
-                // Small avatar
-                if let url = avatarURL {
-                    UserAvatar(
-                        size: 18,
-                        imageURL: url,
-                        name: senderName,
-                        authToken: authToken
-                    )
-                } else {
-                    // Fallback: initials circle
-                    Circle()
-                        .fill(accentColor.opacity(0.25))
-                        .frame(width: 18, height: 18)
-                        .overlay(
-                            Text(String(senderName.prefix(1)).uppercased())
-                                .font(.system(size: 9, weight: .bold))
-                                .foregroundStyle(accentColor)
-                        )
+            HStack(alignment: .center, spacing: 8) {
+                Capsule()
+                    .fill(accentColor)
+                    .frame(width: 3)
+                    .padding(.vertical, 2)
+                Group {
+                    if let url = avatarURL {
+                        UserAvatar(size: 18, imageURL: url, name: senderName, authToken: authToken)
+                    } else {
+                        Circle()
+                            .fill(accentColor.opacity(0.22))
+                            .frame(width: 18, height: 18)
+                            .overlay(
+                                Text(String(senderName.prefix(1)).uppercased())
+                                    .font(.system(size: 9, weight: .bold))
+                                    .foregroundStyle(accentColor)
+                            )
+                    }
                 }
-
-                // Single-line: "SenderName  preview text…"
-                // Name is bold, preview is regular italic — same as Open WebUI
-                (Text(senderName)
-                    .font(.system(size: 12, weight: .semibold))
-                    .foregroundColor(accentColor)
-                + Text(previewText.isEmpty ? "" : "  ")
-                + Text(previewText)
-                    .font(.system(size: 12, weight: .regular).italic())
-                    .foregroundColor(theme.textSecondary.opacity(0.85))
-                )
-                .lineLimit(1)
-                .truncationMode(.tail)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(senderName)
+                        .scaledFont(size: 12, weight: .semibold)
+                        .foregroundStyle(accentColor)
+                        .lineLimit(1)
+                    if !previewText.isEmpty {
+                        Text(previewText)
+                            .scaledFont(size: 12)
+                            .foregroundStyle(theme.textSecondary)
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+                    }
+                }
+                Spacer(minLength: 0)
             }
-            .padding(.horizontal, 8)
-            .padding(.vertical, 5)
-            .background(
-                // Subtle tinted background matching Open WebUI's reply quote style
-                RoundedRectangle(cornerRadius: 8, style: .continuous)
-                    .fill(accentColor.opacity(0.08))
-                    .overlay(
-                        // Left edge accent bar — thin, like web
-                        HStack {
-                            RoundedRectangle(cornerRadius: 1, style: .continuous)
-                                .fill(accentColor)
-                                .frame(width: 2)
-                            Spacer()
-                        }
-                        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-                    )
-            )
+            .fixedSize(horizontal: false, vertical: true)
+            .padding(.leading, 6)
+            .padding(.trailing, 10)
+            .padding(.vertical, 6)
+            .background(accentColor.opacity(theme.isDark ? 0.12 : 0.08),
+                        in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+            .contentShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel("Reply to \(senderName): \(previewText)")
+            .accessibilityHint(onTap == nil ? "" : "Jumps to the original message")
         }
         .buttonStyle(.plain)
     }

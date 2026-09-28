@@ -306,29 +306,27 @@ final class OllamaModelManagerViewModel {
         ggufUploadStatus = "Reading file…"
         ggufUploadError = nil
 
+        let urlIdx = urlIndex
         ggufUploadTask = Task { [weak self] in
-            guard let self else { return }
             do {
-                let digest = try await api.uploadOllamaBlob(fileURL: url, urlIdx: self.urlIndex) { fraction in
+                let digest = try await api.uploadOllamaBlob(fileURL: url, urlIdx: urlIdx) { fraction in
                     Task { @MainActor [weak self] in
                         guard let self else { return }
                         self.ggufUploadProgress = fraction * 100.0
                         self.ggufUploadStatus = fraction >= 1.0 ? "Done" : "Uploading…"
                     }
                 }
-                if !Task.isCancelled {
-                    self.ggufUploadStatus = "Uploaded (sha256:\(String(digest.prefix(16)))…)"
-                    self.ggufUploadProgress = 100
-                    try? await Task.sleep(nanoseconds: 1_500_000_000)
-                    self.isUploadingGGUF = false
-                    self.ggufUploadProgress = nil
-                    self.ggufUploadStatus = ""
-                }
+                guard let self, !Task.isCancelled else { return }
+                self.ggufUploadStatus = "Uploaded (sha256:\(String(digest.prefix(16)))…)"
+                self.ggufUploadProgress = 100
+                try? await Task.sleep(nanoseconds: 1_500_000_000)
+                self.isUploadingGGUF = false
+                self.ggufUploadProgress = nil
+                self.ggufUploadStatus = ""
             } catch {
-                if !Task.isCancelled {
-                    self.ggufUploadError = error.localizedDescription
-                    self.isUploadingGGUF = false
-                }
+                guard let self, !Task.isCancelled else { return }
+                self.ggufUploadError = error.localizedDescription
+                self.isUploadingGGUF = false
             }
         }
     }

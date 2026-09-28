@@ -1,5 +1,5 @@
 {
-  "originHash" : "920dcfc180720d003e1ca8b9297711c8129b7be46fa4ab6be034c3952173cb1b",
+  "originHash" : "2d89272755e20436ab651021323d01c8e7bd6ca62041e88e7655ee006afe3092",
   "pins" : [
     {
       "identity" : "beautiful-mermaid-swift",
@@ -89,15 +89,6 @@
       "state" : {
         "revision" : "bd4b7434e6bdb588c7ef55706ff8904cb7fd4c57",
         "version" : "3.31.4"
-      }
-    },
-    {
-      "identity" : "reactioncontextmenu",
-      "kind" : "remoteSourceControl",
-      "location" : "https://github.com/Ichigo3766/ReactionContextMenu",
-      "state" : {
-        "branch" : "main",
-        "revision" : "bb8cb726c8647fad17d3e09a6327a487a2630a61"
       }
     },
     {

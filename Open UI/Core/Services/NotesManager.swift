@@ -108,20 +108,26 @@ final class NotesManager: @unchecked Sendable {
     ///
     /// Matches the Flutter `NoteUpdater.updateNote()` which posts to
     /// `/api/v1/notes/{id}/update`.
-    func updateNote(_ note: Note) async {
+    /// Only an explicit body edit replaces the server's rich content — the server
+    /// replaces `data.content` wholesale, so renames and local attachment bookkeeping
+    /// must not send it (that would discard the note's JSON/HTML representation).
+    @discardableResult
+    func updateNote(_ note: Note, contentChanged: Bool = false) async -> Bool {
         // Always update local cache first
         updateLocalNote(note)
 
-        guard let apiClient, isServerEnabled else { return }
+        guard let apiClient, isServerEnabled else { return true }
 
         do {
             _ = try await apiClient.updateNote(
                 id: note.id,
                 title: note.title,
-                markdownContent: note.content
+                markdownContent: contentChanged ? note.content : nil
             )
+            return true
         } catch {
             logger.warning("Failed to update note on server: \(error.localizedDescription)")
+            return false
         }
     }
 
@@ -173,7 +179,7 @@ final class NotesManager: @unchecked Sendable {
     /// Creates a note locally (fallback when server unavailable).
     @discardableResult
     private func createLocalNote(title: String, content: String) -> Note {
-        let note = Note(title: title, content: content)
+        let note = Note(title: title, content: content, isLocalOnly: true)
         var notes = fetchLocalNotes()
         notes.insert(note, at: 0)
         saveLocalNotes(notes)
@@ -200,37 +206,39 @@ final class NotesManager: @unchecked Sendable {
 
     // MARK: - Search
 
-    /// Searches notes — uses server-side search when available for comprehensive results,
-    /// falls back to local cache filtering when offline.
-    func searchNotes(query: String) async -> [Note] {
-        // Try server-side search first (covers all notes, not just cached)
+    /// Searches the server when available (paginated). An authoritative empty server
+    /// page is never replaced with cached matches. Local-only notes search locally.
+    func searchNotes(query: String, page: Int = 1) async throws -> (notes: [Note], total: Int) {
         if let apiClient, isServerEnabled {
-            do {
-                let results = try await apiClient.searchNotes(query: query)
-                let notes = results.compactMap { Note.fromServerJSON($0) }
-                if !notes.isEmpty { return notes }
-            } catch {
-                logger.debug("Server notes search failed, falling back to local: \(error.localizedDescription)")
-            }
+            let results = try await apiClient.searchNotes(query: query, page: page)
+            return (results.items.compactMap { Note.fromServerJSON($0) }, results.total)
         }
-
-        // Fallback to local cache search
         let lowered = query.lowercased()
-        return fetchLocalNotes().filter {
+        let matches = fetchLocalNotes().filter {
             $0.title.lowercased().contains(lowered) ||
             $0.content.lowercased().contains(lowered) ||
             $0.tags.contains { $0.lowercased().contains(lowered) }
         }
+        return (page == 1 ? matches : [], matches.count)
     }
 
-    /// Pins or unpins a note (local-only; OpenWebUI does not have pin for notes).
-    func togglePin(id: String) {
+    /// Pins or unpins a note using the server's authoritative result.
+    /// Local-only notes toggle locally; a failed remote pin is never silently
+    /// turned into a local one.
+    func togglePin(_ note: Note) async throws -> Bool {
+        let pinned: Bool
+        if note.isLocalOnly {
+            pinned = !note.isPinned
+        } else {
+            guard let apiClient, isServerEnabled else { throw NotesError.pinUnavailable }
+            pinned = try await apiClient.toggleNotePin(id: note.id)
+        }
         var notes = fetchLocalNotes()
-        if let index = notes.firstIndex(where: { $0.id == id }) {
-            notes[index].isPinned.toggle()
-            notes[index].updatedAt = .now
+        if let index = notes.firstIndex(where: { $0.id == note.id }) {
+            notes[index].isPinned = pinned
             saveLocalNotes(notes)
         }
+        return pinned
     }
 
     // MARK: - File Operations
@@ -259,6 +267,8 @@ final class NotesManager: @unchecked Sendable {
 enum NotesError: LocalizedError {
     case serverUnavailable
     case noteNotFound
+    case invalidPinResponse
+    case pinUnavailable
 
     var errorDescription: String? {
         switch self {
@@ -266,6 +276,10 @@ enum NotesError: LocalizedError {
             return "Server is not available. Notes are saved locally."
         case .noteNotFound:
             return "Note not found."
+        case .invalidPinResponse:
+            return "The server did not return the note's pinned state. Refresh Notes before trying again."
+        case .pinUnavailable:
+            return "The server is unavailable. The note's pin has not been changed."
         }
     }
 }

@@ -137,7 +137,7 @@ final class ChannelListViewModel {
         
         isLoadingUsers = true
         do {
-            allServerUsers = try await apiClient.searchUsers()
+            allServerUsers = try await apiClient.searchAllUsers()
             usersLoadedAt = Date()
             logger.info("Loaded \(self.allServerUsers.count) server users for pickers")
         } catch {
@@ -164,7 +164,7 @@ final class ChannelListViewModel {
             for idx in dmChannelIndices {
                 let channelId = channels[idx].id
                 group.addTask {
-                    let members = (try? await apiClient.getChannelMembers(id: channelId)) ?? []
+                    let members = (try? await apiClient.getAllChannelMembers(id: channelId)) ?? []
                     return (channelId, members)
                 }
             }
@@ -372,9 +372,14 @@ final class ChannelListViewModel {
                 if let idx = channels.firstIndex(where: { $0.id == channelId }) {
                     channels[idx].updatedAt = .now
                     
-                    // Only increment unread when the user is NOT actively viewing this channel.
-                    // If they have the channel open, the read state is handled by ChannelViewModel.markAsRead().
-                    if activeChannelId != channelId {
+                    // Only increment unread when the user is NOT actively viewing this channel,
+                    // the message isn't ours, and it's a top-level message (thread replies don't
+                    // count toward the channel badge — matches the server's unread_count).
+                    let payload = (data["data"] as? [String: Any]) ?? data
+                    let senderId = payload["user_id"] as? String ?? (payload["user"] as? [String: Any])?["id"] as? String
+                    let isThreadReply = !((payload["parent_id"] as? String) ?? "").isEmpty
+                    let isOwn = senderId != nil && senderId == currentUserId
+                    if activeChannelId != channelId && !isOwn && !isThreadReply {
                         channels[idx].unreadCount += 1
 
                         // Fire a local push notification for the new message.

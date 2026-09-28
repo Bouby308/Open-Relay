@@ -10,7 +10,7 @@ struct SidebarOpeningGesture: UIGestureRecognizerRepresentable {
     func makeCoordinator(converter: CoordinateSpaceConverter) -> Coordinator { Coordinator() }
 
     func makeUIGestureRecognizer(context: Context) -> UIPanGestureRecognizer {
-        let pan = UIPanGestureRecognizer()
+        let pan = SidebarPanRecognizer()
         pan.maximumNumberOfTouches = 1
         // Once the pan is recognised, the touched view receives touchesCancelled,
         // so raw-touch views (e.g. selectable message text) stop reacting.
@@ -49,6 +49,8 @@ struct SidebarOpeningGesture: UIGestureRecognizerRepresentable {
         }
 
         func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
+            // A swipe that started on a message belongs to that message (swipe-to-reply).
+            if MessageGestureArbiter.isTouchOnMessage { return false }
             guard let pan = gestureRecognizer as? UIPanGestureRecognizer,
                   allowsOpening(from: touchedView) else { return false }
             // Translation is still zero at UIKit's begin decision; velocity is available.
@@ -56,10 +58,17 @@ struct SidebarOpeningGesture: UIGestureRecognizerRepresentable {
             return velocity.x > abs(velocity.y) * 1.5
         }
 
-        // The chat's simultaneous drag observer must not cancel an accepted pan.
+        // The chat's simultaneous drag observer must not cancel an accepted pan —
+        // but a message's reply swipe is exclusive: never run both together.
         func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer,
                                shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer) -> Bool {
-            true
+            !(otherGestureRecognizer is MessagePanRecognizer)
+        }
+
+        // If a message reply swipe is in play, the sidebar waits for it to fail.
+        func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer,
+                               shouldRequireFailureOf otherGestureRecognizer: UIGestureRecognizer) -> Bool {
+            otherGestureRecognizer is MessagePanRecognizer
         }
 
         /// Cancels every other gesture between the touched view and the pan's
@@ -97,3 +106,6 @@ struct SidebarOpeningGesture: UIGestureRecognizerRepresentable {
         }
     }
 }
+
+/// Named subclass so message gestures can identify (and exclude) the sidebar pan.
+final class SidebarPanRecognizer: UIPanGestureRecognizer {}

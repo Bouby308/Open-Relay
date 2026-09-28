@@ -119,8 +119,12 @@ final class TurnController {
         isSpeaking = false
         if isBusy || speaksOnPhone {
             Task {
-                let envelope = try WatchEnvelope.make(.cancelTurn, payload: WatchTurnRequest(turnId: id))
-                _ = try? await WatchLink.shared.sendWithRetry(envelope, attempts: 1)
+                do {
+                    let envelope = try WatchEnvelope.make(.cancelTurn, payload: WatchTurnRequest(turnId: id))
+                    _ = try? await WatchLink.shared.sendWithRetry(envelope, attempts: 1)
+                } catch {
+                    // Best effort: the phone also times out an abandoned turn.
+                }
             }
         }
         if isBusy { phase = reply.isEmpty ? .idle : .done }

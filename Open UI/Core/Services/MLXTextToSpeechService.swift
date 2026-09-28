@@ -531,7 +531,7 @@ final class OnDeviceTTSService {
         let pieces = sentences.isEmpty ? [text] : sentences
 
         // Detect language once from the full text so all sentences share the same accent.
-        let resolvedLanguage: String? = await activeModel == .qwen3
+        let resolvedLanguage: String? = activeModel == .qwen3
             ? (qwen3Language == "auto" ? detectQwen3Language(for: text) : qwen3Language)
             : nil
 
@@ -681,7 +681,7 @@ final class OnDeviceTTSService {
             // Resolve language on the first real sentence and reuse it for the whole response
             if resolvedLanguage == nil {
                 if activeModel == .qwen3 {
-                    resolvedLanguage = await qwen3Language == "auto"
+                    resolvedLanguage = qwen3Language == "auto"
                         ? detectQwen3Language(for: sentence)
                         : qwen3Language
                 } else {
@@ -926,9 +926,10 @@ final class OnDeviceTTSService {
 /// Returns `nil` if the detected language is English, unsupported, or detection
 /// confidence is too low — in those cases the caller should pass `nil` to Qwen3
 /// so the model uses its built-in "auto" logic.
-private let detectLogger = Logger(subsystem: "com.openui", category: "OnDeviceTTS")
+nonisolated private let detectLogger = Logger(subsystem: "com.openui", category: "OnDeviceTTS")
 
-private func detectQwen3Language(for text: String) -> String? {
+/// Pure helper — safe to call from the detached voice-call synthesis task.
+nonisolated private func detectQwen3Language(for text: String) -> String? {
     let recognizer = NLLanguageRecognizer()
     recognizer.processString(text)
 

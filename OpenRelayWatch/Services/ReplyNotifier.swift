@@ -1,5 +1,5 @@
 import Foundation
-import UserNotifications
+@preconcurrency import UserNotifications
 import WatchKit
 
 /// The watch's own notifications: "Reply ready" when you lowered your wrist
@@ -9,9 +9,9 @@ final class ReplyNotifier: NSObject, UNUserNotificationCenterDelegate {
 
     static let shared = ReplyNotifier()
 
-    static let category = "watch.replyReady"
-    static let replyAction = "watch.reply"
-    static let openAction = "watch.open"
+    nonisolated static let category = "watch.replyReady"
+    nonisolated static let replyAction = "watch.reply"
+    nonisolated static let openAction = "watch.open"
 
     /// Set by the app to open a chat (notification tap / Open).
     var onOpenChat: ((String, String) -> Void)?
@@ -29,10 +29,11 @@ final class ReplyNotifier: NSObject, UNUserNotificationCenterDelegate {
 
     /// Asks once, the first time Talk is used.
     static func requestPermissionIfNeeded() {
-        let center = UNUserNotificationCenter.current()
-        center.getNotificationSettings { settings in
+        Task {
+            let center = UNUserNotificationCenter.current()
+            let settings = await center.notificationSettings()
             guard settings.authorizationStatus == .notDetermined else { return }
-            center.requestAuthorization(options: [.alert, .sound]) { _, _ in }
+            _ = try? await center.requestAuthorization(options: [.alert, .sound])
         }
     }
 

@@ -219,6 +219,8 @@ final class ActiveChatStore {
 
     /// Removes all cached view models and model cache (e.g. on server switch or logout).
     func clear() {
+        // Account/server change: web search consent must not carry over.
+        viewModels.values.forEach { $0.webSearchConsent.reset() }
         viewModels.removeAll()
         accessOrder.removeAll()
         cachedModels = []

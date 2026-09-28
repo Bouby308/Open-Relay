@@ -236,7 +236,7 @@ nonisolated struct ChatMessageFile: Codable, Hashable, Sendable {
     }
 }
 
-extension ChatMessageFile {
+nonisolated extension ChatMessageFile {
     init(serverDictionary value: [String: Any]) {
         let meta = value["meta"] as? [String: Any]
             ?? (value["file"] as? [String: Any])?["meta"] as? [String: Any]
@@ -358,19 +358,16 @@ nonisolated struct ChatMessage: Identifiable, Hashable, Sendable {
         self.subagentDelegationId = subagentDelegationId
     }
 
-    /// O(1) equality check — uses `content.utf8.count` instead of full string
-    /// comparison. During streaming, content only grows so byte count is always
-    /// unique. For completed messages, content is stable. This avoids O(n)
-    /// character-by-character comparison on potentially huge AI responses during
-    /// every SwiftUI diff cycle (~7x/sec during streaming).
+    /// Filters can replace completed text without changing its byte count.
     static func == (lhs: ChatMessage, rhs: ChatMessage) -> Bool {
         lhs.id == rhs.id
-            && lhs.content.utf8.count == rhs.content.utf8.count
+            && lhs.content == rhs.content
             && lhs.isStreaming == rhs.isStreaming
             && lhs.statusHistory.count == rhs.statusHistory.count
             && lhs.sources.count == rhs.sources.count
             && lhs.followUps.count == rhs.followUps.count
             && lhs.files.count == rhs.files.count
+            && lhs.embeds == rhs.embeds
             && lhs.error?.content == rhs.error?.content
             && lhs.versions.count == rhs.versions.count
             && (lhs.usage == nil) == (rhs.usage == nil)
@@ -392,7 +389,7 @@ extension ChatMessage: Codable {
     enum CodingKeys: String, CodingKey {
         case id, role, content, timestamp, model, isStreaming
         case attachmentIds, files, sources, statusHistory, followUps
-        case metadata, error, versions, usage
+        case metadata, error, versions, usage, embeds
     }
 
     init(from decoder: Decoder) throws {
@@ -417,8 +414,7 @@ extension ChatMessage: Codable {
         } else {
             usage = nil
         }
-        // embeds are not persisted — they come from the server JSON on each load.
-        embeds = []
+        embeds = (try? c.decode([String].self, forKey: .embeds)) ?? []
         // These fields are runtime-only / not persisted via Codable.
         parentId = nil
         annotation = nil
@@ -443,6 +439,7 @@ extension ChatMessage: Codable {
         try c.encodeIfPresent(metadata, forKey: .metadata)
         try c.encodeIfPresent(error, forKey: .error)
         try c.encode(versions, forKey: .versions)
+        try c.encode(embeds, forKey: .embeds)
         if let usage {
             try c.encode(AnyCodableMap(usage), forKey: .usage)
         }

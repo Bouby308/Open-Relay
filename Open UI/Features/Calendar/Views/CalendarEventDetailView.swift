@@ -7,6 +7,9 @@ struct CalendarEventDetailView: View {
     @Environment(\.theme) private var theme
 
     @State private var showDeleteConfirm = false
+    @State private var editingEvent: CalendarEvent?
+    @State private var isLoadingEdit = false
+    @State private var editError: String?
 
     // MARK: - Cached Formatters
 
@@ -49,6 +52,7 @@ struct CalendarEventDetailView: View {
     private var reminderLabel: String {
         guard let mins = event.meta?.alertMinutes else { return "" }
         switch mins {
+        case ..<0: return "None"
         case 0: return "At time of event"
         case 5: return "5 minutes before"
         case 10: return "10 minutes before"
@@ -170,11 +174,30 @@ struct CalendarEventDetailView: View {
             .navigationTitle("Event")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .navigationBarTrailing) {
-                    Button("Done") { dismiss() }
-                        .foregroundStyle(theme.brandPrimary)
+                ToolbarItem(placement: .cancellationAction) {
+                    Button { dismiss() } label: { Image(systemName: "xmark") }
+                        .accessibilityLabel("Close")
+                }
+                if !event.isRunEvent && !event.isAutomationEvent && event.meta?.automationId == nil {
+                    ToolbarItem(placement: .primaryAction) {
+                        Button {
+                            isLoadingEdit = true
+                            Task {
+                                defer { isLoadingEdit = false }
+                                do { editingEvent = try await vm.eventForEditing(event) }
+                                catch { editError = error.localizedDescription }
+                            }
+                        } label: {
+                            if isLoadingEdit { ProgressView() } else { Image(systemName: "pencil") }
+                        }
+                        .accessibilityLabel("Edit Event").disabled(isLoadingEdit)
+                    }
                 }
             }
+            .sheet(item: $editingEvent) { CreateCalendarEventSheet(vm: vm, event: $0).themed() }
+            .alert("Couldn’t open event", isPresented: Binding(get: { editError != nil }, set: { if !$0 { editError = nil } })) {
+                Button("OK", role: .cancel) { editError = nil }
+            } message: { Text(editError ?? "") }
             .confirmationDialog(
                 "Delete \"\(event.title)\"?",
                 isPresented: $showDeleteConfirm,

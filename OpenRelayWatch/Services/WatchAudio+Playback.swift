@@ -12,7 +12,8 @@ extension WatchAudio {
         pendingBuffers += 1
         let gen = generation
         player.scheduleBuffer(pcm, at: nil, options: [], completionCallbackType: .dataPlayedBack) { [weak self] _ in
-            Task { @MainActor in self?.bufferPlayed(generation: gen) }
+            // Rebind weakly inside the main-actor task so no captured var crosses isolation.
+            Task { @MainActor [weak self] in self?.bufferPlayed(generation: gen) }
         }
         if !player.isPlaying { player.play() }
     }

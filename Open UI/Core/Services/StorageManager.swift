@@ -58,11 +58,11 @@ final class StorageManager: @unchecked Sendable {
     /// UserDefaults key controlling whether the ML model cache is excluded from
     /// iCloud / device backups. Defaults to `true` (excluded). Models are
     /// redownloadable so there is no need to back them up.
-    static let excludeModelsFromBackupKey = "storage.excludeMLModelsFromBackup"
+    nonisolated static let excludeModelsFromBackupKey = "storage.excludeMLModelsFromBackup"
 
     /// Whether the user has opted to exclude ML models from iCloud backup.
     /// Reads from UserDefaults; defaults to `true` when unset.
-    static var excludeModelsFromBackup: Bool {
+    nonisolated static var excludeModelsFromBackup: Bool {
         get {
             let ud = UserDefaults.standard
             // Return true if the key hasn't been set yet (first launch)
@@ -82,7 +82,7 @@ final class StorageManager: @unchecked Sendable {
     /// The Apple docs note that some file operations can reset this flag, so
     /// this is called both at directory creation time and whenever the user
     /// changes their preference.
-    static func applyBackupExclusion(enabled: Bool) {
+    nonisolated static func applyBackupExclusion(enabled: Bool) {
         let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
         var dir = docs.appendingPathComponent("Models", isDirectory: true)
         guard FileManager.default.fileExists(atPath: dir.path) else { return }
@@ -98,7 +98,9 @@ final class StorageManager: @unchecked Sendable {
     ///
     /// Also re-applies the backup-exclusion flag each time it is called,
     /// since some file operations can reset it (per Apple docs).
-    static var modelCacheDirectory: URL {
+    /// Nonisolated: only uses FileManager/UserDefaults, so model loaders on any
+    /// thread (e.g. `VADModelStore.baseDirectory`) can read it.
+    nonisolated static var modelCacheDirectory: URL {
         let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
         let dir = docs.appendingPathComponent("Models", isDirectory: true)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)

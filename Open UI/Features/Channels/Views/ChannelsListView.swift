@@ -605,37 +605,45 @@ struct CreateChannelSheet: View {
                             .foregroundStyle(theme.textTertiary)
                     }
                 } else {
-                    Section(channelType == .group ? "Group Info" : "Channel Info") {
+                    Section {
                         TextField(channelType == .group ? "Group Name" : "Channel Name", text: $name)
                             .textInputAutocapitalization(.never)
                             .autocorrectionDisabled()
+                            // Web parity (ChannelModal.svelte): spaces → hyphens, lowercase, max 128 chars.
+                            .onChange(of: name) { _, newValue in
+                                let normalized = String(
+                                    newValue.replacingOccurrences(of: " ", with: "-").lowercased().prefix(128)
+                                )
+                                if normalized != newValue { name = normalized }
+                            }
                         TextField("Description (optional)", text: $description)
+                    } header: {
+                        Text(channelType == .group ? "Group Info" : "Channel Info")
+                    } footer: {
+                        if !name.isEmpty {
+                            Label("#\(name)", systemImage: channelType == .group ? "person.3" : (isPrivate ? "lock" : "number"))
+                                .scaledFont(size: 12, weight: .medium)
+                                .foregroundStyle(theme.textSecondary)
+                                .contentTransition(.opacity)
+                        }
                     }
                 }
                 
                 // Type picker — all 3 types
                 if !isEditMode {
-                    Section("Type") {
-                        Picker("Channel Type", selection: $channelType) {
-                            Text("Channel").tag(ChannelType.standard)
-                            Text("Group").tag(ChannelType.group)
-                            Text("Direct Message").tag(ChannelType.dm)
+                    Section {
+                        HStack(spacing: 8) {
+                            ChannelTypeCard(type: .standard, title: "Channel", subtitle: "Topic-based",
+                                            icon: "number", selection: $channelType)
+                            ChannelTypeCard(type: .group, title: "Group", subtitle: "Members only",
+                                            icon: "person.3.fill", selection: $channelType)
+                            ChannelTypeCard(type: .dm, title: "Direct", subtitle: "Private chat",
+                                            icon: "bubble.left.and.bubble.right.fill", selection: $channelType)
                         }
-                        // Type description
-                        switch channelType {
-                        case .standard:
-                            Text("Traditional topic-based channel")
-                                .scaledFont(size: 12)
-                                .foregroundStyle(theme.textTertiary)
-                        case .group:
-                            Text("Membership-based collaboration space")
-                                .scaledFont(size: 12)
-                                .foregroundStyle(theme.textTertiary)
-                        case .dm:
-                            Text("Private conversation between selected users")
-                                .scaledFont(size: 12)
-                                .foregroundStyle(theme.textTertiary)
-                        }
+                        .listRowInsets(EdgeInsets(top: 8, leading: 8, bottom: 8, trailing: 8))
+                        .listRowBackground(Color.clear)
+                    } header: {
+                        Text("Type")
                     }
                 }
                 
@@ -732,7 +740,7 @@ struct CreateChannelSheet: View {
                 hasFetchedUsers = true
                 isLoadingUsers = true
                 do {
-                    fetchedUsers = try await apiClient.searchUsers()
+                    fetchedUsers = try await apiClient.searchAllUsers()
                 } catch {
                     // Fall back to allUsers from parent
                 }

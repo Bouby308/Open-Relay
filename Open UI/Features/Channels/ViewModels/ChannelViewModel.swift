@@ -36,13 +36,20 @@ final class ChannelViewModel {
     var replyToMessage: ChannelMessage?
     var editingMessage: ChannelMessage?
     var editingText: String = ""
-    
+    /// Message awaiting delete confirmation (web: ConfirmDialog "Delete Message").
+    var pendingDeleteMessage: ChannelMessage?
+
     // Thread state — uses separate attachment array (BUG-011 fix)
     var threadParentMessage: ChannelMessage?
     var threadMessages: [ChannelMessage] = []
     var isLoadingThread: Bool = false
-    var threadInputText: String = ""
-    var threadAttachments: [ChatAttachment] = []
+    /// Thread pagination (web Thread.svelte loads older replies in pages of 50).
+    var isLoadingOlderThread = false
+    var allThreadLoaded = false
+var threadInputText: String = ""
+    /// Message being replied to *inside* the open thread (web Thread.svelte `replyToMessage`).
+    var threadReplyToMessage: ChannelMessage?
+var threadAttachments: [ChatAttachment] = []
     
     // @mention state
     var mentionedModelId: String?
@@ -50,7 +57,41 @@ final class ChannelViewModel {
     
     // Typing indicators — users currently typing in this channel
     var typingUsers: [TypingUser] = []
-    
+    /// Users typing inside the currently open thread.
+    var threadTypingUsers: [TypingUser] = []
+
+    // Members sheet (server-paginated, searchable)
+    var memberSearchResults: [ChannelMember] = []
+    var memberTotal: Int = 0
+    var isLoadingMemberPage = false
+    private var memberPage = 1
+    private var memberQuery = ""
+    private var memberSearchTask: Task<Void, Never>?
+    var hasMoreMembers: Bool { memberSearchResults.count < memberTotal }
+
+    // Pinned messages (paginated)
+    var isLoadingPinned = false
+    private var pinnedPage = 1
+    var allPinnedLoaded = false
+
+    // Webhooks (managers only)
+    var webhooks: [ChannelWebhook] = []
+    var isLoadingWebhooks = false
+
+    // `/` prompt shortcuts (web parity: CommandSuggestionList in channel MessageInput)
+    var availablePrompts: [PromptItem] = []
+    var isLoadingPrompts = false
+    var pendingPromptForVariables: PromptItem?
+    var pendingPromptVariables: [PromptVariable] = []
+    /// Which composer the pending prompt should be inserted into.
+    var pendingPromptIsThread = false
+
+    /// Set to scroll the timeline to (and highlight) a specific message, e.g. from pins.
+    var jumpToMessageId: String?
+
+    /// Whether the first page of history reached the start of the channel.
+    var reachedChannelStart: Bool { allMessagesLoaded }
+
     // UI state
     var showMembersSheet: Bool = false
     var showPinnedSheet: Bool = false
@@ -73,7 +114,10 @@ final class ChannelViewModel {
     
     /// Current user ID (from the auth session).
     var currentUserId: String?
-    
+
+    /// Whether the signed-in user is a server admin.
+    var isCurrentUserAdmin: Bool = false
+
     /// Server base URL for image resolution.
     var serverBaseURL: String { apiClient?.baseURL ?? "" }
     
@@ -137,16 +181,39 @@ final class ChannelViewModel {
     }
     
     /// Whether the current user can access channel settings.
+    /// Web parity: admins or the channel owner (ChannelItem.svelte); group managers
+    /// via the server's `is_manager` flag; any DM participant for DM settings.
     var canManageChannel: Bool {
         guard let channel, let userId = currentUserId else { return false }
         if isDM {
-            return members.contains(where: { $0.id == userId })
+            return members.contains(where: { $0.id == userId }) || channel.userIds.contains(userId)
         }
-        if isStandard {
-            let isAdmin = members.first(where: { $0.id == userId })?.role == "admin"
-            return channel.userId == userId || isAdmin
-        }
-        return channel.userId == userId
+        return isCurrentUserAdmin || channel.userId == userId || channel.isManager
+    }
+
+    /// Whether the user can add/remove members of a group channel (web: `is_manager`).
+    var canManageMembers: Bool {
+        guard let channel else { return false }
+        return channel.type == .group && (channel.isManager || isCurrentUserAdmin)
+    }
+
+    /// Web parity: authors and admins may edit/delete a message (server enforces the same).
+    func canModify(_ message: ChannelMessage) -> Bool {
+        guard !message.isOptimistic else { return false }
+        if isCurrentUserAdmin { return true }
+        return message.userId == currentUserId && !isModelMessage(message)
+    }
+
+    /// Members count for the header — prefers the server's `user_count`.
+    var memberCount: Int {
+        channel?.userCount ?? members.count
+    }
+
+    /// When replying to a model's message the backend auto-mentions that model.
+    /// Returns its display name so the composer can say "<Model> will respond".
+    var replyTargetModelName: String? {
+        guard let reply = replyToMessage, isModelMessage(reply) else { return nil }
+        return resolvedSenderName(for: reply)
     }
     
     // MARK: - Private
@@ -162,7 +229,12 @@ final class ChannelViewModel {
     /// R-028: Reaction rate limiting — minimum interval between reaction API calls
     private var lastReactionTime: Date = .distantPast
     private let reactionCooldown: TimeInterval = 0.3
-    
+
+    /// One pending expiry per typing user (key: "c:<uid>" channel, "t:<uid>" thread).
+    private var typingExpiryTasks: [String: Task<Void, Never>] = [:]
+    /// Last typing emit per scope ("" = channel, otherwise thread parent id).
+    private var lastTypingEmit: [String: Date] = [:]
+
     // MARK: - Init
     
     init(channelId: String) {
@@ -171,10 +243,11 @@ final class ChannelViewModel {
     
     // MARK: - Configuration
     
-    func configure(apiClient: APIClient, socket: SocketIOService?, currentUserId: String?) {
+    func configure(apiClient: APIClient, socket: SocketIOService?, currentUserId: String?, isAdmin: Bool = false) {
         self.apiClient = apiClient
         self.socketService = socket
         self.currentUserId = currentUserId
+        self.isCurrentUserAdmin = isAdmin
     }
     
     // MARK: - Loading
@@ -321,7 +394,7 @@ final class ChannelViewModel {
         isLoadingMembers = true
         
         do {
-            members = try await apiClient.getChannelMembers(id: channelId)
+            members = try await apiClient.getAllChannelMembers(id: channelId)
             logger.info("Loaded \(self.members.count) channel members")
         } catch {
             logger.error("Failed to load members: \(error.localizedDescription)")
@@ -339,19 +412,172 @@ final class ChannelViewModel {
         }
     }
     
+    /// Loads the first page of pinned messages (resets pagination).
     func loadPinnedMessages() async {
         guard let apiClient else { return }
+        isLoadingPinned = true
+        pinnedPage = 1
+        allPinnedLoaded = false
         do {
-            pinnedMessages = try await apiClient.getPinnedChannelMessages(channelId: channelId)
+            let page = try await apiClient.getPinnedChannelMessages(channelId: channelId, page: 1)
+            pinnedMessages = page
+            allPinnedLoaded = page.isEmpty
         } catch {
             logger.error("Failed to load pinned messages: \(error.localizedDescription)")
         }
+        isLoadingPinned = false
+    }
+
+    /// Loads the next page of pinned messages (web: infinite scroll in PinnedMessagesModal).
+    func loadMorePinnedMessages() async {
+        guard let apiClient, !allPinnedLoaded, !isLoadingPinned else { return }
+        isLoadingPinned = true
+        let next = pinnedPage + 1
+        do {
+            let page = try await apiClient.getPinnedChannelMessages(channelId: channelId, page: next)
+            let existing = Set(pinnedMessages.map(\.id))
+            let fresh = page.filter { !existing.contains($0.id) }
+            pinnedMessages.append(contentsOf: fresh)
+            pinnedPage = next
+            if fresh.isEmpty { allPinnedLoaded = true }
+        } catch {
+            logger.error("Failed to load more pinned messages: \(error.localizedDescription)")
+        }
+        isLoadingPinned = false
+    }
+
+    /// Unpins a message from the pinned list (message may not be in the loaded timeline).
+    func unpinFromList(_ message: ChannelMessage) async {
+        guard let apiClient else { return }
+        pinnedMessages.removeAll { $0.id == message.id }
+        if let idx = messages.firstIndex(where: { $0.id == message.id }) {
+            messages[idx].isPinned = false
+        }
+        do {
+            _ = try await apiClient.pinChannelMessage(channelId: channelId, messageId: message.id, isPinned: false)
+        } catch {
+            logger.error("Failed to unpin: \(error.localizedDescription)")
+            await loadPinnedMessages()
+        }
+    }
+
+    // MARK: - Members (paginated / searchable)
+
+    /// Resets and loads page 1 of members for the members sheet, optionally filtered.
+    func searchMembers(_ query: String, debounce: Bool = true) {
+        memberSearchTask?.cancel()
+        memberSearchTask = Task { [weak self] in
+            if debounce { try? await Task.sleep(for: .milliseconds(300)) }
+            guard !Task.isCancelled, let self else { return }
+            await self.loadMemberPage(query: query, page: 1)
+        }
+    }
+
+    func loadMoreMembers() async {
+        guard hasMoreMembers, !isLoadingMemberPage else { return }
+        await loadMemberPage(query: memberQuery, page: memberPage + 1)
+    }
+
+    private func loadMemberPage(query: String, page: Int) async {
+        guard let apiClient else { return }
+        isLoadingMemberPage = true
+        do {
+            let result = try await apiClient.getChannelMembersPage(id: channelId, query: query, page: page)
+            guard !Task.isCancelled else { isLoadingMemberPage = false; return }
+            if page == 1 {
+                memberSearchResults = result.members
+            } else {
+                let existing = Set(memberSearchResults.map(\.id))
+                memberSearchResults.append(contentsOf: result.members.filter { !existing.contains($0.id) })
+            }
+            memberTotal = result.total
+            memberPage = page
+            memberQuery = query
+        } catch {
+            logger.error("Failed to load member page: \(error.localizedDescription)")
+        }
+        isLoadingMemberPage = false
+    }
+
+    /// Adds users/groups to a group channel then refreshes channel + members.
+    func addMembers(userIds: [String], groupIds: [String]) async throws {
+        guard let apiClient else { return }
+        try await apiClient.addChannelMembers(id: channelId, userIds: userIds, groupIds: groupIds)
+        await loadChannel()
+        await loadMembers()
+        await loadMemberPage(query: memberQuery, page: 1)
+    }
+
+    /// Removes a member from a group channel (managers only).
+    func removeMember(userId: String) async throws {
+        guard let apiClient, userId != currentUserId else { return }
+        try await apiClient.removeChannelMembers(id: channelId, userIds: [userId])
+        memberSearchResults.removeAll { $0.id == userId }
+        memberTotal = max(0, memberTotal - 1)
+        members.removeAll { $0.id == userId }
+        await loadChannel()
+    }
+
+    /// Fetches the full profile (status, bio, groups) for the profile card.
+    func loadUserProfile(userId: String) async -> ChannelMember? {
+        guard let apiClient else { return nil }
+        return try? await apiClient.getUserInfo(userId: userId)
+    }
+
+    /// Opens (or creates) the DM with a user — returns the DM channel id.
+    func directMessageChannelId(with userId: String) async -> String? {
+        guard let apiClient else { return nil }
+        return (try? await apiClient.getDMChannel(userId: userId))?.id
+    }
+
+    // MARK: - Webhooks
+
+    func loadWebhooks() async {
+        guard let apiClient else { return }
+        isLoadingWebhooks = true
+        do {
+            webhooks = try await apiClient.listChannelWebhooks(channelId: channelId)
+        } catch {
+            logger.error("Failed to load webhooks: \(error.localizedDescription)")
+            webhooks = []
+        }
+        isLoadingWebhooks = false
+    }
+
+    func createWebhook(name: String = "New Webhook") async throws -> ChannelWebhook? {
+        guard let apiClient else { return nil }
+        let created = try await apiClient.createChannelWebhook(channelId: channelId, name: name)
+        if let created { webhooks.append(created) }
+        return created
+    }
+
+    func updateWebhook(_ webhook: ChannelWebhook, name: String, profileImageURL: String?) async throws {
+        guard let apiClient else { return }
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let updated = try await apiClient.updateChannelWebhook(
+            channelId: channelId, webhookId: webhook.id,
+            name: trimmed.isEmpty ? webhook.name : trimmed,
+            profileImageURL: profileImageURL
+        )
+        if let updated, let idx = webhooks.firstIndex(where: { $0.id == webhook.id }) {
+            webhooks[idx] = updated
+        }
+    }
+
+    func deleteWebhook(_ webhook: ChannelWebhook) async throws {
+        guard let apiClient else { return }
+        try await apiClient.deleteChannelWebhook(channelId: channelId, webhookId: webhook.id)
+        webhooks.removeAll { $0.id == webhook.id }
+    }
+
+    func webhookURL(_ webhook: ChannelWebhook) -> String {
+        apiClient?.channelWebhookURL(webhook) ?? ""
     }
     
     func loadAllServerUsers() async {
         guard let apiClient else { return }
         do {
-            allServerUsers = try await apiClient.searchUsers()
+            allServerUsers = try await apiClient.searchAllUsers()
             logger.info("Loaded \(self.allServerUsers.count) server users for access picker")
         } catch {
             logger.warning("Failed to load all server users: \(error.localizedDescription)")
@@ -368,6 +594,56 @@ final class ChannelViewModel {
         }
     }
     
+    /// Server results for the current `@` query (web MentionList: members + /users/search).
+    var mentionSearchResults: [ChannelMember] = []
+    private var mentionSearchTask: Task<Void, Never>?
+
+    /// Debounced server search while typing after `@` — finds users beyond any loaded page.
+    func searchMentions(_ query: String) {
+        mentionSearchTask?.cancel()
+        guard let apiClient else { return }
+        let channelId = self.channelId
+        mentionSearchTask = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(180))
+            guard !Task.isCancelled else { return }
+            async let membersPage = try? apiClient.getChannelMembersPage(id: channelId, query: query, page: 1)
+            async let globalPage = try? apiClient.searchUsers(query: query.isEmpty ? nil : query, page: 1)
+            let (m, g) = await (membersPage, globalPage)
+            guard !Task.isCancelled, let self else { return }
+            let memberResults = m?.members ?? []
+            let memberIds = Set(memberResults.map(\.id))
+            self.mentionSearchResults = memberResults + (g ?? []).filter { !memberIds.contains($0.id) }
+        }
+    }
+
+    /// Candidates for the `@` picker: server results for the query merged with everything
+    /// already loaded (members first, then other users), deduped.
+    func mentionCandidates(for query: String) -> [ChannelMember] {
+        let q = query.lowercased()
+        let local = mentionCandidates.filter {
+            q.isEmpty || $0.displayName.lowercased().contains(q) || $0.email.lowercased().contains(q)
+        }
+        var seen = Set<String>()
+        let memberIds = Set(members.map(\.id))
+        let merged = (mentionSearchResults + local).filter { seen.insert($0.id).inserted }
+        // Members first, then everyone else; alphabetical within each group.
+        let byName: (ChannelMember, ChannelMember) -> Bool = {
+            $0.displayName.localizedCaseInsensitiveCompare($1.displayName) == .orderedAscending
+        }
+        return merged.filter { memberIds.contains($0.id) }.sorted(by: byName)
+            + merged.filter { !memberIds.contains($0.id) }.sorted(by: byName)
+    }
+
+    /// @mention candidates: channel members first, then other server users (web MentionList parity).
+    var mentionCandidates: [ChannelMember] {
+        let byName: (ChannelMember, ChannelMember) -> Bool = {
+            $0.displayName.localizedCaseInsensitiveCompare($1.displayName) == .orderedAscending
+        }
+        let memberIds = Set(members.map(\.id))
+        let others = allServerUsers.filter { !memberIds.contains($0.id) }
+        return members.sorted(by: byName) + others.sorted(by: byName)
+    }
+
     var availableChannelsForPicker: [Channel] {
         availableChannels.filter { $0.id != channelId }
     }
@@ -526,6 +802,8 @@ final class ChannelViewModel {
         
         let currentText = text
         threadInputText = ""
+        let threadReplyId = threadReplyToMessage?.id
+        threadReplyToMessage = nil
         let currentAttachments = threadAttachments
         threadAttachments = []
         
@@ -576,6 +854,7 @@ final class ChannelViewModel {
             let msg = try await apiClient.postChannelMessage(
                 channelId: channelId,
                 content: currentText,
+                replyToId: threadReplyId,
                 parentId: parentId,
                 data: msgData.isEmpty ? nil : msgData
             )
@@ -686,6 +965,7 @@ final class ChannelViewModel {
         
         do {
             try await apiClient.deleteChannelMessage(channelId: channelId, messageId: id)
+            applyDeletionSideEffects(for: id)
         } catch {
             // Revert on failure
             if let msg = removedMsg, let idx = removedIdx {
@@ -704,8 +984,25 @@ final class ChannelViewModel {
     
     // MARK: - Reactions (R-028: Rate limited)
     
-    func toggleReaction(messageId: String, emoji: String) async {
+    func toggleReaction(messageId: String, emoji rawEmoji: String) async {
         guard let apiClient, let userId = currentUserId else { return }
+        // Web stores reactions as shortcodes ("+1", "heart"). Match an existing chip first
+        // (it may be a legacy raw-emoji reaction) so toggling removes the right one.
+        let shortcode = rawEmoji.emojiShortcode
+        let emoji: String = {
+            let reactions = (messages.first(where: { $0.id == messageId })
+                ?? threadMessages.first(where: { $0.id == messageId }))?.reactions ?? []
+            if reactions.contains(where: { $0.name == shortcode }) { return shortcode }
+            if reactions.contains(where: { $0.name == rawEmoji }) { return rawEmoji }
+            if let match = reactions.first(where: { $0.name.emojiFromShortcode == rawEmoji.emojiFromShortcode }) {
+                return match.name
+            }
+            return shortcode
+        }()
+        if messages.firstIndex(where: { $0.id == messageId }) == nil {
+            await toggleThreadReaction(messageId: messageId, emoji: emoji, userId: userId, apiClient: apiClient)
+            return
+        }
         guard let idx = messages.firstIndex(where: { $0.id == messageId }) else { return }
         
         // R-028: Rate limit reactions
@@ -749,6 +1046,37 @@ final class ChannelViewModel {
             await loadMessages()
         }
     }
+
+    /// Reactions on thread replies (not present in the main timeline).
+    private func toggleThreadReaction(messageId: String, emoji: String, userId: String, apiClient: APIClient) async {
+        guard let idx = threadMessages.firstIndex(where: { $0.id == messageId }) else { return }
+        let now = Date()
+        guard now.timeIntervalSince(lastReactionTime) >= reactionCooldown else { return }
+        lastReactionTime = now
+
+        let hasReacted = threadMessages[idx].hasReaction(emoji, byUserId: userId)
+        if hasReacted {
+            if let rIdx = threadMessages[idx].reactions.firstIndex(where: { $0.name == emoji }) {
+                threadMessages[idx].reactions[rIdx].userIds.removeAll { $0 == userId }
+                threadMessages[idx].reactions[rIdx].count = max(0, threadMessages[idx].reactions[rIdx].count - 1)
+                if threadMessages[idx].reactions[rIdx].count == 0 { threadMessages[idx].reactions.remove(at: rIdx) }
+            }
+        } else if let rIdx = threadMessages[idx].reactions.firstIndex(where: { $0.name == emoji }) {
+            threadMessages[idx].reactions[rIdx].userIds.append(userId)
+            threadMessages[idx].reactions[rIdx].count += 1
+        } else {
+            threadMessages[idx].reactions.append(MessageReaction(name: emoji, userIds: [userId], userNames: [], count: 1))
+        }
+        do {
+            if hasReacted {
+                try await apiClient.removeChannelReaction(channelId: channelId, messageId: messageId, emoji: emoji)
+            } else {
+                try await apiClient.addChannelReaction(channelId: channelId, messageId: messageId, emoji: emoji)
+            }
+        } catch {
+            logger.error("Failed to toggle thread reaction: \(error.localizedDescription)")
+        }
+    }
     
     // MARK: - Pin / Unpin
     
@@ -765,9 +1093,18 @@ final class ChannelViewModel {
                 messageId: messageId,
                 isPinned: newPinned
             )
-            await loadPinnedMessages()
+            if newPinned {
+                if !pinnedMessages.contains(where: { $0.id == messageId }),
+                   let msg = messages.first(where: { $0.id == messageId }) {
+                    pinnedMessages.insert(msg, at: 0)
+                }
+            } else {
+                pinnedMessages.removeAll { $0.id == messageId }
+            }
         } catch {
-            messages[idx].isPinned = !newPinned
+            if let i = messages.firstIndex(where: { $0.id == messageId }) {
+                messages[i].isPinned = !newPinned
+            }
             logger.error("Failed to toggle pin: \(error.localizedDescription)")
         }
     }
@@ -814,6 +1151,7 @@ final class ChannelViewModel {
                 }
             } else {
                 threadMessages = Array(chronological)
+                allThreadLoaded = fetched.count < pageSize
                 await loadThreadMessageDataForAll()
             }
         } catch {
@@ -866,7 +1204,32 @@ final class ChannelViewModel {
         }
     }
     
+    /// Loads older replies of the open thread (prepends).
+    func loadOlderThreadMessages() async {
+        guard let apiClient, let parent = threadParentMessage,
+              !allThreadLoaded, !isLoadingOlderThread, !isLoadingThread else { return }
+        isLoadingOlderThread = true
+        let generation = threadLoadGeneration
+        do {
+            let fetched = try await apiClient.getChannelThreadMessages(
+                channelId: channelId, messageId: parent.id, skip: threadMessages.count, limit: pageSize
+            )
+            guard generation == threadLoadGeneration else { isLoadingOlderThread = false; return }
+            let existing = Set(threadMessages.map(\.id))
+            let older = fetched.reversed().filter { !existing.contains($0.id) }
+            threadMessages.insert(contentsOf: older, at: 0)
+            if fetched.count < pageSize { allThreadLoaded = true }
+            for msg in older where msg.hasData { await loadThreadMessageData(for: msg.id) }
+        } catch {
+            logger.error("Failed to load older thread messages: \(error.localizedDescription)")
+        }
+        isLoadingOlderThread = false
+    }
+
     func closeThread() {
+        allThreadLoaded = false
+        threadTypingUsers = []
+        threadReplyToMessage = nil
         threadLoadGeneration &+= 1
         isLoadingThread = false
         // BUG-006 fix: Clear editing state when closing thread
@@ -885,6 +1248,21 @@ final class ChannelViewModel {
     
     func clearReply() {
         replyToMessage = nil
+    }
+
+    /// Reply to a specific message inside the open thread.
+    func setThreadReplyTo(_ message: ChannelMessage) {
+        threadReplyToMessage = message
+    }
+
+    func clearThreadReply() {
+        threadReplyToMessage = nil
+    }
+
+    /// Replying to a model's thread message makes that model answer (server behaviour).
+    var threadReplyTargetModelName: String? {
+        guard let reply = threadReplyToMessage, isModelMessage(reply) else { return nil }
+        return resolvedSenderName(for: reply)
     }
     
     // MARK: - File Upload
@@ -1037,6 +1415,64 @@ final class ChannelViewModel {
         threadInputText += "<#C:\(channel.id)|\(channel.name)> "
     }
     
+    // MARK: - `/` Prompts
+
+    /// Loads active prompts (stale-while-revalidate, like the main chat).
+    func loadPrompts() {
+        guard let apiClient else { return }
+        if availablePrompts.isEmpty { isLoadingPrompts = true }
+        Task {
+            if let raw = try? await apiClient.getPrompts() {
+                availablePrompts = raw.compactMap { PromptItem(json: $0) }.filter(\.isActive)
+            }
+            isLoadingPrompts = false
+        }
+    }
+
+    /// Inserts a selected prompt (or asks for its variables first).
+    func selectPrompt(_ prompt: PromptItem, isThread: Bool) {
+        if isThread {
+            threadInputText = removeLastToken(of: "/", from: threadInputText)
+        } else {
+            inputText = removeLastToken(of: "/", from: inputText)
+        }
+        let variables = PromptService.extractCustomVariables(from: prompt.content)
+        if variables.isEmpty {
+            let processed = PromptService.resolveSystemVariables(in: prompt.content, userName: nil, userEmail: nil)
+            appendPromptText(processed, isThread: isThread)
+        } else {
+            pendingPromptIsThread = isThread
+            pendingPromptVariables = variables
+            pendingPromptForVariables = prompt
+        }
+        Haptics.play(.light)
+    }
+
+    func submitPromptVariables(values: [String: String]) {
+        guard let prompt = pendingPromptForVariables else { return }
+        let processed = PromptService.processPrompt(
+            content: prompt.content, userValues: values,
+            variables: pendingPromptVariables, userName: nil, userEmail: nil
+        )
+        appendPromptText(processed, isThread: pendingPromptIsThread)
+        cancelPromptVariables()
+    }
+
+    func cancelPromptVariables() {
+        pendingPromptForVariables = nil
+        pendingPromptVariables = []
+    }
+
+    private func appendPromptText(_ text: String, isThread: Bool) {
+        if isThread {
+            let remaining = threadInputText.trimmingCharacters(in: .whitespaces)
+            threadInputText = remaining.isEmpty ? text : remaining + " " + text
+        } else {
+            let remaining = inputText.trimmingCharacters(in: .whitespaces)
+            inputText = remaining.isEmpty ? text : remaining + " " + text
+        }
+    }
+
     // MARK: - Copy Message
     
     func copyMessage(_ message: ChannelMessage) {
@@ -1202,6 +1638,7 @@ final class ChannelViewModel {
     }
     
     private func handleIncomingMessage(_ msg: ChannelMessage) {
+        clearTyping(for: msg.userId, inThread: !(msg.parentId ?? "").isEmpty)
         if let parentId = msg.parentId, !parentId.isEmpty {
             // Thread reply
             if threadParentMessage?.id == parentId {
@@ -1287,6 +1724,25 @@ final class ChannelViewModel {
             messages.removeAll { $0.id == msgId }
             threadMessages.removeAll { $0.id == msgId }
         }
+        applyDeletionSideEffects(for: msgId)
+    }
+
+    /// Web parity after a message is deleted: drop quotes pointing to it, clear a pending
+    /// reply to it, close its thread if open, and remove it from pinned messages.
+    private func applyDeletionSideEffects(for msgId: String) {
+        for i in messages.indices where messages[i].replyToId == msgId {
+            messages[i].replyToId = nil
+            messages[i].replyToMessage = nil
+        }
+        for i in threadMessages.indices where threadMessages[i].replyToId == msgId {
+            threadMessages[i].replyToId = nil
+            threadMessages[i].replyToMessage = nil
+        }
+        if replyToMessage?.id == msgId { replyToMessage = nil }
+        if threadReplyToMessage?.id == msgId { threadReplyToMessage = nil }
+        if editingMessage?.id == msgId { cancelEditing() }
+        pinnedMessages.removeAll { $0.id == msgId }
+        if threadParentMessage?.id == msgId { closeThread() }
     }
 
     /// Handles remote pin/unpin events from other clients.
@@ -1419,34 +1875,73 @@ final class ChannelViewModel {
         let data = event["data"] as? [String: Any]
         let innerData = data?["data"] as? [String: Any]
         let isTyping = innerData?["typing"] as? Bool ?? false
-        
+
+        // `message_id` scopes the typing event: nil = main channel, otherwise the thread parent.
+        let threadId = event["message_id"] as? String
+        if let threadId, !threadId.isEmpty {
+            guard threadParentMessage?.id == threadId else { return }
+            updateTypingList(&threadTypingUsers, userId: userId, name: userName, isTyping: isTyping, key: "t:\(userId)")
+        } else {
+            updateTypingList(&typingUsers, userId: userId, name: userName, isTyping: isTyping, key: "c:\(userId)")
+        }
+    }
+
+    /// Adds/removes a typing user and (re)starts a single 5s expiry per user —
+    /// matches the web client's clearTimeout/setTimeout pattern (no flicker).
+    private func updateTypingList(_ list: inout [TypingUser], userId: String, name: String, isTyping: Bool, key: String) {
+        typingExpiryTasks[key]?.cancel()
         if isTyping {
-            // Add if not already present
-            if !typingUsers.contains(where: { $0.id == userId }) {
-                typingUsers.append(TypingUser(id: userId, name: userName))
+            if !list.contains(where: { $0.id == userId }) {
+                list.append(TypingUser(id: userId, name: name))
+            }
+            let isThread = key.hasPrefix("t:")
+            typingExpiryTasks[key] = Task { [weak self] in
+                try? await Task.sleep(for: .seconds(5))
+                guard !Task.isCancelled, let self else { return }
+                if isThread {
+                    self.threadTypingUsers.removeAll { $0.id == userId }
+                } else {
+                    self.typingUsers.removeAll { $0.id == userId }
+                }
+                self.typingExpiryTasks[key] = nil
             }
         } else {
-            typingUsers.removeAll { $0.id == userId }
+            list.removeAll { $0.id == userId }
+            typingExpiryTasks[key] = nil
         }
-        
-        // Auto-remove after 5s (matches web client behaviour).
-        // If the user sends a stop-typing before this fires, they're already removed — no-op.
-        let capturedUserId = userId
-        Task {
-            try? await Task.sleep(for: .seconds(5))
-            await MainActor.run {
-                self.typingUsers.removeAll { $0.id == capturedUserId }
-            }
-        }
+    }
+
+    /// Clears a typing indicator for a user once their message arrives (web parity).
+    private func clearTyping(for userId: String, inThread: Bool) {
+        let key = inThread ? "t:\(userId)" : "c:\(userId)"
+        typingExpiryTasks[key]?.cancel()
+        typingExpiryTasks[key] = nil
+        if inThread { threadTypingUsers.removeAll { $0.id == userId } }
+        else { typingUsers.removeAll { $0.id == userId } }
     }
     
     /// Emits a typing indicator to the server for this channel.
     /// Call this when the user types in the input field.
     func emitTyping() {
+        emitTyping(threadId: nil)
+    }
+
+    /// Emits typing for the open thread (scoped by the thread parent's message id).
+    func emitThreadTyping() {
+        guard let parentId = threadParentMessage?.id else { return }
+        emitTyping(threadId: parentId)
+    }
+
+    private func emitTyping(threadId: String?) {
         guard socketService != nil else { return }
+        // Throttle: the web emits per keystroke; 1/sec is enough for a 5s expiry window.
+        let key = threadId ?? ""
+        let now = Date()
+        if let last = lastTypingEmit[key], now.timeIntervalSince(last) < 1 { return }
+        lastTypingEmit[key] = now
         socketService?.emit("events:channel", data: [
             "channel_id": channelId,
-            "message_id": NSNull(),
+            "message_id": threadId.map { $0 as Any } ?? NSNull(),
             "data": [
                 "type": "typing",
                 "data": ["typing": true]
@@ -1486,6 +1981,9 @@ final class ChannelViewModel {
         markAsRead()
         channelSubscription?.dispose()
         channelSubscription = nil
+        typingExpiryTasks.values.forEach { $0.cancel() }
+        typingExpiryTasks = [:]
+        memberSearchTask?.cancel()
         // Note: Do NOT call updateMemberActiveStatus(isActive: false) here.
         // That API tells the server the user has left/hidden the channel,
         // causing DMs to disappear from the sidebar. It should only be

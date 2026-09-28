@@ -382,11 +382,14 @@ struct NoteEditorView: View {
 
         updatedNote.title = titleText
         updatedNote.content = contentText
-        await notesManager?.updateNote(updatedNote)
-        note = updatedNote
+        // Only send content when the body was actually edited, so a rename keeps
+        // the server's rich JSON/HTML content intact.
+        let saved = await notesManager?.updateNote(updatedNote, contentChanged: contentText != note?.content) == true
+        if saved { note = updatedNote }
 
         isSaving = false
-        hasChanges = false
+        // Keep the note dirty after a failed save (or edits made mid-save) so it retries.
+        hasChanges = !saved || titleText != updatedNote.title || contentText != updatedNote.content
     }
 
     // MARK: - AI Features

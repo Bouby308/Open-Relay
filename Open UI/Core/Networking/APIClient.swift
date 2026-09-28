@@ -834,7 +834,8 @@ final class APIClient: @unchecked Sendable {
         messages: [ChatMessage],
         chatParams: ChatAdvancedParams? = nil,
         folderId: String? = nil,
-        chatFiles: [ChatMessageFile] = []
+        chatFiles: [ChatMessageFile] = [],
+        variables: [String: Any] = [:]
     ) async throws -> Conversation {
         // Build flat messages array
         let flatMessages = history.createMessagesList()
@@ -878,6 +879,7 @@ final class APIClient: @unchecked Sendable {
         ]
 
         var body: [String: Any] = ["chat": chatData]
+        body["variables"] = variables
         if let folderId { body["folder_id"] = folderId }
 
         let (data, _) = try await network.requestRaw(
@@ -904,7 +906,8 @@ final class APIClient: @unchecked Sendable {
         messages: [ChatMessage],
         model: String? = nil,
         systemPrompt: String? = nil,
-        folderId: String? = nil
+        folderId: String? = nil,
+        variables: [String: Any] = [:]
     ) async throws -> Conversation {
         let chatData = buildChatPayload(
             title: title,
@@ -915,6 +918,7 @@ final class APIClient: @unchecked Sendable {
 
         var body: [String: Any] = ["chat": chatData]
         body["folder_id"] = folderId
+        body["variables"] = variables
 
         let (data, _) = try await network.requestRaw(
             path: "/api/v1/chats/new",
@@ -945,6 +949,14 @@ final class APIClient: @unchecked Sendable {
             method: .post,
             body: ["chat": chatPayload]
         )
+    }
+
+    func updateChatVariables(id: String, values: [String: Any]) async throws {
+        let scope = network.conversationCacheScope
+        _ = try await network.requestRaw(path: "/api/v1/chats/\(id)", method: .post,
+            body: JSONSerialization.data(withJSONObject: ["chat": [:], "variables": values]))
+        if let scope { await ConversationCache.shared.invalidate(scope: scope, id: id) }
+        guard scope == network.conversationCacheScope else { throw APIError.cancelled }
     }
 
     func deleteConversation(id: String) async throws {
@@ -1316,24 +1328,6 @@ final class APIClient: @unchecked Sendable {
             body: try JSONSerialization.data(withJSONObject: body)
         )
         return (try? JSONSerialization.jsonObject(with: data) as? [String: Any]) ?? [:]
-    }
-
-    /// Updates a single task's status for the given chat.
-    /// `POST /api/v1/tasks/{chat_id}/update` with body `{"task_id": ..., "status": ...}`
-    @discardableResult
-    func updateChatTask(chatId: String, taskId: String, status: String) async throws -> ChatTask? {
-        let body: [String: Any] = ["task_id": taskId, "status": status]
-        let (data, _) = try await network.requestRaw(
-            path: "/api/v1/tasks/\(chatId)/update",
-            method: .post,
-            body: try JSONSerialization.data(withJSONObject: body)
-        )
-        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let id = json["id"] as? String,
-              let content = json["content"] as? String,
-              let taskStatus = json["status"] as? String
-        else { return nil }
-        return ChatTask(id: id, content: content, status: taskStatus)
     }
 
     // MARK: - User Settings
@@ -3043,200 +3037,16 @@ final class APIClient: @unchecked Sendable {
                 // Absent/nil means enabled by default.
                 if let enabled = item["enabled"] as? Bool, !enabled { return nil }
                 let name = item["name"] as? String ?? id
-                return TerminalServer(id: id, name: name)
+                // `contexts.chat` is `false` when hidden in chats, or `{context_id: "chat_id"}`
+                // when each chat gets its own isolated terminal.
+                let contexts = item["contexts"] as? [String: Any]
+                let chatContext = contexts?["chat"]
+                let hidden = (chatContext as? Bool) == false
+                let scoped = ((chatContext as? [String: Any])?["context_id"] as? String) == "chat_id"
+                return TerminalServer(id: id, name: name, isChatScoped: scoped, isHiddenInChats: hidden)
             }
         } catch {
             return []
-        }
-    }
-
-    func getTerminalConfig(serverId: String) async throws -> TerminalConfig {
-        let (data, _) = try await network.requestRaw(
-            path: "/api/v1/terminals/\(serverId)/api/config"
-        )
-        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            return TerminalConfig(from: [:])
-        }
-        return TerminalConfig(from: json)
-    }
-
-    func terminalListFiles(serverId: String, path: String) async throws -> [TerminalFileItem] {
-        let (data, _) = try await network.requestRaw(
-            path: "/api/v1/terminals/\(serverId)/files/list",
-            queryItems: [URLQueryItem(name: "directory", value: path)]
-        )
-        if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-           let entries = json["entries"] as? [[String: Any]] {
-            let dir = json["dir"] as? String ?? path
-            return entries.map { TerminalFileItem(from: $0, basePath: dir) }
-        }
-        if let array = try JSONSerialization.jsonObject(with: data) as? [[String: Any]] {
-            return array.map { TerminalFileItem(from: $0, basePath: path) }
-        }
-        return []
-    }
-
-    func terminalReadFile(serverId: String, path: String) async throws -> String {
-        let (data, _) = try await network.requestRaw(
-            path: "/api/v1/terminals/\(serverId)/files/read",
-            queryItems: [URLQueryItem(name: "path", value: path)]
-        )
-        if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-           let content = json["content"] as? String {
-            return content
-        }
-        return String(data: data, encoding: .utf8) ?? ""
-    }
-
-    func terminalMkdir(serverId: String, path: String) async throws {
-        try await network.requestVoidJSON(
-            path: "/api/v1/terminals/\(serverId)/files/mkdir",
-            method: .post,
-            body: ["path": path]
-        )
-    }
-
-    func terminalDeleteFile(serverId: String, path: String) async throws {
-        try await network.requestVoid(
-            path: "/api/v1/terminals/\(serverId)/files/delete",
-            method: .delete,
-            queryItems: [URLQueryItem(name: "path", value: path)]
-        )
-    }
-
-    func terminalMoveFile(serverId: String, sourcePath: String, destinationPath: String) async throws {
-        let body: [String: Any] = [
-            "src_path": sourcePath,
-            "dst_path": destinationPath
-        ]
-        try await network.requestVoidJSON(
-            path: "/api/v1/terminals/\(serverId)/files/move",
-            method: .post,
-            body: body
-        )
-    }
-
-    func terminalDownloadFile(serverId: String, path: String) async throws -> (Data, String) {
-        let (data, response) = try await network.requestRaw(
-            path: "/api/v1/terminals/\(serverId)/files/view",
-            queryItems: [URLQueryItem(name: "path", value: path)]
-        )
-        let contentType = response.value(forHTTPHeaderField: "Content-Type") ?? "application/octet-stream"
-        return (data, contentType)
-    }
-
-    func terminalWriteFile(serverId: String, path: String, content: String) async throws {
-        let body = try JSONSerialization.data(withJSONObject: [
-            "path": path,
-            "content": content
-        ])
-        try await network.requestVoid(
-            path: "/api/v1/terminals/\(serverId)/files/write",
-            method: .post,
-            body: body
-        )
-    }
-
-    /// Creates a new interactive PTY session on the terminal server.
-    /// Returns the session ID used to open the WebSocket connection.
-    /// POST `/api/v1/terminals/{serverId}/api/terminals`
-    func terminalCreateSession(serverId: String) async throws -> String {
-        let (data, _) = try await network.requestRaw(
-            path: "/api/v1/terminals/\(serverId)/api/terminals",
-            method: .post,
-            body: Data("{}".utf8)
-        )
-        // Response is {"id": "xxxx", ...}
-        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let sessionId = json["id"] as? String else {
-            throw APIError.responseDecoding(
-                underlying: NSError(domain: "Terminal", code: -1,
-                    userInfo: [NSLocalizedDescriptionKey: "Missing session id in response"]),
-                data: nil
-            )
-        }
-        return sessionId
-    }
-
-    /// without requiring polling. Returns the process ID for long-running commands.
-    func terminalExecute(serverId: String, command: String, cwd: String? = nil) async throws -> TerminalCommandResult {
-        var body: [String: Any] = ["command": command]
-        if let cwd { body["cwd"] = cwd }
-        let bodyData = try JSONSerialization.data(withJSONObject: body)
-        let (data, _) = try await network.requestRaw(
-            path: "/api/v1/terminals/\(serverId)/execute",
-            method: .post,
-            queryItems: [URLQueryItem(name: "wait", value: "5")],
-            body: bodyData
-        )
-        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            throw APIError.unknown(underlying: NSError(domain: "Terminal", code: -1,
-                userInfo: [NSLocalizedDescriptionKey: "Invalid execute response"]))
-        }
-        return TerminalCommandResult(from: json)
-    }
-
-    /// Polls command status. `wait=5` blocks up to 5s for new output,
-    /// and `offset` enables incremental reads.
-    func terminalGetCommandStatus(serverId: String, processId: String, offset: Int = 0) async throws -> TerminalCommandResult {
-        var queryItems = [URLQueryItem(name: "offset", value: "\(offset)")]
-        queryItems.append(URLQueryItem(name: "wait", value: "5"))
-        let (data, _) = try await network.requestRaw(
-            path: "/api/v1/terminals/\(serverId)/execute/\(processId)/status",
-            queryItems: queryItems
-        )
-        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            throw APIError.unknown(underlying: NSError(domain: "Terminal", code: -1,
-                userInfo: [NSLocalizedDescriptionKey: "Invalid status response"]))
-        }
-        return TerminalCommandResult(from: json)
-    }
-
-    /// Sends text to the stdin of a running process.
-    ///
-    /// Used to provide interactive input (passwords, prompts, etc.) to a
-    /// long-running process without spawning a new shell command.
-    func terminalSendInput(serverId: String, processId: String, input: String) async throws {
-        let body = try JSONSerialization.data(withJSONObject: ["input": input])
-        let (_, response) = try await network.session.data(for: network.buildRequest(
-            path: "/api/v1/terminals/\(serverId)/execute/\(processId)/input",
-            method: .post,
-            body: body,
-            contentType: "application/json",
-            authenticated: true,
-            timeout: 30
-        ))
-        if let httpResponse = response as? HTTPURLResponse,
-           !(200..<400).contains(httpResponse.statusCode) {
-            throw APIError.httpError(statusCode: httpResponse.statusCode, message: "Send input failed", data: nil)
-        }
-    }
-
-    func terminalUploadFile(serverId: String, fileData: Data, fileName: String, destinationPath: String) async throws {
-        let boundary = UUID().uuidString
-        var body = Data()
-
-        let mime = mimeType(for: fileName)
-        body.append("--\(boundary)\r\n".data(using: .utf8)!)
-        body.append("Content-Disposition: form-data; name=\"file\"; filename=\"\(fileName)\"\r\n".data(using: .utf8)!)
-        body.append("Content-Type: \(mime)\r\n\r\n".data(using: .utf8)!)
-        body.append(fileData)
-        body.append("\r\n--\(boundary)--\r\n".data(using: .utf8)!)
-
-        var request = try network.buildRequest(
-            path: "/api/v1/terminals/\(serverId)/files/upload",
-            method: .post,
-            queryItems: [URLQueryItem(name: "directory", value: destinationPath)],
-            authenticated: true,
-            timeout: 120
-        )
-        request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
-        request.httpBody = body
-
-        let (_, response) = try await network.session.data(for: request)
-        if let httpResponse = response as? HTTPURLResponse,
-           !(200..<400).contains(httpResponse.statusCode) {
-            throw APIError.httpError(statusCode: httpResponse.statusCode, message: "Upload failed", data: nil)
         }
     }
 
@@ -3262,6 +3072,16 @@ final class APIClient: @unchecked Sendable {
         try await network.requestJSON(path: "/api/v1/notes/\(id)")
     }
 
+    /// POST `/api/v1/notes/{id}/pin` — toggles the pin and returns the server's
+    /// resulting `is_pinned`. A toggle is not idempotent, so this uses the
+    /// single-attempt `requestRaw` path and never retries an uncertain result.
+    func toggleNotePin(id: String) async throws -> Bool {
+        let (data, _) = try await network.requestRaw(path: "/api/v1/notes/\(id)/pin", method: .post)
+        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let pinned = json["is_pinned"] as? Bool else { throw NotesError.invalidPinResponse }
+        return pinned
+    }
+
     func createNote(
         title: String,
         markdownContent: String = "",
@@ -3270,7 +3090,7 @@ final class APIClient: @unchecked Sendable {
         let noteData: [String: Any] = [
             "content": [
                 "json": NSNull(),
-                "HTML": htmlContent,
+                "html": htmlContent,
                 "md": markdownContent
             ],
             "versions": [] as [Any],
@@ -3303,7 +3123,7 @@ final class APIClient: @unchecked Sendable {
             body["data"] = [
                 "content": [
                     "json": NSNull(),
-                    "HTML": htmlContent ?? "",
+                    "html": htmlContent ?? "",
                     "md": markdownContent ?? ""
                 ]
             ]
@@ -3328,15 +3148,23 @@ final class APIClient: @unchecked Sendable {
         }
     }
 
-    func searchNotes(query: String) async throws -> [[String: Any]] {
+    /// GET `/api/v1/notes/search` — paginated (60 per page) server search.
+    /// Returns `{items, total}`; older servers returned a bare array.
+    func searchNotes(query: String, page: Int = 1) async throws -> (items: [[String: Any]], total: Int) {
         let (data, _) = try await network.requestRaw(
             path: "/api/v1/notes/search",
-            queryItems: [URLQueryItem(name: "query", value: query)]
+            queryItems: [URLQueryItem(name: "query", value: query), URLQueryItem(name: "page", value: String(page))]
         )
-        if let array = try JSONSerialization.jsonObject(with: data) as? [[String: Any]] {
-            return array
+        let json = try JSONSerialization.jsonObject(with: data)
+        if let response = json as? [String: Any],
+           let items = response["items"] as? [[String: Any]],
+           let total = response["total"] as? Int, total >= 0 {
+            return (items, total)
         }
-        return []
+        if let array = json as? [[String: Any]] { return (array, array.count) }
+        throw APIError.responseDecoding(underlying: DecodingError.dataCorrupted(
+            .init(codingPath: [], debugDescription: "Invalid notes search response")
+        ), data: data)
     }
 
     // MARK: - Profile & Account
@@ -3579,15 +3407,25 @@ final class APIClient: @unchecked Sendable {
     }
 
     func updateAutomation(id: String, name: String, prompt: String, modelId: String, rrule: String) async throws -> Automation {
-        let bodyDict: [String: Any] = [
-            "name": name,
-            "data": [
-                "prompt": prompt,
-                "model_id": modelId,
-                "rrule": rrule
-            ] as [String: Any]
-        ]
+        // The update endpoint replaces the whole form, including fields not editable here.
+        // Read the latest configuration so editing does not reset targets, terminal,
+        // folder, metadata, or reactivate a paused automation.
+        let (snapshot, _) = try await network.requestRaw(path: "/api/v1/automations/\(id)")
+        guard let existing = try JSONSerialization.jsonObject(with: snapshot) as? [String: Any],
+              var taskData = existing["data"] as? [String: Any],
+              existing["is_active"] is Bool else {
+            throw APIError.responseDecoding(underlying: DecodingError.dataCorrupted(
+                .init(codingPath: [], debugDescription: "Invalid automation configuration")
+            ), data: snapshot)
+        }
+        var bodyDict = existing.filter { ["name", "data", "folder_id", "meta", "is_active"].contains($0.key) }
+        taskData["prompt"] = prompt
+        taskData["model_id"] = modelId
+        taskData["rrule"] = rrule
+        bodyDict["name"] = name
+        bodyDict["data"] = taskData
         let bodyData = try JSONSerialization.data(withJSONObject: bodyDict)
+        try Task.checkCancellation()
         let (data, _) = try await network.requestRaw(
             path: "/api/v1/automations/\(id)/update",
             method: .post,
@@ -3667,6 +3505,29 @@ final class APIClient: @unchecked Sendable {
         return try JSONDecoder().decode([OWCalendar].self, from: data)
     }
 
+    func saveCalendar(id: String?, name: String, color: String?) async throws -> OWCalendar {
+        var body: [String: Any] = ["name": name]
+        if let color { body["color"] = color }
+        let path = id.map { "/api/v1/calendars/\($0)/update" } ?? "/api/v1/calendars/create"
+        let (data, _) = try await network.requestRaw(path: path, method: .post,
+            body: JSONSerialization.data(withJSONObject: body))
+        return try JSONDecoder().decode(OWCalendar.self, from: data)
+    }
+
+    func setDefaultCalendar(id: String) async throws -> OWCalendar {
+        let (data, _) = try await network.requestRaw(path: "/api/v1/calendars/\(id)/default", method: .post)
+        return try JSONDecoder().decode(OWCalendar.self, from: data)
+    }
+
+    func deleteCalendar(id: String) async throws {
+        let (data, _) = try await network.requestRaw(path: "/api/v1/calendars/\(id)/delete", method: .delete)
+        guard let result = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+              result["status"] as? Bool == true else {
+            throw NSError(domain: "Calendar", code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "The calendar was not deleted. Refresh and try again."])
+        }
+    }
+
     func getCalendarEvents(start: Date, end: Date) async throws -> [CalendarEvent] {
         let iso8601Formatter: DateFormatter = {
             let f = DateFormatter()
@@ -3687,14 +3548,22 @@ final class APIClient: @unchecked Sendable {
         return try JSONDecoder().decode([CalendarEvent].self, from: data)
     }
 
-    func createCalendarEvent(_ request: CalendarEventCreateRequest) async throws -> CalendarEvent {
-        let bodyData = try JSONEncoder().encode(request)
+    func getCalendarEvent(id: String) async throws -> CalendarEvent {
+        let scope = network.conversationCacheScope
+        let (data, _) = try await network.requestRaw(path: "/api/v1/calendars/events/\(id)")
+        guard scope == network.conversationCacheScope else { throw APIError.cancelled }
+        return try JSONDecoder().decode(CalendarEvent.self, from: data)
+    }
+
+    func saveCalendarEvent(_ draft: CalendarEventDraft) async throws -> CalendarEvent {
+        let scope = network.conversationCacheScope
+        let path = draft.id.map { "/api/v1/calendars/events/\($0)/update" }
+            ?? "/api/v1/calendars/events/create"
         let (data, _) = try await network.requestRaw(
-            path: "/api/v1/calendars/events/create",
-            method: .post,
-            body: bodyData,
-            contentType: "application/json"
+            path: path, method: .post,
+            body: JSONSerialization.data(withJSONObject: draft.requestBody())
         )
+        guard scope == network.conversationCacheScope else { throw APIError.cancelled }
         return try JSONDecoder().decode(CalendarEvent.self, from: data)
     }
 
@@ -3856,58 +3725,6 @@ final class APIClient: @unchecked Sendable {
             return trimmed
         }
         return nil
-    }
-
-    // MARK: - Util APIs
-
-    /// Downloads a chat as PDF. Fetches the full conversation from the server
-    /// and walks the history tree to get ordered messages in the format
-    /// the PDF renderer expects.
-    func downloadChatAsPDF(chatId: String) async throws -> Data {
-        let (chatData, _) = try await network.requestRaw(path: "/api/v1/chats/\(chatId)")
-        guard let chatJson = try JSONSerialization.jsonObject(with: chatData) as? [String: Any] else {
-            throw APIError.responseDecoding(underlying: NSError(domain: "API", code: -1, userInfo: [NSLocalizedDescriptionKey: "Invalid chat data"]), data: chatData)
-        }
-
-        let chat = chatJson["chat"] as? [String: Any] ?? [:]
-        let title = chat["title"] as? String ?? chatJson["title"] as? String ?? "Chat"
-
-        var orderedMessages: [[String: Any]] = []
-
-        if let history = chat["history"] as? [String: Any],
-           let messagesMap = history["messages"] as? [String: [String: Any]],
-           let currentId = history["currentId"] as? String {
-            var chain: [[String: Any]] = []
-            var cursor: String? = currentId
-            while let id = cursor, let msg = messagesMap[id] {
-                var m = msg
-                m["id"] = id
-                chain.append(m)
-                cursor = msg["parentId"] as? String
-            }
-            chain.reverse()
-            orderedMessages = chain
-        } else {
-            orderedMessages = chat["messages"] as? [[String: Any]] ?? []
-        }
-
-        let safeMessages: [[String: Any]] = orderedMessages.map { msg in
-            var m = msg
-            if m["content"] == nil || m["content"] is NSNull {
-                m["content"] = ""
-            }
-            return m
-        }
-
-        let body: [String: Any] = ["title": title, "messages": safeMessages]
-        let bodyData = try JSONSerialization.data(withJSONObject: body)
-        let (data, _) = try await network.requestRaw(
-            path: "/api/v1/utils/pdf",
-            method: .post,
-            body: bodyData,
-            timeout: 120
-        )
-        return data
     }
 
     // MARK: - AI Note Features
@@ -4280,6 +4097,8 @@ final class APIClient: @unchecked Sendable {
             files: chatFiles
         )
         conv.chatParams = chatParams
+        conv.contextUsage = ChatContextUsage.parse(json["context_usage"])
+        conv.chatVariables = json["variables"] as? [String: Any] ?? [:]
         return conv
     }
 
@@ -5332,6 +5151,29 @@ final class APIClient: @unchecked Sendable {
 
     // MARK: - Channel Members
 
+    /// Fetches one page of channel members plus the server's total count.
+    /// Supports server-side search and sort (`order_by`: name/role, `direction`: asc/desc).
+    func getChannelMembersPage(
+        id: String,
+        query: String? = nil,
+        orderBy: String? = "name",
+        direction: String? = "asc",
+        page: Int = 1
+    ) async throws -> (members: [ChannelMember], total: Int) {
+        var queryItems: [URLQueryItem] = [URLQueryItem(name: "page", value: "\(page)")]
+        if let query, !query.isEmpty { queryItems.append(URLQueryItem(name: "query", value: query)) }
+        if let orderBy { queryItems.append(URLQueryItem(name: "order_by", value: orderBy)) }
+        if let direction { queryItems.append(URLQueryItem(name: "direction", value: direction)) }
+        let (data, _) = try await network.requestRaw(
+            path: "/api/v1/channels/\(id)/members",
+            queryItems: queryItems
+        )
+        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else { return ([], 0) }
+        let members = (json["users"] as? [[String: Any]] ?? []).compactMap { ChannelMember.fromJSON($0) }
+        let total = json["total"] as? Int ?? members.count
+        return (members, total)
+    }
+
     /// Fetches members of a channel with pagination.
     /// API returns `UserListResponse`: `{users: UserModelResponse[], total: int}`
     func getChannelMembers(id: String, query: String? = nil, page: Int = 1) async throws -> [ChannelMember] {
@@ -5367,6 +5209,23 @@ final class APIClient: @unchecked Sendable {
             method: .post,
             body: ["user_ids": userIds]
         )
+    }
+
+    /// Adds users and/or whole groups to a group channel (matches web AddMembersModal).
+    func addChannelMembers(id: String, userIds: [String], groupIds: [String]) async throws {
+        try await network.requestVoidJSON(
+            path: "/api/v1/channels/\(id)/update/members/add",
+            method: .post,
+            body: ["user_ids": userIds, "group_ids": groupIds]
+        )
+    }
+
+    /// Public profile info for a user (name, role, bio, status, groups, is_active).
+    /// GET /users/{id}/info — used by the channel profile card.
+    func getUserInfo(userId: String) async throws -> ChannelMember? {
+        let (data, _) = try await network.requestRaw(path: "/api/v1/users/\(userId)/info")
+        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+        return ChannelMember.fromJSON(json)
     }
 
     /// Removes members from a channel.
@@ -5554,6 +5413,83 @@ final class APIClient: @unchecked Sendable {
             return []
         }
         return array
+    }
+
+    /// Typed webhook list for a channel (managers only).
+    func listChannelWebhooks(channelId: String) async throws -> [ChannelWebhook] {
+        try await getChannelWebhooks(channelId: channelId).compactMap { ChannelWebhook.fromJSON($0) }
+    }
+
+    /// Creates a webhook. POST /channels/{id}/webhooks/create
+    func createChannelWebhook(channelId: String, name: String, profileImageURL: String? = nil) async throws -> ChannelWebhook? {
+        var body: [String: Any] = ["name": name]
+        if let profileImageURL { body["profile_image_url"] = profileImageURL }
+        let (data, _) = try await network.requestRaw(
+            path: "/api/v1/channels/\(channelId)/webhooks/create",
+            method: .post,
+            body: try JSONSerialization.data(withJSONObject: body)
+        )
+        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+        return ChannelWebhook.fromJSON(json)
+    }
+
+    /// Updates a webhook's name / avatar. POST /channels/{id}/webhooks/{webhook_id}/update
+    func updateChannelWebhook(channelId: String, webhookId: String, name: String, profileImageURL: String?) async throws -> ChannelWebhook? {
+        var body: [String: Any] = ["name": name]
+        if let profileImageURL { body["profile_image_url"] = profileImageURL }
+        let (data, _) = try await network.requestRaw(
+            path: "/api/v1/channels/\(channelId)/webhooks/\(webhookId)/update",
+            method: .post,
+            body: try JSONSerialization.data(withJSONObject: body)
+        )
+        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+        return ChannelWebhook.fromJSON(json)
+    }
+
+    /// Deletes a webhook. DELETE /channels/{id}/webhooks/{webhook_id}/delete
+    /// The server returns `true` on success — anything else means it wasn't deleted.
+    func deleteChannelWebhook(channelId: String, webhookId: String) async throws {
+        let (data, _) = try await network.requestRaw(
+            path: "/api/v1/channels/\(channelId)/webhooks/\(webhookId)/delete",
+            method: .delete
+        )
+        guard (try? JSONSerialization.jsonObject(with: data, options: .fragmentsAllowed)) as? Bool == true else {
+            throw NSError(domain: "ChannelWebhook", code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "The webhook was not deleted. Refresh and try again."])
+        }
+    }
+
+    /// The public URL external services POST to for a webhook.
+    func channelWebhookURL(_ webhook: ChannelWebhook) -> String {
+        "\(baseURL)/api/v1/channels/webhooks/\(webhook.id)/\(webhook.token)"
+    }
+
+    /// Loads **every** page of `/users/search` (the server pages at 30).
+    /// Pickers need the full directory — page 1 alone silently hid most users.
+    /// Capped at `maxPages` as a safety net for very large servers.
+    func searchAllUsers(query: String? = nil, maxPages: Int = 40) async throws -> [ChannelMember] {
+        var all: [ChannelMember] = []
+        var seen = Set<String>()
+        for page in 1...maxPages {
+            let batch = try await searchUsers(query: query, page: page)
+            let fresh = batch.filter { seen.insert($0.id).inserted }
+            all.append(contentsOf: fresh)
+            if batch.count < 30 || fresh.isEmpty { break }
+        }
+        return all
+    }
+
+    /// Loads every page of a channel's members (server pages at 30).
+    func getAllChannelMembers(id: String, maxPages: Int = 40) async throws -> [ChannelMember] {
+        var all: [ChannelMember] = []
+        var seen = Set<String>()
+        for page in 1...maxPages {
+            let result = try await getChannelMembersPage(id: id, page: page)
+            let fresh = result.members.filter { seen.insert($0.id).inserted }
+            all.append(contentsOf: fresh)
+            if all.count >= result.total || result.members.count < 30 || fresh.isEmpty { break }
+        }
+        return all
     }
 
     /// Searches users (for @mention picker and access management).
@@ -6015,18 +5951,23 @@ final class APIClient: @unchecked Sendable {
         return try decoder.decode([ImageModelItem].self, from: data)
     }
 
-    /// GET `/api/v1/images/config/url/verify` — returns true if ComfyUI/A1111 URL is reachable.
-    func verifyImageConfigURL() async throws -> Bool {
-        let (data, _) = try await network.requestRaw(path: "/api/v1/images/config/url/verify")
-        // Response is a plain JSON boolean
-        if let result = try? JSONDecoder().decode(Bool.self, from: data) {
-            return result
+    /// POST `/api/v1/images/verify` — verifies a ComfyUI/Automatic1111 connection using the
+    /// given URL/key WITHOUT saving image configuration.
+    /// Falls back to the legacy `GET /api/v1/images/config/url/verify` (which checks the
+    /// *saved* configuration) on older servers that don't have the new endpoint.
+    func verifyImageConfigURL(engine: String, url: String, key: String? = nil) async throws -> Bool {
+        var payload = ["engine": engine, "url": url]
+        if let key, !key.isEmpty { payload["key"] = key }
+        do {
+            let (data, _) = try await network.requestRaw(
+                path: "/api/v1/images/verify", method: .post,
+                body: try JSONSerialization.data(withJSONObject: payload)
+            )
+            return try JSONDecoder().decode(Bool.self, from: data)
+        } catch APIError.httpError(let statusCode, _, _) where statusCode == 404 || statusCode == 405 {
+            let (data, _) = try await network.requestRaw(path: "/api/v1/images/config/url/verify")
+            return try JSONDecoder().decode(Bool.self, from: data)
         }
-        // Fallback: check for string "true"
-        if let str = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) {
-            return str == "true"
-        }
-        return false
     }
 
     // MARK: - Retrieval / Documents Config

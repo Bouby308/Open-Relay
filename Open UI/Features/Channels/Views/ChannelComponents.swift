@@ -1,7 +1,6 @@
 import SwiftUI
 import PhotosUI
 import QuickLook
-import ReactionContextMenu
 
 // MARK: - Overlay Reply Input Field
 //
@@ -51,16 +50,12 @@ struct OverlayReplyInputField: View {
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 10)
-        .background(
-            theme.isDark
-                ? theme.cardBackground.opacity(0.95)
-                : theme.inputBackground
-        )
-        .clipShape(RoundedRectangle(cornerRadius: 24, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: 24, style: .continuous)
-                .strokeBorder(theme.cardBorder.opacity(0.4), lineWidth: 0.5)
-        )
+        .modifier(ComposerGlassModifier(
+            cornerRadius: 24,
+            borderColor: Color(uiColor: .separator),
+            shadowColor: Color.black.opacity(theme.isDark ? 0.2 : 0.08),
+            isDark: theme.isDark
+        ))
         .padding(.horizontal, Spacing.screenPadding)
         .padding(.vertical, 10)
         .animation(.easeInOut(duration: 0.15), value: text.isEmpty)
@@ -121,14 +116,10 @@ struct UserModelPickerView: View {
     
     @Environment(\.theme) private var theme
     
+    /// Caller passes candidates already filtered + ordered (members first, then
+    /// other server users). Capped only for rendering cost; the list scrolls.
     private var filteredMembers: [ChannelMember] {
-        // Sort channel members alphabetically so results are stable and predictable (A8).
-        let sorted = members.sorted { $0.displayName.localizedCaseInsensitiveCompare($1.displayName) == .orderedAscending }
-        if query.isEmpty { return Array(sorted.prefix(8)) }
-        let q = query.lowercased()
-        return sorted.filter {
-            $0.displayName.lowercased().contains(q) || $0.email.lowercased().contains(q)
-        }.prefix(8).map { $0 }
+        Array(members.prefix(200))
     }
     
     private var filteredModels: [AIModel] {
@@ -187,9 +178,9 @@ struct UserModelPickerView: View {
             }
             .frame(maxHeight: 320)
         }
-        .background(.ultraThinMaterial)
-        .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
-        .shadow(color: .black.opacity(0.15), radius: 16, y: -4)
+        .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
+        .chatControlGlass(in: RoundedRectangle(cornerRadius: 22, style: .continuous), fallback: .ultraThinMaterial)
+        .shadow(color: .black.opacity(0.12), radius: 16, y: -4)
         .padding(.horizontal, Spacing.sm)
         .padding(.bottom, 80)
     }
@@ -340,9 +331,9 @@ struct ChannelLinkPickerView: View {
             }
             .frame(maxHeight: 280)
         }
-        .background(.ultraThinMaterial)
-        .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
-        .shadow(color: .black.opacity(0.15), radius: 16, y: -4)
+        .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
+        .chatControlGlass(in: RoundedRectangle(cornerRadius: 22, style: .continuous), fallback: .ultraThinMaterial)
+        .shadow(color: .black.opacity(0.12), radius: 16, y: -4)
         .padding(.horizontal, Spacing.sm)
         .padding(.bottom, 80)
     }
@@ -398,6 +389,11 @@ struct ChannelLinkPickerView: View {
 struct ThreadDetailSheet: View {
     @Bindable var viewModel: ChannelViewModel
     let parentMessage: ChannelMessage
+    /// When true the thread is rendered as an iPad side panel (no sheet chrome);
+    /// closing calls `onClose` instead of dismissing a sheet.
+    var isPanel: Bool = false
+    var onClose: (() -> Void)? = nil
+    var onShowProfile: ((String) -> Void)? = nil
     @Environment(AppDependencyContainer.self) private var dependencies
     @Environment(\.dismiss) private var dismiss
     @Environment(\.theme) private var theme
@@ -412,6 +408,14 @@ struct ThreadDetailSheet: View {
     @State private var isShowingMentionPicker = false
     @State private var mentionQuery = ""
 
+    // Swipe-to-reply offsets inside the thread
+    @State private var threadSwipeOffsets: [String: CGFloat] = [:]
+
+    // `/` prompt picker
+    @State private var isShowingPromptPicker = false
+    @State private var promptQuery = ""
+    @State private var keyboard = KeyboardTracker()
+
     // Thread attachment picker
     @State private var showThreadAttachmentPicker = false
     
@@ -419,9 +423,9 @@ struct ThreadDetailSheet: View {
     @State private var threadShowEmojiKeyboard = false
     @State private var threadEmojiTargetMessageId: String?
     
-    // ReactionContextMenu state
-    @State private var threadSelectedReaction: String?
-    @State private var threadReactionTargetMessageId: String?
+    // Glass long-press menu
+    @State private var threadMenu = MessageMenuPresenter()
+    @State private var threadRowFrames: [String: CGRect] = [:]
     
     // QuickLook for file preview
     @State private var quickLookURL: URL?
@@ -430,13 +434,201 @@ struct ThreadDetailSheet: View {
     @State private var downloadErrorMessage = ""
     
     var body: some View {
-        NavigationStack {
+        threadContent
+    }
+
+    private func closeThread() {
+        if let onClose { onClose() } else { dismiss() }
+    }
+
+    /// Glass header (title, channel, close) — matches the channel's glass nav bar.
+    private var threadHeader: some View {
+        HStack(spacing: Spacing.sm) {
+            VStack(alignment: .leading, spacing: 1) {
+                Text("Thread")
+                    .scaledFont(size: 16, weight: .semibold)
+                    .foregroundStyle(theme.textPrimary)
+                Text(threadSubtitle)
+                    .scaledFont(size: 11)
+                    .foregroundStyle(theme.textTertiary)
+                    .lineLimit(1)
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 6)
+            .chatControlGlass(in: Capsule(), fallback: .ultraThinMaterial)
+
+            Spacer()
+
+            Button {
+                closeThread()
+            } label: {
+                Image(systemName: "xmark")
+                    .scaledFont(size: 14, weight: .semibold)
+                    .foregroundStyle(theme.textSecondary)
+                    .frame(width: 40, height: 40)
+                    .contentShape(Circle())
+            }
+            .buttonStyle(.plain)
+            .chatControlGlass(in: Circle(), fallback: .ultraThinMaterial)
+            .accessibilityLabel("Close thread")
+        }
+        .padding(.horizontal, Spacing.sm)
+        .padding(.top, isPanel ? 8 : 12)
+        .padding(.bottom, 6)
+    }
+
+    private var threadSubtitle: String {
+        let count = max(parentMessage.replyCount, displayMessages.count)
+        let replies = count == 1 ? "1 reply" : "\(count) replies"
+        return "\(viewModel.channelDisplayTitle) · \(replies)"
+    }
+
+    private var threadContent: some View {
+        ZStack {
+            theme.background.ignoresSafeArea()
+            threadScroll
+        }
+        .modifier(ChannelDeleteConfirmation(viewModel: viewModel))
+        .chatChromeBar(edge: .top) { threadHeader }
+        .chatChromeBar(edge: .bottom) { threadBottomChrome }
+        .modifier(MessageMenuHost(presenter: threadMenu))
+        .task { keyboard.start() }
+        .onDisappear { keyboard.stop() }
+        .overlay(alignment: .bottom) { threadPromptPicker }
+        .overlay(alignment: .bottom) { threadMentionPicker }
+        .onAppear { displayMessages = viewModel.threadMessages }
+        .onChange(of: viewModel.threadMessages) { oldValue, newValue in
+            // Sync when messages arrive; ignore the clear-to-[] during dismiss.
+            if !newValue.isEmpty || oldValue.isEmpty { displayMessages = newValue }
+        }
+        .onChange(of: viewModel.editingMessage) { _, newValue in
+            if newValue != nil {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { isThreadEditFocused = true }
+            } else {
+                isThreadEditFocused = false
+            }
+        }
+        .quickLookPreview($quickLookURL)
+        .overlay { threadFileLoadingOverlay }
+        .alert("Download Failed", isPresented: $showDownloadError) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text(downloadErrorMessage)
+        }
+        .background {
+            InlineEmojiKeyboard(isActive: $threadShowEmojiKeyboard) { emoji in
+                if let messageId = threadEmojiTargetMessageId {
+                    RecentReactions.record(emoji)
+                    Task { await viewModel.toggleReaction(messageId: messageId, emoji: emoji) }
+                    Haptics.play(.light)
+                }
+                threadShowEmojiKeyboard = false
+                threadEmojiTargetMessageId = nil
+            }
+            .allowsHitTesting(false)
+        }
+    }
+
+    private var threadBottomChrome: some View {
+        VStack(spacing: 0) {
+            if !viewModel.threadTypingUsers.isEmpty {
+                ChannelTypingCapsule(names: viewModel.threadTypingUsers.map(\.name))
+                    .padding(.horizontal, Spacing.screenPadding)
+                    .padding(.bottom, 4)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
+            }
+            if viewModel.hasWriteAccess {
+                threadInput
+            } else {
+                ChannelReadOnlyBanner(text: "You do not have permission to send messages in this thread.")
+            }
+        }
+        .animation(.spring(response: 0.3, dampingFraction: 0.85), value: viewModel.threadTypingUsers.map(\.id))
+    }
+
+    @ViewBuilder
+    private var threadPromptPicker: some View {
+        if isShowingPromptPicker {
+            PromptPickerView(
+                query: promptQuery,
+                prompts: viewModel.availablePrompts,
+                isLoading: viewModel.isLoadingPrompts,
+                keyboardHeight: keyboard.height,
+                onSelect: { prompt in
+                    viewModel.selectPrompt(prompt, isThread: true)
+                    dismissPromptPicker()
+                },
+                onDismiss: { dismissPromptPicker() }
+            )
+            .transition(.move(edge: .bottom).combined(with: .opacity))
+        }
+    }
+
+    @ViewBuilder
+    private var threadMentionPicker: some View {
+        if isShowingMentionPicker {
+            UserModelPickerView(
+                query: mentionQuery,
+                members: viewModel.mentionCandidates(for: mentionQuery),
+                models: viewModel.availableModels,
+                serverBaseURL: viewModel.serverBaseURL,
+                authToken: viewModel.serverAuthToken,
+                onSelectUser: { member in
+                    viewModel.insertThreadUserMention(member)
+                    dismissMentionPicker()
+                    Haptics.play(.light)
+                },
+                onSelectModel: { model in
+                    viewModel.setThreadModelMention(model)
+                    dismissMentionPicker()
+                    Haptics.play(.light)
+                },
+                onDismiss: { dismissMentionPicker() }
+            )
+            .transition(.asymmetric(
+                insertion: .move(edge: .bottom).combined(with: .opacity),
+                removal: .opacity
+            ))
+        }
+    }
+
+    @ViewBuilder
+    private var threadFileLoadingOverlay: some View {
+        if isLoadingFile {
+            ZStack {
+                Color.black.opacity(0.3).ignoresSafeArea()
+                VStack(spacing: 8) {
+                    ProgressView()
+                        .controlSize(.large)
+                        .tint(.white)
+                    Text("Loading file…")
+                        .scaledFont(size: 14, weight: .medium)
+                        .foregroundStyle(.white)
+                }
+                .padding(Spacing.lg)
+                .chatControlGlass(in: RoundedRectangle(cornerRadius: 16, style: .continuous), fallback: .ultraThinMaterial)
+            }
+            .transition(.opacity)
+        }
+    }
+
+    private func dismissPromptPicker() {
+        withAnimation(.easeOut(duration: 0.15)) {
+            isShowingPromptPicker = false
+            promptQuery = ""
+        }
+    }
+
+    private var threadScroll: some View {
             VStack(spacing: 0) {
                 ScrollViewReader { proxy in
                     ScrollView {
                         VStack(spacing: 0) {
                             // Parent message
                             threadMessageRow(parentMessage, isParent: true, showHeader: true)
+                                .onGeometryChange(for: CGRect.self) { $0.frame(in: .global) } action: { threadRowFrames[parentMessage.id] = $0 }
+                                .opacity(threadMenu.content?.messageId == parentMessage.id && threadMenu.isVisible ? 0 : 1)
                                 .padding(.bottom, 4)
                             
                             // Divider
@@ -464,6 +656,9 @@ struct ThreadDetailSheet: View {
                                 }
                                 .padding(.vertical, Spacing.xl)
                             } else {
+                                if viewModel.isLoadingOlderThread {
+                                    ProgressView().controlSize(.small).padding(.vertical, 8)
+                                }
                                 // BUG-009 fix: Safe index bounds checking for message grouping
                                 ForEach(Array(displayMessages.enumerated()), id: \.element.id) { index, msg in
                                     let showHeader = index == 0 || msg.effectiveSenderId != displayMessages[index - 1].effectiveSenderId
@@ -471,7 +666,7 @@ struct ThreadDetailSheet: View {
                                         guard index < displayMessages.count - 1 else { return true }
                                         return msg.effectiveSenderId != displayMessages[index + 1].effectiveSenderId
                                     }()
-                                    threadMessageRow(msg, isParent: false, showHeader: showHeader, showGroupTimestamp: showTimestamp)
+                                    threadReplyRow(msg, index: index, showHeader: showHeader, showTimestamp: showTimestamp)
                                 }
                             }
                             
@@ -482,132 +677,33 @@ struct ThreadDetailSheet: View {
                         }
                         .padding(.top, 8)
                         .padding(.bottom, 8)
-                        // Same fix as ChannelDetailView: prevent keyboard-animation
-                        // frames propagating into CustomContextMenuWrapper geometry
-                        // trackers, which would fire onGeometryChange on every tick.
+                        // Tap empty space to close the keyboard (background keeps links/buttons first).
+                        .background {
+                            Color.clear.contentShape(Rectangle()).onTapGesture { dismissKeyboard() }
+                        }
+                        // Prevent keyboard-animation frames propagating into row geometry trackers.
                         .transaction { $0.animation = nil }
                     }
+                    .scrollDismissesKeyboard(.interactively)
+                    .background(ChannelScrollHorizontalLock())
                     .onAppear {
                         proxy.scrollTo("threadBottom", anchor: .bottom)
                     }
-                    .onChange(of: displayMessages.count) { old, new in
-                        guard new > old else { return }
+                    .onChange(of: displayMessages.last?.id) { old, new in
+                        // Only follow appended replies, not older pages prepended at the top.
+                        guard new != old, new != nil else { return }
                         withAnimation {
                             proxy.scrollTo("threadBottom", anchor: .bottom)
                         }
                     }
-                }
-                
-                threadInput
-            }
-            .navigationTitle("Thread")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .topBarLeading) {
-                    Button("Close") { dismiss() }
-                }
-            }
-            // @mention picker overlay
-            .overlay(alignment: .bottom) {
-                if isShowingMentionPicker {
-                    UserModelPickerView(
-                        query: mentionQuery,
-                        members: viewModel.members,
-                        models: viewModel.availableModels,
-                        serverBaseURL: viewModel.serverBaseURL,
-                        authToken: viewModel.serverAuthToken,
-                        onSelectUser: { member in
-                            viewModel.insertThreadUserMention(member)
-                            dismissMentionPicker()
-                            Haptics.play(.light)
-                        },
-                        onSelectModel: { model in
-                            viewModel.setThreadModelMention(model)
-                            dismissMentionPicker()
-                            Haptics.play(.light)
-                        },
-                        onDismiss: { dismissMentionPicker() }
-                    )
-                    .transition(.asymmetric(
-                        insertion: .move(edge: .bottom).combined(with: .opacity),
-                        removal: .opacity
-                    ))
-                    .animation(.easeOut(duration: 0.2), value: isShowingMentionPicker)
-                }
-            }
-            .modifier(ContextMenuHost())
-            .environment(\.reactionProvider, ChannelReactionProvider())
-            .onChange(of: threadSelectedReaction) { _, newEmoji in
-                guard let emoji = newEmoji, let msgId = threadReactionTargetMessageId else { return }
-                threadSelectedReaction = nil
-                threadReactionTargetMessageId = nil
-                if emoji == "➕" {
-                    threadEmojiTargetMessageId = msgId
-                    threadShowEmojiKeyboard = true
-                } else {
-                    Task { await viewModel.toggleReaction(messageId: msgId, emoji: emoji) }
-                    Haptics.play(.light)
-                }
-            }
-        }
-        .onAppear {
-            displayMessages = viewModel.threadMessages
-        }
-        .onChange(of: viewModel.threadMessages) { oldValue, newValue in
-            // Sync when messages arrive (new bot replies, etc.)
-            // Ignore when cleared to [] during dismiss — protects against crash
-            if !newValue.isEmpty || oldValue.isEmpty {
-                displayMessages = newValue
-            }
-        }
-        .onChange(of: viewModel.editingMessage) { _, newValue in
-            if newValue != nil {
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-                    isThreadEditFocused = true
-                }
-            } else {
-                isThreadEditFocused = false
-            }
-        }
-        // In-app file preview using QuickLook (PDFs, images, docs, etc.)
-        .quickLookPreview($quickLookURL)
-        // File download loading overlay
-        .overlay {
-            if isLoadingFile {
-                ZStack {
-                    Color.black.opacity(0.3).ignoresSafeArea()
-                    VStack(spacing: 8) {
-                        ProgressView()
-                            .controlSize(.large)
-                            .tint(.white)
-                        Text("Loading file…")
-                            .scaledFont(size: 14, weight: .medium)
-                            .foregroundStyle(.white)
+                    .onChange(of: keyboard.height > 0) { _, shown in
+                        guard shown else { return }
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                            withAnimation(.easeOut(duration: 0.25)) { proxy.scrollTo("threadBottom", anchor: .bottom) }
+                        }
                     }
-                    .padding(Spacing.lg)
-                    .background(.ultraThinMaterial)
-                    .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
                 }
-                .transition(.opacity)
             }
-        }
-        .alert("Download Failed", isPresented: $showDownloadError) {
-            Button("OK", role: .cancel) {}
-        } message: {
-            Text(downloadErrorMessage)
-        }
-        // Inline emoji keyboard for thread (triggered from context menu)
-        .background {
-            InlineEmojiKeyboard(isActive: $threadShowEmojiKeyboard) { emoji in
-                if let messageId = threadEmojiTargetMessageId {
-                    Task { await viewModel.toggleReaction(messageId: messageId, emoji: emoji) }
-                    Haptics.play(.light)
-                }
-                threadShowEmojiKeyboard = false
-                threadEmojiTargetMessageId = nil
-            }
-            .allowsHitTesting(false)
-        }
     }
     
     private func dismissMentionPicker() {
@@ -693,141 +789,294 @@ struct ThreadDetailSheet: View {
 
     // MARK: - Message Row
     
+    // MARK: - Thread Rows
+
+    /// Reply row with swipe-to-reply and the glass long-press menu.
+    @ViewBuilder
+    private func threadReplyRow(_ msg: ChannelMessage, index: Int, showHeader: Bool, showTimestamp: Bool) -> some View {
+        let offset = threadSwipeOffsets[msg.id] ?? 0
+        let progress = min(abs(offset) / 64, 1)
+        let isOwn = msg.userId == viewModel.currentUserId && !viewModel.isModelMessage(msg)
+        ZStack(alignment: isOwn ? .trailing : .leading) {
+            SwipeReplyIcon(progress: progress)
+                .opacity(progress > 0.05 ? 1 : 0)
+                .scaleEffect(0.6 + progress * 0.4)
+                .padding(isOwn ? .trailing : .leading, Spacing.screenPadding)
+                .allowsHitTesting(false)
+            threadMessageRow(msg, isParent: false, showHeader: showHeader, showGroupTimestamp: showTimestamp)
+                .offset(x: offset)
+        }
+        .onAppear {
+            if index == 0 { Task { await viewModel.loadOlderThreadMessages() } }
+        }
+        .onGeometryChange(for: CGRect.self) { $0.frame(in: .global) } action: { threadRowFrames[msg.id] = $0 }
+        .opacity(threadMenu.content?.messageId == msg.id && threadMenu.isVisible ? 0 : 1)
+    }
+
     private func threadMessageRow(_ message: ChannelMessage, isParent: Bool, showHeader: Bool, showGroupTimestamp: Bool = false) -> some View {
-        let senderName = viewModel.resolvedSenderName(for: message)
-        let isModel = viewModel.isModelMessage(message)
         let isCurrentUser = message.userId == viewModel.currentUserId && !viewModel.isModelMessage(message)
-        let bubbleBg = isCurrentUser ? sentBubbleBg : receivedBubbleBg
-        let bubbleBd = isCurrentUser ? sentBubbleBorderColor : receivedBubbleBorder
         let bubbleAlignment: HorizontalAlignment = isCurrentUser ? .trailing : .leading
         let frameAlignment: Alignment = isCurrentUser ? .trailing : .leading
-        
-        return CustomContextMenuWrapper(
-            hapticTouchDuration: .default,
-            contextMenuAppearingSide: .leading,
-            selectedReaction: Binding(
-                get: { threadSelectedReaction },
-                set: { newVal in
-                    if let emoji = newVal {
-                        threadReactionTargetMessageId = message.id
-                        threadSelectedReaction = emoji
-                    }
-                }
-            )
-        ) {
-            VStack(alignment: bubbleAlignment, spacing: 0) {
-                // Sender header — only shown for received messages (not current user)
-                if showHeader && !isCurrentUser {
-                    HStack(spacing: 8) {
-                        threadAvatar(message, size: 26)
-                        HStack(spacing: 4) {
-                            Text(senderName)
-                                .scaledFont(size: 12, weight: .bold)
-                                .foregroundStyle(isModel ? theme.mentionModelText : theme.textPrimary)
-                            if isModel {
-                                Text("BOT")
-                                    .scaledFont(size: 7, weight: .heavy)
-                                    .foregroundStyle(theme.mentionModelText)
-                                    .padding(.horizontal, 3).padding(.vertical, 1)
-                                    .background(theme.mentionModelBackground)
-                                    .clipShape(RoundedRectangle(cornerRadius: 2))
-                            }
-                            if isParent {
-                                Text("OP")
-                                    .scaledFont(size: 7, weight: .heavy)
-                                    .foregroundStyle(theme.brandPrimary)
-                                    .padding(.horizontal, 3).padding(.vertical, 1)
-                                    .background(theme.brandPrimary.opacity(0.12))
-                                    .clipShape(RoundedRectangle(cornerRadius: 2))
-                            }
-                            Text(message.createdAt.channelTime)
-                                .scaledFont(size: 10)
-                                .foregroundStyle(theme.textTertiary)
-                        }
-                    }
-                    .padding(.bottom, 3)
-                }
-                
-                // Pinned indicator
-                if message.isPinned {
-                    HStack(spacing: 4) {
-                        Image(systemName: "pin.fill")
-                            .scaledFont(size: 9)
-                            .rotationEffect(.degrees(45))
-                        Text("Pinned")
-                            .scaledFont(size: 10, weight: .semibold)
-                    }
-                    .foregroundStyle(.yellow.opacity(0.8))
-                    .padding(.bottom, 2)
-                }
-                
-                // Bubble (or edit bubble if editing this message)
-                if viewModel.editingMessage?.id == message.id {
-                    threadEditBubble
-                } else {
-                    VStack(alignment: .leading, spacing: 4) {
-                        if !message.content.isEmpty {
-                            ChannelMarkdownView(
-                                content: message.content,
-                                currentUserId: viewModel.currentUserId,
-                                isCurrentUser: isCurrentUser
-                            )
-                        }
-                        if !message.files.isEmpty {
-                            threadFileAttachments(message.files)
-                        }
-                    }
-                    .padding(.horizontal, 14)
-                    .padding(.vertical, 9)
-                    .background(bubbleBg)
-                    .clipShape(ChannelBubbleShape(isCurrentUser: isCurrentUser, showTail: showHeader))
-                    .overlay(
-                        ChannelBubbleShape(isCurrentUser: isCurrentUser, showTail: showHeader)
-                            .strokeBorder(bubbleBd, lineWidth: 0.5)
-                    )
-                    .frame(minWidth: 60, maxWidth: UIScreen.main.bounds.width * 0.75, alignment: frameAlignment)
-                }
-                
-                if showGroupTimestamp && !showHeader {
-                    Text(message.createdAt.channelTime)
-                        .scaledFont(size: 10)
-                        .foregroundStyle(theme.textTertiary)
-                        .padding(.top, 2)
-                }
+
+        return VStack(alignment: bubbleAlignment, spacing: 0) {
+            if showHeader && !isCurrentUser {
+                threadSenderHeader(message, isParent: isParent)
+                    .padding(.bottom, 4)
             }
-            .frame(maxWidth: .infinity, alignment: frameAlignment)
-            .padding(.horizontal, Spacing.screenPadding)
-            .padding(.top, showHeader ? 12 : 2)
-            .background(isParent ? theme.brandPrimary.opacity(0.03) : Color.clear)
-        } menu: {
-            CustomMenuView {
-                CustomMenuButton(action: { Task { await viewModel.togglePin(messageId: message.id) } }) {
-                    Label(message.isPinned ? "Unpin" : "Pin", systemImage: message.isPinned ? "pin.slash" : "pin")
-                }
-                CustomMenuButton("Copy", systemImage: "doc.on.doc") {
-                    viewModel.copyMessage(message)
-                }
-                if isCurrentUser {
-                    CustomMenuDivider()
-                    CustomMenuButton("Edit", systemImage: "pencil") {
-                        viewModel.beginEditing(message: message)
+
+            if !isParent, let replyId = message.replyToId {
+                threadReplyQuote(replyId: replyId, message: message)
+                    .frame(maxWidth: ChannelLayout.maxBubbleWidth, alignment: frameAlignment)
+                    .padding(.bottom, 3)
+            }
+
+            if viewModel.editingMessage?.id == message.id {
+                threadEditBubble
+            } else {
+                threadBubble(message, isCurrentUser: isCurrentUser, showTail: showHeader)
+            }
+
+            if !message.reactions.isEmpty {
+                ChannelReactionsBar(
+                    reactions: message.reactions,
+                    currentUserId: viewModel.currentUserId,
+                    alignment: bubbleAlignment,
+                    isEnabled: viewModel.hasWriteAccess,
+                    onToggle: { name in
+                        Task { await viewModel.toggleReaction(messageId: message.id, emoji: name) }
+                        Haptics.play(.light)
+                    },
+                    onAdd: {
+                        threadEmojiTargetMessageId = message.id
+                        threadShowEmojiKeyboard = true
                     }
-                CustomMenuButton("Delete", systemImage: "trash", role: .destructive) {
-                        Task { await viewModel.deleteMessage(id: message.id) }
-                    }
-                }
+                )
+                .frame(maxWidth: ChannelLayout.maxBubbleWidth, alignment: frameAlignment)
+                .padding(.top, 4)
+            }
+
+            if message.isPinned || (showGroupTimestamp && !showHeader) {
+                ChannelMessageMeta(
+                    time: showGroupTimestamp && !showHeader ? message.createdAt.channelTime : nil,
+                    isPinned: message.isPinned,
+                    isEdited: false
+                )
+                .padding(.top, 3)
             }
         }
-        // Dismiss the keyboard before the context menu appears so it has the full
-        // screen height available and doesn't appear off-screen.
-        .simultaneousGesture(
-            LongPressGesture(minimumDuration: 0.35).onEnded { _ in
-                UIApplication.shared.sendAction(
-                    #selector(UIResponder.resignFirstResponder),
-                    to: nil, from: nil, for: nil
-                )
+        // Bubble-scoped gestures (not the full row) — see ChannelMessageGestures.
+        .modifier(ChannelMessageGestures(
+            swipeEnabled: !isParent && viewModel.hasWriteAccess && !message.isOptimistic,
+            longPressEnabled: !message.isOptimistic && viewModel.editingMessage?.id != message.id,
+            direction: isCurrentUser ? .left : .right,
+            onSwipeChanged: { threadSwipeOffsets[message.id] = $0 },
+            onSwipeEnded: { triggered in
+                if triggered {
+                    viewModel.setThreadReplyTo(message)
+                    NotificationCenter.default.post(name: .chatInputFieldRequestFocus, object: nil)
+                }
+                withAnimation(.spring(response: 0.35, dampingFraction: 0.72)) { threadSwipeOffsets[message.id] = nil }
+            },
+            onLongPress: {
+                presentThreadMenu(for: message, isParent: isParent, isOwn: isCurrentUser,
+                                  showHeader: showHeader, showTimestamp: showGroupTimestamp)
             }
-        )
+        ))
+        .frame(maxWidth: .infinity, alignment: frameAlignment)
+        .padding(.horizontal, Spacing.screenPadding)
+        .padding(.top, showHeader ? 12 : 2)
+        .padding(.vertical, isParent ? 8 : 0)
+        .background {
+            if isParent {
+                RoundedRectangle(cornerRadius: 18, style: .continuous)
+                    .fill(theme.brandPrimary.opacity(theme.isDark ? 0.08 : 0.05))
+                    .padding(.horizontal, 8)
+            }
+        }
+        .contentShape(Rectangle())
+        .onTapGesture { dismissKeyboard() }
+    }
+
+    private func threadSenderHeader(_ message: ChannelMessage, isParent: Bool) -> some View {
+        let isModel = viewModel.isModelMessage(message)
+        return HStack(spacing: 8) {
+            threadAvatar(message, size: 26)
+                .onTapGesture {
+                    guard !isModel, !message.isFromWebhook else { return }
+                    onShowProfile?(message.userId)
+                }
+            Text(viewModel.resolvedSenderName(for: message))
+                .scaledFont(size: 13, weight: .semibold)
+                .foregroundStyle(isModel ? theme.mentionModelText : theme.textPrimary)
+                .lineLimit(1)
+            if isModel { ChannelBadge(text: "BOT", tint: theme.mentionModelText) }
+            if message.isFromWebhook { ChannelBadge(text: "WEBHOOK", tint: theme.textSecondary) }
+            if isParent { ChannelBadge(text: "OP", tint: theme.brandPrimary) }
+            Text(message.createdAt.channelTime)
+                .scaledFont(size: 11)
+                .foregroundStyle(theme.textTertiary)
+        }
+    }
+
+    @ViewBuilder
+    private func threadBubble(_ message: ChannelMessage, isCurrentUser: Bool, showTail: Bool) -> some View {
+        let isModel = viewModel.isModelMessage(message)
+        if isModel && message.renderedContent.isEmpty && message.files.isEmpty && !message.isModelDone {
+            HStack(spacing: 8) {
+                TypingDotsView()
+                Text("Generating…")
+                    .scaledFont(size: 12)
+                    .foregroundStyle(theme.textTertiary)
+            }
+            .modifier(ChannelBubbleStyle(isCurrentUser: false, showTail: showTail))
+        } else if !message.renderedContent.isEmpty || !message.files.isEmpty {
+            VStack(alignment: .leading, spacing: 6) {
+                if message.hasStructuredOutput {
+                    AssistantMessageContent(
+                        content: message.renderedContent,
+                        isStreaming: !message.isModelDone,
+                        authToken: viewModel.serverAuthToken,
+                        serverBaseURL: viewModel.serverBaseURL,
+                        apiClient: dependencies.apiClient
+                    )
+                } else if !message.content.isEmpty {
+                    ChannelMarkdownView(
+                        content: message.content,
+                        currentUserId: viewModel.currentUserId,
+                        isCurrentUser: isCurrentUser,
+                        accessibleChannelIds: viewModel.accessibleChannelIds
+                    )
+                }
+                if !message.files.isEmpty {
+                    threadFileAttachments(message.files)
+                }
+                if message.isEdited {
+                    Text("edited")
+                        .scaledFont(size: 10)
+                        .foregroundStyle(isCurrentUser ? theme.brandOnPrimary.opacity(0.7) : theme.textTertiary)
+                }
+            }
+            .modifier(ChannelBubbleStyle(isCurrentUser: isCurrentUser, showTail: showTail))
+        }
+    }
+
+    /// Glass long-press menu for a thread message (Reply in thread, Copy, Pin, Edit, Delete).
+    private func presentThreadMenu(for message: ChannelMessage, isParent: Bool, isOwn: Bool,
+                                   showHeader: Bool, showTimestamp: Bool) {
+        guard let frame = threadRowFrames[message.id] else { return }
+        let uid = viewModel.currentUserId ?? ""
+        let own = Set(message.reactions.filter { $0.userIds.contains(uid) }.map { $0.name.emojiFromShortcode })
+        let canWrite = viewModel.hasWriteAccess
+
+        var quick: [MessageMenuAction] = []
+        if !isParent && canWrite {
+            quick.append(.init(id: "reply", title: "Reply", icon: "arrowshape.turn.up.left") {
+                viewModel.setThreadReplyTo(message)
+                NotificationCenter.default.post(name: .chatInputFieldRequestFocus, object: nil)
+            })
+        }
+        quick.append(.init(id: "copy", title: "Copy", icon: "doc.on.doc") { viewModel.copyMessage(message) })
+        quick.append(.init(id: "pin", title: message.isPinned ? "Unpin" : "Pin",
+                           icon: message.isPinned ? "pin.slash" : "pin") {
+            Task { await viewModel.togglePin(messageId: message.id) }
+        })
+
+        var info: [MessageMenuAction] = [
+            .init(id: "time", title: message.createdAt.formatted(date: .abbreviated, time: .shortened), icon: "clock") {
+                UIPasteboard.general.string = message.createdAt.formatted(date: .complete, time: .standard)
+                Haptics.notify(.success)
+            }
+        ]
+        if !viewModel.isModelMessage(message) && !message.isFromWebhook, let onShowProfile {
+            info.append(.init(id: "profile", title: "View Profile", icon: "person.crop.circle") {
+                onShowProfile(message.userId)
+            })
+        }
+        var sections: [[MessageMenuAction]] = [info]
+        if viewModel.canModify(message) {
+            sections.append([
+                .init(id: "edit", title: "Edit", icon: "pencil") { viewModel.beginEditing(message: message) },
+                .init(id: "delete", title: "Delete", icon: "trash", style: .destructive) {
+                    viewModel.pendingDeleteMessage = message
+                }
+            ])
+        }
+
+        let preview = threadMessageRow(message, isParent: isParent, showHeader: showHeader,
+                                       showGroupTimestamp: showTimestamp)
+            .environment(\.theme, theme)
+            .frame(width: frame.width)
+        threadMenu.present(MessageMenuContent(
+            messageId: message.id,
+            preview: AnyView(preview),
+            sourceFrame: frame,
+            alignTrailing: isOwn,
+            header: "\(viewModel.resolvedSenderName(for: message)) · \(message.createdAt.channelTime)",
+            ownReactions: own,
+            showsReactions: canWrite,
+            quickActions: quick,
+            sections: sections,
+            onReact: { emoji in
+                Task { await viewModel.toggleReaction(messageId: message.id, emoji: emoji) }
+            },
+            onMoreReactions: {
+                threadEmojiTargetMessageId = message.id
+                threadShowEmojiKeyboard = true
+            }
+        ))
+    }
+
+    /// Reply-target chip (+ "model will respond" hint) inside the thread composer.
+    private var threadComposerChips: [ChannelComposerChip] {
+        guard let reply = viewModel.threadReplyToMessage else { return [] }
+        let preview = ChannelMessage.parseMentions(in: reply.content).trimmingCharacters(in: .whitespacesAndNewlines)
+        var chips = [ChannelComposerChip(
+            id: "thread-reply-\(reply.id)",
+            style: .reply,
+            icon: "arrowshape.turn.up.left.fill",
+            title: "Replying to \(viewModel.resolvedSenderName(for: reply))",
+            subtitle: preview.isEmpty ? (reply.files.isEmpty ? nil : "Attachment") : String(preview.prefix(90)),
+            onTap: nil,
+            onRemove: { viewModel.clearThreadReply() }
+        )]
+        if let model = viewModel.threadReplyTargetModelName {
+            chips.append(ChannelComposerChip(
+                id: "thread-reply-model-\(model)", style: .model, icon: "sparkles",
+                title: "\(model) will respond", subtitle: nil, onTap: nil, onRemove: nil
+            ))
+        }
+        return chips
+    }
+
+    /// Compact quote of the message a thread reply points to.
+    @ViewBuilder
+    private func threadReplyQuote(replyId: String, message: ChannelMessage) -> some View {
+        let original = displayMessages.first(where: { $0.id == replyId })
+            ?? (parentMessage.id == replyId ? parentMessage : nil)
+        if let original {
+            let isModel = viewModel.isModelMessage(original)
+            ChannelReplyPreview(
+                senderName: viewModel.resolvedSenderName(for: original),
+                content: original.content,
+                isModel: isModel,
+                avatarURL: isModel
+                    ? viewModel.resolveModelForMessage(original)?.resolveAvatarURL(baseURL: viewModel.serverBaseURL)
+                    : ChannelAvatarURL.forSender(userId: original.userId, isWebhook: original.isFromWebhook,
+                                                 serverBaseURL: viewModel.serverBaseURL),
+                authToken: viewModel.serverAuthToken,
+                hasFiles: !original.files.isEmpty
+            )
+        } else if let slim = message.replyToMessage {
+            ChannelReplyPreview(
+                senderName: slim.modelName ?? slim.user?.displayName ?? "Unknown",
+                content: slim.content,
+                isModel: slim.modelId != nil,
+                avatarURL: ChannelAvatarURL.forSender(userId: slim.userId, isWebhook: slim.user?.role == "webhook",
+                                                      serverBaseURL: viewModel.serverBaseURL),
+                authToken: viewModel.serverAuthToken,
+                hasFiles: false
+            )
+        }
     }
 
     @ViewBuilder
@@ -838,10 +1087,9 @@ struct ThreadDetailSheet: View {
             ModelAvatar(size: size, imageURL: model.resolveAvatarURL(baseURL: viewModel.serverBaseURL), label: model.shortName, authToken: viewModel.serverAuthToken)
         } else {
             // Build URL directly from userId — don't depend on member lookup
-            let avatarURL: URL? = {
-                guard !message.userId.isEmpty, !viewModel.serverBaseURL.isEmpty else { return nil }
-                return URL(string: "\(viewModel.serverBaseURL)/api/v1/users/\(message.userId)/profile/image")
-            }()
+            let avatarURL = ChannelAvatarURL.forSender(
+                userId: message.userId, isWebhook: message.isFromWebhook, serverBaseURL: viewModel.serverBaseURL
+            )
             UserAvatar(
                 size: size,
                 imageURL: avatarURL,
@@ -858,15 +1106,7 @@ struct ThreadDetailSheet: View {
         
         // Image thumbnails — use AuthenticatedImageView (same as channel + AI chat)
         if !imageFiles.isEmpty {
-            HStack(spacing: 4) {
-                ForEach(Array(imageFiles.prefix(3).enumerated()), id: \.offset) { _, file in
-                    if let fileId = file.url, !fileId.isEmpty {
-                        AuthenticatedImageView(fileId: fileId, apiClient: dependencies.apiClient)
-                            .frame(width: 60, height: 60)
-                            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-                    }
-                }
-            }
+            ChannelImageGrid(imageFiles: imageFiles, apiClient: dependencies.apiClient)
         }
         
         // File cards — tappable with QuickLook preview (same as channel + AI chat)
@@ -897,6 +1137,7 @@ struct ThreadDetailSheet: View {
             isEnabled: true,
             onSend: { await viewModel.sendThreadMessage() },
             canSend: viewModel.canSendThread,
+            chips: threadComposerChips,
             onAttachmentTapped: { showThreadAttachmentPicker = true },
             onPasteAttachments: { pasted in
                 // BUG-011 fix: Paste into thread-specific attachments
@@ -906,13 +1147,23 @@ struct ThreadDetailSheet: View {
             onRemoveAttachment: { att in
                 withAnimation { viewModel.threadAttachments.removeAll { $0.id == att.id } }
             },
+            onTextChange: { viewModel.emitThreadTyping() },
             onAtTrigger: { query in
                 mentionQuery = query
+                viewModel.searchMentions(query)
                 if !isShowingMentionPicker {
                     withAnimation(.easeOut(duration: 0.2)) { isShowingMentionPicker = true }
                 }
             },
-            onAtDismiss: { dismissMentionPicker() }
+            onAtDismiss: { dismissMentionPicker() },
+            onSlashTrigger: { query in
+                promptQuery = query
+                if !isShowingPromptPicker {
+                    viewModel.loadPrompts()
+                    withAnimation(.easeOut(duration: 0.2)) { isShowingPromptPicker = true }
+                }
+            },
+            onSlashDismiss: { dismissPromptPicker() }
         )
         .sheet(isPresented: $showThreadAttachmentPicker) {
             UnifiedAttachmentPicker(
@@ -957,88 +1208,6 @@ struct ThreadDetailSheet: View {
         let attachment = ChatAttachment(type: .file, name: url.lastPathComponent, thumbnail: nil, data: data)
         viewModel.threadAttachments.append(attachment)
         viewModel.uploadAttachmentImmediately(attachmentId: attachment.id, isThread: true)
-    }
-}
-
-// MARK: - Channel Members Sheet
-
-struct ChannelMembersSheet: View {
-    let members: [ChannelMember]
-    let isLoading: Bool
-    var serverBaseURL: String = ""
-    @Environment(\.dismiss) private var dismiss
-    @Environment(\.theme) private var theme
-    @State private var searchText = ""
-    
-    private var filtered: [ChannelMember] {
-        if searchText.isEmpty { return members }
-        let q = searchText.lowercased()
-        return members.filter {
-            $0.displayName.lowercased().contains(q) || $0.email.lowercased().contains(q)
-        }
-    }
-    
-    var body: some View {
-        NavigationStack {
-            Group {
-                if isLoading && members.isEmpty {
-                    ProgressView()
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
-                } else {
-                    List(filtered) { member in
-                        HStack(spacing: Spacing.md) {
-                            UserAvatar(
-                                size: 36,
-                                imageURL: member.resolveAvatarURL(serverBaseURL: serverBaseURL),
-                                name: member.displayName
-                            )
-                            
-                            VStack(alignment: .leading, spacing: 2) {
-                                HStack(spacing: 4) {
-                                    Text(member.displayName)
-                                        .scaledFont(size: 15, weight: .medium)
-                                        .foregroundStyle(theme.textPrimary)
-                                    
-                                    if member.role == "admin" {
-                                        Text("Admin")
-                                            .scaledFont(size: 9, weight: .bold)
-                                            .foregroundStyle(.orange)
-                                            .padding(.horizontal, 4)
-                                            .padding(.vertical, 1)
-                                            .background(Color.orange.opacity(0.1))
-                                            .clipShape(Capsule())
-                                    }
-                                }
-                                Text(member.email)
-                                    .scaledFont(size: 12)
-                                    .foregroundStyle(theme.textTertiary)
-                            }
-                            
-                            Spacer()
-                            
-                            // Online status
-                            Circle()
-                                .fill(member.isOnline ? Color.green : theme.textTertiary.opacity(0.3))
-                                .frame(width: 10, height: 10)
-                        }
-                        .padding(.vertical, 2)
-                    }
-                    .listStyle(.insetGrouped)
-                    .searchable(text: $searchText, prompt: "Search members")
-                }
-            }
-            .navigationTitle("Members (\(members.count))")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .navigationBarLeading) {
-                    Button("Close", systemImage: "xmark") {
-                        dismiss()
-                    }
-                    .labelStyle(.iconOnly)
-                    .tint(.secondary)
-                }
-            }
-        }
     }
 }
 
@@ -1207,64 +1376,6 @@ struct DmSettingsSheet: View {
                 .interactiveDismissDisabled()
                 .presentationDetents([.medium, .large])
                 .presentationDragIndicator(.visible)
-            }
-        }
-    }
-}
-
-// MARK: - Pinned Messages Sheet
-
-struct PinnedMessagesSheet: View {
-    let messages: [ChannelMessage]
-    @Environment(\.dismiss) private var dismiss
-    @Environment(\.theme) private var theme
-    
-    var body: some View {
-        NavigationStack {
-            Group {
-                if messages.isEmpty {
-                    ContentUnavailableView {
-                        Label("No pinned messages", systemImage: "pin.slash")
-                    } description: {
-                        Text("Pin important messages for easy reference.")
-                    }
-                } else {
-                    List(messages) { message in
-                        VStack(alignment: .leading, spacing: 4) {
-                            HStack(spacing: 4) {
-                                Image(systemName: "pin.fill")
-                                    .scaledFont(size: 10)
-                                    .foregroundStyle(theme.brandPrimary)
-                                Text(message.senderName)
-                                    .scaledFont(size: 13, weight: .semibold)
-                                    .foregroundStyle(theme.textPrimary)
-                                Spacer()
-                                Text(message.createdAt.chatTimestamp)
-                                    .scaledFont(size: 11)
-                                    .foregroundStyle(theme.textTertiary)
-                            }
-                            
-                            // Use markdown rendering for pinned message content
-                            Text(ChannelMessage.parseMentions(in: message.content))
-                                .scaledFont(size: 14)
-                                .foregroundStyle(theme.textSecondary)
-                                .lineLimit(4)
-                        }
-                        .padding(.vertical, 4)
-                    }
-                    .listStyle(.insetGrouped)
-                }
-            }
-            .navigationTitle("Pinned Messages")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .navigationBarLeading) {
-                    Button("Close", systemImage: "xmark") {
-                        dismiss()
-                    }
-                    .labelStyle(.iconOnly)
-                    .tint(.secondary)
-                }
             }
         }
     }

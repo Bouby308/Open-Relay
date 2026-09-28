@@ -364,7 +364,7 @@ final class KnowledgeManager {
     /// Fetches all server users for the access-control picker.
     func fetchAllUsers() async {
         do {
-            allUsers = try await apiClient.searchUsers()
+            allUsers = try await apiClient.searchAllUsers()
         } catch {
             // Non-critical — editor will show empty picker if this fails
         }

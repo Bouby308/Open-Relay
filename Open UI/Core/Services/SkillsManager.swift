@@ -141,7 +141,7 @@ final class SkillsManager {
 
     func fetchAllUsers() async {
         do {
-            allUsers = try await apiClient.searchUsers()
+            allUsers = try await apiClient.searchAllUsers()
         } catch {
             logger.warning("Failed to fetch users: \(error.localizedDescription)")
         }

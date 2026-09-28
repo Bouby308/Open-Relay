@@ -22,7 +22,7 @@ struct CalendarView: View {
         .interactiveDismissDisabled()
         .task {
             if viewModel == nil, let api = dependencies.apiClient {
-                let vm = CalendarViewModel(apiClient: api)
+                let vm = CalendarViewModel(apiClient: api, userId: dependencies.authViewModel.currentUser?.id)
                 viewModel = vm
                 await vm.load()
             }
@@ -35,6 +35,8 @@ struct CalendarView: View {
 private struct CalendarContentView: View {
     @Bindable var vm: CalendarViewModel
     let onDismiss: () -> Void
+    @Environment(AppDependencyContainer.self) private var dependencies
+    @State private var showCalendars = false
 
     @Environment(\.theme) private var theme
 
@@ -104,6 +106,11 @@ private struct CalendarContentView: View {
             )
         }
         .background(theme.background.ignoresSafeArea())
+        .sheet(isPresented: $showCalendars) {
+            if let user = dependencies.authViewModel.currentUser {
+                CalendarManagementView(vm: vm, userId: user.id, isAdmin: user.role == .admin).themed()
+            }
+        }
         .sheet(isPresented: $vm.showCreateEvent) {
             CreateCalendarEventSheet(vm: vm)
         }
@@ -159,6 +166,8 @@ private struct CalendarContentView: View {
 
                 // View mode picker
                 Menu {
+                    Button("Manage Calendars", systemImage: "calendar") { showCalendars = true }
+                    Divider()
                     ForEach(CalendarViewMode.allCases, id: \.self) { mode in
                         Button {
                             withAnimation(.spring(response: 0.38, dampingFraction: 0.82)) {

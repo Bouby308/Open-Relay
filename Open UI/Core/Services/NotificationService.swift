@@ -16,29 +16,30 @@ final class NotificationService: NSObject, @unchecked Sendable {
     private let logger = Logger(subsystem: "com.openui", category: "Notifications")
 
     // MARK: - Notification Identifiers
+    // Plain string constants — nonisolated so the nonisolated delegate callbacks can read them.
 
     /// Category for chat generation complete notifications.
-    static let generationCompleteCategory = "GENERATION_COMPLETE"
+    nonisolated static let generationCompleteCategory = "GENERATION_COMPLETE"
 
     /// Category for voice call notifications.
-    static let voiceCallCategory = "VOICE_CALL"
+    nonisolated static let voiceCallCategory = "VOICE_CALL"
 
     /// Category for channel message notifications.
-    static let channelMessageCategory = "CHANNEL_MESSAGE"
+    nonisolated static let channelMessageCategory = "CHANNEL_MESSAGE"
 
     /// Category for streaming interrupted notifications.
-    static let streamingInterruptedCategory = "STREAMING_INTERRUPTED"
+    nonisolated static let streamingInterruptedCategory = "STREAMING_INTERRUPTED"
 
     /// Action to open the chat from a notification.
-    static let openChatAction = "OPEN_CHAT"
+    nonisolated static let openChatAction = "OPEN_CHAT"
 
     /// Action to end a voice call from a notification.
-    static let endCallAction = "END_CALL"
+    nonisolated static let endCallAction = "END_CALL"
 
     /// Action to open a channel from a notification.
-    static let openChannelAction = "OPEN_CHANNEL"
+    nonisolated static let openChannelAction = "OPEN_CHANNEL"
     /// Text-input "Reply" on finished-reply and channel notifications.
-    static let replyAction = "REPLY"
+    nonisolated static let replyAction = "REPLY"
 
     // MARK: - State
 

@@ -3,7 +3,6 @@ import PhotosUI
 import QuickLook
 import MarkdownView
 import os.log
-import ReactionContextMenu
 
 /// Channel chat view with:
 /// - Markdown rendering for all message content
@@ -15,11 +14,14 @@ import ReactionContextMenu
 struct ChannelDetailView: View {
     @Environment(AppDependencyContainer.self) private var dependencies
     @Environment(\.theme) private var theme
+    @Environment(\.dismiss) private var dismiss
     
     @State private var viewModel: ChannelViewModel
     @State private var scrollPosition = ScrollPosition()
     @State private var isScrolledUp = false
-    @State private var lastScrollOffset: CGFloat = 0
+    /// Messages from others that arrived while scrolled up (badge on the scroll FAB).
+    @State private var unseenCount = 0
+@State private var lastScrollOffset: CGFloat = 0
     @State private var contentHeight: CGFloat = 0
     @State private var containerHeight: CGFloat = 0
     @State private var keyboard = KeyboardTracker()
@@ -27,13 +29,9 @@ struct ChannelDetailView: View {
     // Swipe-to-reply / highlight
     @State private var highlightedMessageId: String?
     @State private var swipeOffsets: [String: CGFloat] = [:]
-    @State private var swipeTriggered: Set<String> = []
 
     // iMessage-style reply focus overlay
-    @State private var replyFocusMessage: ChannelMessage?
-    @State private var replyOverlayInputText: String = ""
-    @State private var showReplyOverlay: Bool = false
-    
+
     // @mention picker
     @State private var isShowingMentionPicker = false
     @State private var mentionQuery = ""
@@ -57,10 +55,11 @@ struct ChannelDetailView: View {
     @State private var showEmojiKeyboard = false
     @State private var emojiTargetMessageId: String?
     
-    // ReactionContextMenu state
-    @State private var selectedReaction: String?
-    @State private var reactionTargetMessageId: String?
-    
+    // Glass long-press menu
+    @State private var menuPresenter = MessageMenuPresenter()
+    /// Last known global frame of each row (for lifting the pressed bubble into the menu).
+    @State private var rowFrames: [String: CGRect] = [:]
+
     // Reaction tooltip (MF-003)
     @State private var reactionTooltipText: String?
     @State private var showReactionTooltip = false
@@ -73,7 +72,20 @@ struct ChannelDetailView: View {
     
     // Channel settings
     @State private var showChannelSettings = false
-    
+
+    // Channel info (members / pins / webhooks) + profile card
+    @State private var showChannelInfo = false
+    @State private var showWebhooks = false
+    @State private var profileUserId: String?
+
+    // `/` prompt picker
+    @State private var isShowingPromptPicker = false
+    @State private var promptQuery = ""
+
+    /// iPad (regular width) shows threads in a trailing side panel like the web's ResizableSidePanel.
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
+    private var usesThreadPanel: Bool { horizontalSizeClass == .regular }
+
     // Error alerts (SEC-005 fix)
     @State private var showOperationError = false
     @State private var operationErrorMessage = ""
@@ -98,53 +110,84 @@ struct ChannelDetailView: View {
     }
     
     var body: some View {
+        HStack(spacing: 0) {
+            channelColumn
+            if usesThreadPanel, let parent = viewModel.threadParentMessage {
+                Divider()
+                ThreadDetailSheet(
+                    viewModel: viewModel,
+                    parentMessage: parent,
+                    isPanel: true,
+                    onClose: { withAnimation(.spring(response: 0.35, dampingFraction: 0.86)) { viewModel.closeThread() } },
+                    onShowProfile: { profileUserId = $0 }
+                )
+                .frame(width: 400)
+                .id(parent.id)
+                .transition(.move(edge: .trailing).combined(with: .opacity))
+            }
+        }
+        .animation(.spring(response: 0.35, dampingFraction: 0.86), value: usesThreadPanel ? viewModel.threadParentMessage?.id : nil)
+        .navigationBarHidden(true)
+        .sheet(isPresented: Binding(
+            get: { profileUserId != nil },
+            set: { if !$0 { profileUserId = nil } }
+        )) {
+            if let userId = profileUserId {
+                ChannelProfileSheet(
+                    userId: userId,
+                    viewModel: viewModel,
+                    onMessage: { dmChannelId in
+                        profileUserId = nil
+                        // Server may have just created the DM — refresh the sidebar list.
+                        dependencies.socketService?.emit("join-channels", data: ["auth": ["token": viewModel.serverAuthToken ?? ""]])
+                        Task { await channelListVM?.refreshChannels() }
+                        guard dmChannelId != viewModel.channelId else { return }
+                        NotificationCenter.default.post(name: .navigateToChannel, object: dmChannelId)
+                    }
+                )
+                .presentationDetents([.medium, .large])
+                .presentationDragIndicator(.visible)
+            }
+        }
+        .sheet(isPresented: Binding(
+            get: { viewModel.pendingPromptForVariables != nil },
+            set: { if !$0 { viewModel.cancelPromptVariables() } }
+        )) {
+            if let prompt = viewModel.pendingPromptForVariables {
+                PromptVariableSheet(
+                    promptName: prompt.name,
+                    variables: viewModel.pendingPromptVariables,
+                    onSave: { values in viewModel.submitPromptVariables(values: values) },
+                    onCancel: { viewModel.cancelPromptVariables() }
+                )
+            }
+        }
+    }
+
+    /// The channel timeline + glass chrome (the whole screen on iPhone).
+    private var channelColumn: some View {
+        channelLifecycleLayer
+    }
+
+    /// Base layer: timeline + glass chrome + menu host.
+    private var channelBaseLayer: some View {
         ZStack {
             theme.background.ignoresSafeArea()
             messageListArea
         }
-        .modifier(ContextMenuHost())
-        .environment(\.reactionProvider, ChannelReactionProvider())
-        .onChange(of: selectedReaction) { _, newEmoji in
-            guard let emoji = newEmoji, let msgId = reactionTargetMessageId else { return }
-            selectedReaction = nil
-            reactionTargetMessageId = nil
-            if emoji == "➕" {
-                emojiTargetMessageId = msgId
-                showEmojiKeyboard = true
-            } else {
-                Task { await viewModel.toggleReaction(messageId: msgId, emoji: emoji) }
-                Haptics.play(.light)
-            }
-        }
-        .safeAreaInset(edge: .bottom, spacing: 0) {
-            VStack(spacing: 0) {
-                if let replyMsg = viewModel.replyToMessage {
-                    replyPreviewBar(replyMsg)
-                }
-                if viewModel.mentionedModelName != nil {
-                    modelMentionBar
-                }
-                // Typing indicator — show when others are typing
-                if !viewModel.typingUsers.isEmpty {
-                    typingIndicatorBar
-                }
-                // MF-005: Only show input if user has write access
-                if viewModel.hasWriteAccess {
-                    channelInputField
-                } else {
-                    readOnlyBanner
-                }
-            }
-            .background(theme.background)
-        }
-        // iMessage-style reply focus overlay
-        .overlay {
-            if showReplyOverlay, let msg = replyFocusMessage {
-                replyFocusOverlay(for: msg)
-                    .ignoresSafeArea()
-                    .transition(.opacity)
-            }
-        }
+        .modifier(ChannelDeleteConfirmation(viewModel: viewModel))
+        .chatChromeBar(edge: .top) { channelTopBar }
+        .chatChromeBar(edge: .bottom) { bottomChrome }
+        .statusBarGlassBackdrop(background: theme.background)
+        // After the chrome so the scrim covers the header/composer and the
+        // card is never drawn behind the input bar.
+        .modifier(MessageMenuHost(presenter: menuPresenter))
+
+    }
+
+    /// Mention / channel pickers.
+    private var channelPickerLayer: some View {
+        channelBaseLayer
         .overlay(alignment: .bottom) {
             if isShowingChannelPicker {
                 ChannelLinkPickerView(
@@ -168,7 +211,7 @@ struct ChannelDetailView: View {
             if isShowingMentionPicker {
                 UserModelPickerView(
                     query: mentionQuery,
-                    members: viewModel.members,
+                    members: viewModel.mentionCandidates(for: mentionQuery),
                     models: viewModel.availableModels,
                     serverBaseURL: viewModel.serverBaseURL,
                     authToken: viewModel.serverAuthToken,
@@ -191,21 +234,56 @@ struct ChannelDetailView: View {
                 .animation(.easeOut(duration: 0.2), value: isShowingMentionPicker)
             }
         }
+    }
+
+    /// Sheets (thread, members, pins, webhooks, settings, attachments) and overlays.
+    private var channelSheetLayer: some View {
+        channelPickerLayer
         .sheet(isPresented: Binding(
-            get: { viewModel.threadParentMessage != nil },
+            get: { !usesThreadPanel && viewModel.threadParentMessage != nil },
             set: { if !$0 { viewModel.closeThread() } }
         )) {
             if let parent = viewModel.threadParentMessage {
-                ThreadDetailSheet(viewModel: viewModel, parentMessage: parent)
-                    .presentationDetents([.large, .fraction(0.92)])
-                    .presentationDragIndicator(.visible)
+                ThreadDetailSheet(
+                    viewModel: viewModel,
+                    parentMessage: parent,
+                    onShowProfile: { userId in
+                        viewModel.closeThread()
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { profileUserId = userId }
+                    }
+                )
+                .presentationDetents([.large, .fraction(0.92)])
+                .presentationDragIndicator(.visible)
             }
         }
         .sheet(isPresented: $viewModel.showMembersSheet) {
-            ChannelMembersSheet(members: viewModel.members, isLoading: viewModel.isLoadingMembers, serverBaseURL: viewModel.serverBaseURL)
+            ChannelMembersSheet(
+                viewModel: viewModel,
+                onShowProfile: { userId in
+                    viewModel.showMembersSheet = false
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { profileUserId = userId }
+                }
+            )
+            .presentationDetents([.medium, .large])
+            .presentationDragIndicator(.visible)
         }
         .sheet(isPresented: $viewModel.showPinnedSheet) {
-            PinnedMessagesSheet(messages: viewModel.pinnedMessages)
+            PinnedMessagesSheet(
+                viewModel: viewModel,
+                onJump: { messageId in
+                    viewModel.showPinnedSheet = false
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+                        scrollToAndHighlight(messageId: messageId)
+                    }
+                }
+            )
+            .presentationDetents([.medium, .large])
+            .presentationDragIndicator(.visible)
+        }
+        .sheet(isPresented: $showWebhooks) {
+            ChannelWebhooksSheet(viewModel: viewModel)
+                .presentationDetents([.medium, .large])
+                .presentationDragIndicator(.visible)
         }
         // Channel settings sheet (SEC-005: error handling)
         .sheet(isPresented: $showChannelSettings, onDismiss: {
@@ -310,9 +388,23 @@ struct ChannelDetailView: View {
             .presentationDetents([.medium])
             .presentationDragIndicator(.hidden)
         }
-        .navigationBarTitleDisplayMode(.inline)
-        .toolbar { toolbarContent }
-        .overlay(alignment: .top) {
+        .overlay(alignment: .bottom) {
+            if isShowingPromptPicker {
+                PromptPickerView(
+                    query: promptQuery,
+                    prompts: viewModel.availablePrompts,
+                    isLoading: viewModel.isLoadingPrompts,
+                    keyboardHeight: keyboard.height,
+                    onSelect: { prompt in
+                        viewModel.selectPrompt(prompt, isThread: false)
+                        dismissPromptPicker()
+                    },
+                    onDismiss: { dismissPromptPicker() }
+                )
+                .transition(.move(edge: .bottom).combined(with: .opacity))
+            }
+        }
+.overlay(alignment: .top) {
             if viewModel.showCopiedToast {
                 copiedToast
             }
@@ -331,6 +423,11 @@ struct ChannelDetailView: View {
                     .transition(.opacity.combined(with: .move(edge: .bottom)))
             }
         }
+    }
+
+    /// Lifecycle, alerts, link handling and the inline emoji keyboard.
+    private var channelLifecycleLayer: some View {
+        channelSheetLayer
         .task {
             keyboard.start()
             // Mark this channel as the active one so the list VM suppresses badge increments
@@ -346,7 +443,8 @@ struct ChannelDetailView: View {
                 viewModel.configure(
                     apiClient: apiClient,
                     socket: dependencies.socketService,
-                    currentUserId: userId
+                    currentUserId: userId,
+                    isAdmin: dependencies.authViewModel.currentUser?.role == .admin
                 )
                 if userId == nil {
                     Logger(subsystem: "com.openui", category: "ChannelDetailView")
@@ -426,6 +524,7 @@ struct ChannelDetailView: View {
         .background {
             InlineEmojiKeyboard(isActive: $showEmojiKeyboard) { emoji in
                 if let messageId = emojiTargetMessageId {
+                    RecentReactions.record(emoji)
                     Task { await viewModel.toggleReaction(messageId: messageId, emoji: emoji) }
                     Haptics.play(.light)
                 }
@@ -435,7 +534,7 @@ struct ChannelDetailView: View {
             .allowsHitTesting(false)
         }
     }
-    
+
     // MARK: - Error Surfacing (SEC-005)
     
     @MainActor
@@ -444,145 +543,257 @@ struct ChannelDetailView: View {
         showOperationError = true
     }
     
-    // MARK: - Toolbar
-    
-    @ToolbarContentBuilder
-    private var toolbarContent: some ToolbarContent {
-        // Hamburger — only shown when wired from the drawer parent.
-        // Matches ChatDetailView exactly: 46×46 circle, line.3.horizontal icon,
-        // surfaceContainer background, .plain style, .contentShape(Circle()).
-        if let drawerAction = toggleDrawerAction {
-            ToolbarItem(placement: .topBarLeading) {
+    // MARK: - Glass Top Bar
+    //
+    // Mirrors ChatDetailView.customTopBar: hamburger in a glass circle, a tappable
+    // glass title pill (opens channel info), and one grouped glass pill for actions.
+
+    private var channelTopBar: some View {
+        HStack(spacing: Spacing.sm) {
+            if let drawerAction = toggleDrawerAction {
                 Button {
                     drawerAction()
                 } label: {
                     Image(systemName: "line.3.horizontal")
                         .scaledFont(size: 18, weight: .medium, context: .ui)
+                        .foregroundStyle(theme.textPrimary)
+                        .frame(width: 40, height: 40)
+                        .contentShape(Circle())
                 }
                 .buttonStyle(.plain)
+                .chatControlGlass(in: Circle(), fallback: .ultraThinMaterial)
                 .accessibilityLabel("Menu")
-            }
-        }
-        ToolbarItem(placement: .principal) {
-            if viewModel.isDM {
-                dmToolbarTitle
-            } else if viewModel.isGroup {
-                groupToolbarTitle
             } else {
-                standardToolbarTitle
+                // Pushed inside a NavigationStack (ChannelsListView): the system bar is
+                // hidden, so provide a glass back button.
+                Button {
+                    dismiss()
+                } label: {
+                    Image(systemName: "chevron.left")
+                        .scaledFont(size: 16, weight: .semibold, context: .ui)
+                        .foregroundStyle(theme.textPrimary)
+                        .frame(width: 40, height: 40)
+                        .contentShape(Circle())
+                }
+                .buttonStyle(.plain)
+                .chatControlGlass(in: Circle(), fallback: .ultraThinMaterial)
+                .accessibilityLabel("Back")
+            }
+
+            Button {
+                Haptics.play(.light)
+                openChannelInfo()
+            } label: {
+                titlePillContent
+                    .padding(.leading, viewModel.isDM ? 5 : 12)
+                    .padding(.trailing, 12)
+                    .padding(.vertical, 5)
+                    .frame(minHeight: 40)
+                    .contentShape(Capsule())
+            }
+            .buttonStyle(.plain)
+            .chatControlGlass(in: Capsule(), fallback: .ultraThinMaterial)
+            .frame(maxWidth: .infinity)
+            .accessibilityLabel("\(viewModel.channelDisplayTitle), channel info")
+
+            trailingActionsPill
+        }
+        .padding(.horizontal, Spacing.sm)
+        .padding(.bottom, 8)
+    }
+
+    @ViewBuilder
+    private var titlePillContent: some View {
+        HStack(spacing: 8) {
+            if viewModel.isDM {
+                dmAvatarStack(size: 30)
+            } else if let channel = viewModel.channel {
+                Image(systemName: channel.isPrivate ? "lock" : (channel.type == .group ? "person.3" : "number"))
+                    .scaledFont(size: 12, weight: .semibold)
+                    .foregroundStyle(theme.textTertiary)
+            }
+            VStack(alignment: .leading, spacing: 0) {
+                Text(viewModel.channelDisplayTitle)
+                    .scaledFont(size: 14, weight: .semibold)
+                    .foregroundStyle(theme.textPrimary)
+                    .lineLimit(1)
+                if let subtitle = titleSubtitle {
+                    Text(subtitle.text)
+                        .scaledFont(size: 10.5)
+                        .foregroundStyle(subtitle.isActive ? Color.green : theme.textTertiary)
+                        .lineLimit(1)
+                        .contentTransition(.opacity)
+                }
+            }
+            .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    /// "Active now" for 1:1 DMs, the DM user's status, or "N members" for channels.
+    private var titleSubtitle: (text: String, isActive: Bool)? {
+        if viewModel.isDM {
+            guard let p = viewModel.dmOtherParticipant else { return nil }
+            if let msg = p.statusMessage, !msg.isEmpty {
+                return ("\(p.statusEmojiCharacter.map { "\($0) " } ?? "")\(msg)", false)
+            }
+            return (p.isOnline ? "Active now" : "Away", p.isOnline)
+        }
+        let count = viewModel.memberCount
+        if count > 0 { return ("\(count) member\(count == 1 ? "" : "s")", false) }
+        if let desc = viewModel.channel?.description, !desc.isEmpty { return (desc, false) }
+        return nil
+    }
+
+    @ViewBuilder
+    private func dmAvatarStack(size: CGFloat) -> some View {
+        let participants = Array(viewModel.dmParticipants.prefix(2))
+        ZStack(alignment: .bottomTrailing) {
+            HStack(spacing: -size * 0.4) {
+                ForEach(participants) { p in
+                    UserAvatar(
+                        size: size,
+                        imageURL: p.resolveAvatarURL(serverBaseURL: viewModel.serverBaseURL),
+                        name: p.displayName,
+                        authToken: viewModel.serverAuthToken
+                    )
+                    .overlay(Circle().stroke(theme.background, lineWidth: participants.count > 1 ? 1.5 : 0))
+                }
+            }
+            if participants.count == 1, let p = participants.first {
+                Circle()
+                    .fill(p.isOnline ? Color.green : Color.gray.opacity(0.5))
+                    .frame(width: 9, height: 9)
+                    .overlay(Circle().stroke(theme.background, lineWidth: 1.5))
+                    .offset(x: 1, y: 1)
             }
         }
-        ToolbarItemGroup(placement: .topBarTrailing) {
-            Button {
+    }
+
+    private var trailingActionsPill: some View {
+        HStack(spacing: 0) {
+            pillIconButton(icon: "pin", label: "Pinned messages") {
                 Task { await viewModel.loadPinnedMessages() }
                 viewModel.showPinnedSheet = true
-            } label: {
-                Image(systemName: "pin")
-                    .scaledFont(size: 13, weight: .medium)
             }
-            
+
             Button {
-                Task { await viewModel.loadMembers() }
-                viewModel.showMembersSheet = true
+                Haptics.play(.light)
+                openMembers()
             } label: {
-                Image(systemName: "person.2")
-                    .scaledFont(size: 13, weight: .medium)
-            }
-            
-            if viewModel.canManageChannel {
-                Button {
-                    Task {
-                        async let channelRefresh: () = viewModel.loadChannel()
-                        async let usersRefresh: () = viewModel.loadAllServerUsers()
-                        _ = await (channelRefresh, usersRefresh)
-                        showChannelSettings = true
+                HStack(spacing: 3) {
+                    Image(systemName: "person.2")
+                        .scaledFont(size: 14, weight: .medium)
+                    if viewModel.memberCount > 0 && !viewModel.isDM {
+                        Text(compactCount(viewModel.memberCount))
+                            .scaledFont(size: 12, weight: .semibold)
+                            .contentTransition(.numericText())
                     }
-                } label: {
-                    Image(systemName: "gearshape")
-                        .scaledFont(size: 13, weight: .medium)
                 }
+                .foregroundStyle(theme.textSecondary)
+                .padding(.horizontal, 8)
+                .frame(minWidth: 40, minHeight: 40)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Members")
+
+            Menu {
+                channelMenuItems
+            } label: {
+                Image(systemName: "ellipsis")
+                    .scaledFont(size: 16, weight: .medium)
+                    .foregroundStyle(theme.textSecondary)
+                    .frame(width: 40, height: 40)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("More channel actions")
+        }
+        .chatControlGlass(in: RoundedRectangle(cornerRadius: 22, style: .continuous), fallback: .ultraThinMaterial)
+    }
+
+    @ViewBuilder
+    private var channelMenuItems: some View {
+        Button {
+            openChannelInfo()
+        } label: {
+            Label(viewModel.isDM ? "Conversation Info" : "Members", systemImage: viewModel.isDM ? "info.circle" : "person.2")
+        }
+        if viewModel.canManageChannel {
+            Button {
+                openSettings()
+            } label: {
+                Label(viewModel.isDM ? "Conversation Settings" : "Channel Settings", systemImage: "gearshape")
+            }
+        }
+        if viewModel.canManageChannel && !viewModel.isDM {
+            Button {
+                showWebhooks = true
+            } label: {
+                Label("Webhooks", systemImage: "link.badge.plus")
+            }
+        }
+        Button {
+            UIPasteboard.general.string = "\(viewModel.serverBaseURL)/channels/\(viewModel.channelId)"
+            Haptics.notify(.success)
+        } label: {
+            Label("Copy Link", systemImage: "link")
+        }
+        if viewModel.isDM {
+            Divider()
+            Button(role: .destructive) {
+                Task {
+                    try? await dependencies.apiClient?.updateMemberActiveStatus(channelId: viewModel.channelId, isActive: false)
+                    channelListVM?.hideDM(channelId: viewModel.channelId)
+                }
+            } label: {
+                Label("Hide Conversation", systemImage: "eye.slash")
             }
         }
     }
-    
-    // MARK: - Type-Specific Toolbar Titles
-    
-    private var dmToolbarTitle: some View {
-        HStack(spacing: 8) {
-            if let participant = viewModel.dmOtherParticipant {
-                ZStack(alignment: .bottomTrailing) {
-                    UserAvatar(
-                        size: 28,
-                        imageURL: participant.resolveAvatarURL(serverBaseURL: viewModel.serverBaseURL),
-                        name: participant.displayName
-                    )
-                    Circle()
-                        .fill(participant.isOnline ? Color.green : Color.gray.opacity(0.5))
-                        .frame(width: 8, height: 8)
-                        .overlay(Circle().stroke(theme.background, lineWidth: 1.5))
-                        .offset(x: 2, y: 2)
-                }
-            }
-            VStack(alignment: .leading, spacing: 1) {
-                Text(viewModel.channelDisplayTitle)
-                    .scaledFont(size: 15, weight: .semibold)
-                    .foregroundStyle(theme.textPrimary)
-                    .lineLimit(1)
-                if let participant = viewModel.dmOtherParticipant {
-                    Text(participant.isOnline ? "Active now" : "Offline")
-                        .scaledFont(size: 11)
-                        .foregroundStyle(participant.isOnline ? .green : theme.textTertiary)
-                }
-            }
+
+    private func pillIconButton(icon: String, label: String, action: @escaping () -> Void) -> some View {
+        Button {
+            Haptics.play(.light)
+            action()
+        } label: {
+            Image(systemName: icon)
+                .scaledFont(size: 15, weight: .medium)
+                .foregroundStyle(theme.textSecondary)
+                .frame(width: 40, height: 40)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(label)
+    }
+
+    private func compactCount(_ n: Int) -> String {
+        n.formatted(.number.notation(.compactName))
+    }
+
+    private func openMembers() {
+        viewModel.searchMembers("", debounce: false)
+        Task { await viewModel.loadMembers() }
+        viewModel.showMembersSheet = true
+    }
+
+    private func openChannelInfo() {
+        if viewModel.isDM, let other = viewModel.dmOtherParticipant {
+            profileUserId = other.id
+        } else {
+            openMembers()
         }
     }
-    
-    private var groupToolbarTitle: some View {
-        VStack(spacing: 1) {
-            HStack(spacing: 4) {
-                Image(systemName: "person.3")
-                    .scaledFont(size: 11, weight: .semibold)
-                    .foregroundStyle(theme.textTertiary)
-                Text(viewModel.channel?.name ?? "Group")
-                    .scaledFont(size: 15, weight: .semibold)
-                    .foregroundStyle(theme.textPrimary)
-                    .lineLimit(1)
-            }
-            if !viewModel.members.isEmpty {
-                Text("\(viewModel.members.count) members")
-                    .scaledFont(size: 11)
-                    .foregroundStyle(theme.textTertiary)
-            } else if let desc = viewModel.channel?.description, !desc.isEmpty {
-                Text(desc)
-                    .scaledFont(size: 11)
-                    .foregroundStyle(theme.textTertiary)
-                    .lineLimit(1)
-            }
+
+    private func openSettings() {
+        Task {
+            async let channelRefresh: () = viewModel.loadChannel()
+            async let usersRefresh: () = viewModel.loadAllServerUsers()
+            _ = await (channelRefresh, usersRefresh)
+            showChannelSettings = true
         }
     }
-    
-    private var standardToolbarTitle: some View {
-        VStack(spacing: 1) {
-            HStack(spacing: 4) {
-                if let channel = viewModel.channel {
-                    Image(systemName: channel.isPrivate ? "lock" : "number")
-                        .scaledFont(size: 11, weight: .semibold)
-                        .foregroundStyle(theme.textTertiary)
-                }
-                Text(viewModel.channel?.name ?? "Channel")
-                    .scaledFont(size: 15, weight: .semibold)
-                    .foregroundStyle(theme.textPrimary)
-                    .lineLimit(1)
-            }
-            if let desc = viewModel.channel?.description, !desc.isEmpty {
-                Text(desc)
-                    .scaledFont(size: 11)
-                    .foregroundStyle(theme.textTertiary)
-                    .lineLimit(1)
-            }
-        }
-    }
-    
+
     // MARK: - Message List
     
     private var messageListArea: some View {
@@ -597,8 +808,15 @@ struct ChannelDetailView: View {
                 emptyChannelView
             }
         }
-        .overlay(alignment: .bottomTrailing) { scrollToBottomFAB }
+        .overlay(alignment: .bottom) { scrollToBottomFAB }
         .onAppear { scrollPosition.scrollTo(edge: .bottom) }
+        // iMessage behaviour: opening the keyboard keeps the latest message visible.
+        .onChange(of: keyboard.height > 0) { _, isShown in
+            guard isShown, !isScrolledUp else { return }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                withAnimation(.easeOut(duration: 0.25)) { scrollPosition.scrollTo(edge: .bottom) }
+            }
+        }
         .onChange(of: viewModel.messages.count) { old, new in
             guard new > old else { return }
             // Always scroll when the user sends their own message (last message is theirs).
@@ -611,6 +829,13 @@ struct ChannelDetailView: View {
                 withAnimation { scrollPosition.scrollTo(edge: .bottom) }
             }
         }
+        .onChange(of: viewModel.messages.last?.id) { oldId, newId in
+            // Only count appends (new arrivals), not older history prepended at the top.
+            guard isScrolledUp, oldId != nil, newId != oldId,
+                  let last = viewModel.messages.last,
+                  last.userId != viewModel.currentUserId else { return }
+            withAnimation(.spring(response: 0.3)) { unseenCount += 1 }
+        }
     }
     
     // MARK: - Swipe-to-Reply Logic
@@ -618,69 +843,121 @@ struct ChannelDetailView: View {
     /// Threshold (pts) at which swipe triggers the reply action.
     private let swipeReplyThreshold: CGFloat = 64
 
-    /// Returns the swipe offset for a given message, clamped to a max so it bounces back.
+    /// Distance (pts) from the bottom at which the scroll-to-bottom button appears.
+    private static let fabShowDistance: CGFloat = 250
+    /// Distance (pts) from the bottom below which the button hides again.
+    private static let fabHideDistance: CGFloat = 200
+
+    /// Current swipe offset for a row (rubber-banded by the gesture).
     private func swipeOffset(for id: String) -> CGFloat {
-        min(swipeOffsets[id] ?? 0, swipeReplyThreshold * 1.1)
+        swipeOffsets[id] ?? 0
     }
 
-    /// Handles swipe drag change — moves the bubble and shows the reply icon.
-    private func onSwipeChanged(_ value: DragGesture.Value, messageId: String) {
-        let translation = value.translation.width
-        // Only allow right-swipe (positive x)
-        guard translation > 0 else { return }
-        let clamped = min(translation, swipeReplyThreshold * 1.5)
-        swipeOffsets[messageId] = clamped
-
-        // Trigger haptic once we cross the threshold
-        if clamped >= swipeReplyThreshold && !(swipeTriggered.contains(messageId)) {
-            swipeTriggered.insert(messageId)
-            Haptics.play(.medium)
-        } else if clamped < swipeReplyThreshold {
-            swipeTriggered.remove(messageId)
+/// Starts a reply to `message`: sets the composer's reply chip and focuses it.
+    private func beginReply(to message: ChannelMessage) {
+        viewModel.setReplyTo(message)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+            NotificationCenter.default.post(name: .chatInputFieldRequestFocus, object: nil)
         }
     }
 
-    /// Handles swipe drag end — fires the iMessage-style reply overlay if threshold crossed.
-    private func onSwipeEnded(_ value: DragGesture.Value, message: ChannelMessage) {
-        let translation = value.translation.width
-        if translation >= swipeReplyThreshold {
-            // Show the iMessage-style focused reply overlay
-            replyFocusMessage = message
-            replyOverlayInputText = ""
-            withAnimation(.spring(response: 0.4, dampingFraction: 0.85)) {
-                showReplyOverlay = true
+    // MARK: - Glass Long-Press Menu
+
+    /// Builds and presents the glass menu for `message` (reactions + actions).
+    private func presentMenu(for message: ChannelMessage, isCurrentUser: Bool,
+                             showHeader: Bool, showTimestamp: Bool, position: GroupPosition) {
+        guard let frame = rowFrames[message.id] else { return }
+        let uid = viewModel.currentUserId ?? ""
+        let own = Set(message.reactions.filter { $0.userIds.contains(uid) }.map { $0.name.emojiFromShortcode })
+        let canWrite = viewModel.hasWriteAccess
+
+        var quick: [MessageMenuAction] = []
+        if canWrite {
+            quick.append(.init(id: "reply", title: "Reply", icon: "arrowshape.turn.up.left") {
+                beginReply(to: message)
+            })
+        }
+        quick.append(.init(id: "thread", title: message.hasThread || canWrite ? "Thread" : "View",
+                           icon: "bubble.left.and.bubble.right") {
+            Task { await viewModel.openThread(for: message) }
+        })
+        quick.append(.init(id: "copy", title: "Copy", icon: "doc.on.doc") {
+            viewModel.copyMessage(message)
+        })
+        quick.append(.init(id: "pin", title: message.isPinned ? "Unpin" : "Pin",
+                           icon: message.isPinned ? "pin.slash" : "pin") {
+            Task { await viewModel.togglePin(messageId: message.id) }
+        })
+
+        var info: [MessageMenuAction] = [
+            .init(id: "time", title: message.createdAt.formatted(date: .abbreviated, time: .shortened), icon: "clock") {
+                UIPasteboard.general.string = message.createdAt.formatted(date: .complete, time: .standard)
+                Haptics.notify(.success)
             }
-            Haptics.play(.light)
+        ]
+        if !isModelOrWebhook(message) && !message.isFromModel {
+            info.append(.init(id: "profile", title: "View Profile", icon: "person.crop.circle") {
+                profileUserId = message.userId
+            })
         }
-        withAnimation(.spring(response: 0.35, dampingFraction: 0.7)) {
-            swipeOffsets[message.id] = 0
+        var sections: [[MessageMenuAction]] = [info]
+        if viewModel.canModify(message) {
+            sections.append([
+                .init(id: "edit", title: "Edit", icon: "pencil") { viewModel.beginEditing(message: message) },
+                .init(id: "delete", title: "Delete", icon: "trash", style: .destructive) {
+                    viewModel.pendingDeleteMessage = message
+                }
+            ])
         }
-        swipeTriggered.remove(message.id)
+
+        let preview = channelMessageRow(message, showSenderHeader: showHeader,
+                                        showGroupTimestamp: showTimestamp, position: position)
+            .environment(\.theme, theme)
+            .frame(width: frame.width)
+        menuPresenter.present(MessageMenuContent(
+            messageId: message.id,
+            preview: AnyView(preview),
+            sourceFrame: frame,
+            alignTrailing: isCurrentUser,
+            header: "\(viewModel.resolvedSenderName(for: message)) · \(message.createdAt.channelTime)",
+            ownReactions: own,
+            showsReactions: canWrite,
+            quickActions: quick,
+            sections: sections,
+            onReact: { emoji in
+                Task { await viewModel.toggleReaction(messageId: message.id, emoji: emoji) }
+            },
+            onMoreReactions: {
+                emojiTargetMessageId = message.id
+                showEmojiKeyboard = true
+            }
+        ))
     }
 
-    /// Dismiss the reply overlay with a smooth keyboard-first animation.
-    private func dismissReplyOverlay() {
-        // Step 1: resign keyboard so it slides away smoothly first
-        UIApplication.shared.sendAction(
-            #selector(UIResponder.resignFirstResponder),
-            to: nil, from: nil, for: nil
-        )
-        // Step 2: wait for keyboard to finish descending (~0.25s), then fade overlay
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
-            withAnimation(.easeOut(duration: 0.25)) {
-                showReplyOverlay = false
-            }
-        }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.55) {
-            replyFocusMessage = nil
-            replyOverlayInputText = ""
-        }
+    private func isModelOrWebhook(_ message: ChannelMessage) -> Bool {
+        viewModel.isModelMessage(message) || message.isFromWebhook
     }
 
     // MARK: - Scroll + Highlight
 
     /// Scrolls to and briefly highlights the original message referenced by a reply.
     private func scrollToAndHighlight(messageId: String) {
+        guard viewModel.messages.contains(where: { $0.id == messageId }) else {
+            // Not in the loaded timeline (older history or a thread reply) — open its thread if
+            // it's a reply; otherwise surface a hint.
+            if let pinned = viewModel.pinnedMessages.first(where: { $0.id == messageId }),
+               let parentId = pinned.parentId,
+               let parent = viewModel.messages.first(where: { $0.id == parentId }) {
+                Task { await viewModel.openThread(for: parent) }
+            } else {
+                reactionTooltipText = "That message is further back in the history"
+                withAnimation { showReactionTooltip = true }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+                    withAnimation { showReactionTooltip = false }
+                }
+            }
+            return
+        }
         // Scroll to the message
         withAnimation(.easeInOut(duration: 0.35)) {
             scrollPosition.scrollTo(id: messageId, anchor: .center)
@@ -707,6 +984,10 @@ struct ChannelDetailView: View {
                         .controlSize(.small)
                         .padding(.vertical, Spacing.md)
                 }
+
+                if viewModel.reachedChannelStart && !viewModel.messages.isEmpty {
+                    channelStartHeader
+                }
                 
                 ForEach(Array(viewModel.messages.enumerated()), id: \.element.id) { index, message in
                     if shouldShowDateSeparator(at: index) {
@@ -718,87 +999,76 @@ struct ChannelDetailView: View {
                     let position = groupPosition(at: index)
                     let isHighlighted = highlightedMessageId == message.id
                     let offset = swipeOffset(for: message.id)
-                    let swipeProgress = min(offset / swipeReplyThreshold, 1.0)
+                    let swipeProgress = min(abs(offset) / swipeReplyThreshold, 1.0)
                     let isCurrentUser = message.userId == viewModel.currentUserId && !viewModel.isModelMessage(message)
 
-                    // ZStack: message row fills full width; swipe icon is an overlay
-                    // pinned to the leading (received) or trailing (sent) edge.
-                    // This prevents the icon slot from stealing horizontal space from
-                    // the message content, fixing the uneven width issue.
                     ZStack(alignment: isCurrentUser ? .trailing : .leading) {
-                        channelMessageRow(message, showSenderHeader: showHeader, showGroupTimestamp: showTimestamp, position: position)
-                            .offset(x: offset)
-                            .background(
-                                isHighlighted
-                                    ? theme.brandPrimary.opacity(0.12)
-                                    : Color.clear
-                            )
-                            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-
-                        // Reply icon — fades/scales in as swipe progresses
+                        // Reply icon revealed from the edge the row slides away from
+                        // (own messages slide left, others slide right).
                         SwipeReplyIcon(progress: swipeProgress)
                             .opacity(swipeProgress > 0.05 ? 1 : 0)
-                            .scaleEffect(0.7 + swipeProgress * 0.3)
+                            .scaleEffect(0.6 + swipeProgress * 0.4)
                             .padding(isCurrentUser ? .trailing : .leading, Spacing.screenPadding)
-                            .animation(.easeOut(duration: 0.1), value: swipeProgress)
                             .allowsHitTesting(false)
+
+                        channelMessageRow(message, showSenderHeader: showHeader, showGroupTimestamp: showTimestamp, position: position)
+                            .background {
+                                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                                    .fill(theme.brandPrimary.opacity(isHighlighted ? 0.12 : 0))
+                                    .padding(.horizontal, 6)
+                            }
+                            .offset(x: offset)
                     }
-                    // Swipe gesture lives on the ZStack OUTSIDE CustomContextMenuWrapper
-                    // so it doesn't compete with the long-press context menu gesture.
-                    .simultaneousGesture(
-                        DragGesture(minimumDistance: 10, coordinateSpace: .local)
-                            .onChanged { value in
-                                let dx = value.translation.width
-                                let dy = value.translation.height
-                                // Only activate for clearly-horizontal right-swipes
-                                guard dx > 0, abs(dx) > abs(dy) * 1.2 else {
-                                    // Wrong direction — reset any partial offset
-                                    if swipeOffsets[message.id] != nil {
-                                        withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
-                                            swipeOffsets[message.id] = 0
-                                        }
-                                    }
-                                    return
-                                }
-                                onSwipeChanged(value, messageId: message.id)
-                            }
-                            .onEnded { value in
-                                onSwipeEnded(value, message: message)
-                            }
-                    )
+                    .onGeometryChange(for: CGRect.self) { $0.frame(in: .global) } action: { rowFrames[message.id] = $0 }
+                    .opacity(menuPresenter.content?.messageId == message.id && menuPresenter.isVisible ? 0 : 1)
                     .id(message.id)
                     .task {
-                        if message.id == viewModel.messages.first?.id {
-                            await viewModel.loadOlderMessages()
-                        }
+                        // Reaching the top loads older history; keep the reader's place
+                        // by re-anchoring on the message that was first before the load.
+                        guard message.id == viewModel.messages.first?.id,
+                              !viewModel.reachedChannelStart, !viewModel.isLoadingMore else { return }
+                        let anchorId = message.id
+                        let countBefore = viewModel.messages.count
+                        await viewModel.loadOlderMessages()
+                        guard viewModel.messages.count > countBefore else { return }
+                        var tx = Transaction()
+                        tx.disablesAnimations = true
+                        withTransaction(tx) { scrollPosition.scrollTo(id: anchorId, anchor: .top) }
                     }
                 }
             }
             .padding(.top, 8)
             .padding(.bottom, 8)
             .frame(minHeight: max(containerHeight, 0), alignment: .top)
-            // Prevent keyboard-animation frames from propagating into this subtree.
-            // Each CustomContextMenuWrapper tracks its frame via
-            // onGeometryChange(frame(in: .global)), which fires on every animation
-            // tick. Stripping the animation here reduces N-messages × ~15-frame
-            // state updates per keyboard event down to one — eliminating input lag.
-            // The .padding(.bottom, keyboard.height) on the input bar lives outside
-            // this subtree and continues to animate correctly.
+            // Tapping empty space (between/around messages, or below a short
+            // conversation) closes the keyboard. Attached as a *background* so
+            // bubbles, links and buttons keep first-touch priority.
+            .background {
+                Color.clear
+                    .contentShape(Rectangle())
+                    .onTapGesture { dismissKeyboard() }
+            }
+            // Prevent keyboard-animation frames from propagating into this subtree
+            // (rows track their frames via onGeometryChange), keeping input snappy.
             .transaction { $0.animation = nil }
         }
         .scrollDismissesKeyboard(.interactively)
         .defaultScrollAnchor(.bottom)
         .scrollPosition($scrollPosition, anchor: .bottom)
-        .onScrollGeometryChange(for: CGPoint.self) { geo in
-            geo.contentOffset
-        } action: { _, newOffset in
-            let distFromBottom = max(0, contentHeight - newOffset.y - containerHeight)
-            if distFromBottom <= 120 {
-                if isScrolledUp { isScrolledUp = false }
-            } else if newOffset.y < lastScrollOffset - 40 {
-                if !isScrolledUp { isScrolledUp = true }
+        // One atomic snapshot per frame: distance from the visible bottom accounts
+        // for the glass composer inset, so "scrolled up" is always accurate.
+        .onScrollGeometryChange(for: CGFloat.self) { geo in
+            let visibleBottom = geo.contentOffset.y + geo.containerSize.height - geo.contentInsets.bottom
+            return max(0, geo.contentSize.height - visibleBottom)
+        } action: { _, distance in
+            // Hysteresis: show once clearly away from the latest messages, hide
+            // again as soon as you're back near them (no flicker at the edge).
+            let scrolledUp = isScrolledUp ? distance > Self.fabHideDistance
+                                          : distance > Self.fabShowDistance
+            if scrolledUp != isScrolledUp {
+                withAnimation(.spring(response: 0.3, dampingFraction: 0.85)) { isScrolledUp = scrolledUp }
             }
-            if abs(newOffset.y - lastScrollOffset) > 2 { lastScrollOffset = newOffset.y }
+            if !scrolledUp, unseenCount != 0 { unseenCount = 0 }
         }
         .onScrollGeometryChange(for: CGSize.self) { geo in
             CGSize(width: geo.contentSize.height, height: geo.containerSize.height)
@@ -808,6 +1078,7 @@ struct ChannelDetailView: View {
         }
         .scrollContentBackground(.hidden)
         .background(ScrollViewEdgeEffectDisabler())
+        .background(ChannelScrollHorizontalLock())
     }
     
     // MARK: - Message Grouping
@@ -880,16 +1151,7 @@ struct ChannelDetailView: View {
     // MARK: - Date Separator
     
     private func dateSeparatorView(for date: Date) -> some View {
-        HStack(spacing: 8) {
-            VStack { Divider().background(theme.textTertiary.opacity(0.2)) }
-            Text(date.channelDateSeparator)
-                .scaledFont(size: 11, weight: .semibold)
-                .foregroundStyle(theme.textTertiary)
-                .fixedSize()
-            VStack { Divider().background(theme.textTertiary.opacity(0.2)) }
-        }
-        .padding(.horizontal, Spacing.screenPadding)
-        .padding(.vertical, 10)
+        ChannelDateCapsule(date: date)
     }
     
     @ViewBuilder
@@ -903,29 +1165,31 @@ struct ChannelDetailView: View {
         let bubbleAlignment: HorizontalAlignment = isCurrentUser ? .trailing : .leading
         let frameAlignment: Alignment = isCurrentUser ? .trailing : .leading
         
-        CustomContextMenuWrapper(
-            hapticTouchDuration: .default,
-            contextMenuAppearingSide: .leading,
-            selectedReaction: Binding(
-                get: { selectedReaction },
-                set: { newVal in
-                    if let emoji = newVal {
-                        reactionTargetMessageId = message.id
-                        selectedReaction = emoji
-                    }
-                }
-            )
-        ) {
         VStack(alignment: bubbleAlignment, spacing: 0) {
             // Sender header — only shown for received messages (not current user)
             if showSenderHeader && !isCurrentUser {
                 HStack(spacing: 8) {
                     senderAvatar(message, size: avatarSize)
+                        .onTapGesture {
+                            guard !isModel, !message.isFromWebhook else { return }
+                            Haptics.play(.light)
+                            profileUserId = message.userId
+                        }
                     
                     HStack(spacing: 5) {
                         Text(resolvedName)
                             .scaledFont(size: 13, weight: .bold)
                             .foregroundStyle(isModel ? theme.mentionModelText : theme.textPrimary)
+
+                        if message.isFromWebhook {
+                            Text("WEBHOOK")
+                                .scaledFont(size: 8, weight: .heavy)
+                                .foregroundStyle(theme.textSecondary)
+                                .padding(.horizontal, 4)
+                                .padding(.vertical, 1.5)
+                                .background(theme.surfaceContainer)
+                                .clipShape(RoundedRectangle(cornerRadius: 3, style: .continuous))
+                        }
                         
                         if isModel {
                             Text("BOT")
@@ -940,32 +1204,21 @@ struct ChannelDetailView: View {
                         Text(message.createdAt.channelTime)
                             .scaledFont(size: 10)
                             .foregroundStyle(theme.textTertiary)
+                            .accessibilityLabel(message.createdAt.formatted(date: .complete, time: .shortened))
                     }
                 }
                 .padding(.bottom, 3)
             }
             
-            if message.isPinned {
-                HStack(spacing: 4) {
-                    Image(systemName: "pin.fill")
-                        .scaledFont(size: 9)
-                        .rotationEffect(.degrees(45))
-                    Text("Pinned")
-                        .scaledFont(size: 10, weight: .semibold)
-                }
-                .foregroundStyle(.yellow.opacity(0.8))
-                .padding(.bottom, 2)
-            }
-            
             if let replyId = message.replyToId {
                 replyIndicator(for: replyId, message: message)
-                    .frame(maxWidth: UIScreen.main.bounds.width * 0.72, alignment: frameAlignment)
-                    .padding(.bottom, 2)
+                    .frame(maxWidth: ChannelLayout.maxBubbleWidth, alignment: frameAlignment)
+                    .padding(.bottom, 3)
             }
             
             if viewModel.editingMessage?.id == message.id {
                 editBubble(isCurrentUser: isCurrentUser)
-            } else if isModel && message.content.isEmpty && message.files.isEmpty {
+            } else if isModel && message.renderedContent.isEmpty && message.files.isEmpty && !message.isModelDone {
                 // Model is streaming — show animated typing dots while content arrives
                 // This covers the gap between when the empty placeholder message is
                 // created by the backend and when the first token arrives via socket.
@@ -975,17 +1228,19 @@ struct ChannelDetailView: View {
                         .scaledFont(size: 12)
                         .foregroundStyle(theme.textTertiary)
                 }
-                .padding(.horizontal, 14)
-                .padding(.vertical, 9)
-                .background(receivedBubbleBackground)
-                .clipShape(ChannelBubbleShape(isCurrentUser: false, showTail: showTail))
-                .overlay(
-                    ChannelBubbleShape(isCurrentUser: false, showTail: showTail)
-                        .strokeBorder(receivedBubbleBorder, lineWidth: 0.5)
-                )
-            } else if !message.content.isEmpty || !message.files.isEmpty {
-                VStack(alignment: .leading, spacing: 4) {
-                    if !message.content.isEmpty {
+                .modifier(ChannelBubbleStyle(isCurrentUser: false, showTail: showTail))
+            } else if !message.renderedContent.isEmpty || !message.files.isEmpty {
+                VStack(alignment: .leading, spacing: 6) {
+                    if message.hasStructuredOutput {
+                        // Reasoning / tool calls / text streamed by @model responses (web: StructuredOutputRenderer)
+                        AssistantMessageContent(
+                            content: message.renderedContent,
+                            isStreaming: !message.isModelDone,
+                            authToken: viewModel.serverAuthToken,
+                            serverBaseURL: viewModel.serverBaseURL,
+                            apiClient: dependencies.apiClient
+                        )
+                    } else if !message.content.isEmpty {
                         ChannelMarkdownView(
                             content: message.content,
                             currentUserId: viewModel.currentUserId,
@@ -993,115 +1248,118 @@ struct ChannelDetailView: View {
                             accessibleChannelIds: viewModel.accessibleChannelIds
                         )
                     }
-                    
+
                     if !message.files.isEmpty {
                         messageAttachments(message.files)
                     }
+
+                    if message.isEdited {
+                        Text("edited")
+                            .scaledFont(size: 10)
+                            .foregroundStyle(isCurrentUser ? theme.brandOnPrimary.opacity(0.7) : theme.textTertiary)
+                    }
                 }
-                .padding(.horizontal, 14)
-                .padding(.vertical, 9)
-                .background(bubbleBg)
-                .clipShape(ChannelBubbleShape(isCurrentUser: isCurrentUser, showTail: showTail))
-                .overlay(
-                    ChannelBubbleShape(isCurrentUser: isCurrentUser, showTail: showTail)
-                        .strokeBorder(bubbleBd, lineWidth: 0.5)
-                )
-                .frame(minWidth: 60, maxWidth: UIScreen.main.bounds.width * 0.75, alignment: frameAlignment)
+                .modifier(ChannelBubbleStyle(isCurrentUser: isCurrentUser, showTail: showTail))
             }
             
             // Reactions (MF-003: with tooltip on long-press)
             // AnimatedPresence smoothly expands height when reactions arrive via socket
             AnimatedPresence(visible: !message.reactions.isEmpty) {
                 if !message.reactions.isEmpty {
-                    reactionsBar(message)
-                        .padding(.top, 3)
+                    ChannelReactionsBar(
+                        reactions: message.reactions,
+                        currentUserId: viewModel.currentUserId,
+                        alignment: bubbleAlignment,
+                        isEnabled: viewModel.hasWriteAccess,
+                        onToggle: { name in
+                            Task { await viewModel.toggleReaction(messageId: message.id, emoji: name) }
+                            Haptics.play(.light)
+                        },
+                        onAdd: {
+                            emojiTargetMessageId = message.id
+                            showEmojiKeyboard = true
+                        },
+                        onShowReactors: { reaction in showReactors(reaction) }
+                    )
+                    .frame(maxWidth: ChannelLayout.maxBubbleWidth, alignment: frameAlignment)
+                    .padding(.top, 4)
                 }
             }
 
             // Thread reply badge — smoothly appears when a thread reply is created
             AnimatedPresence(visible: message.hasThread) {
                 if message.hasThread {
-                    ThreadReplyBadge(
+                    ChannelThreadBadge(
                         replyCount: message.replyCount,
-                        latestReplyAt: message.latestReplyAt
+                        latestReplyAt: message.latestReplyAt,
+                        avatarURLs: threadAvatarURLs(for: message),
+                        authToken: viewModel.serverAuthToken
                     ) {
                         Task { await viewModel.openThread(for: message) }
                         Haptics.play(.light)
                     }
-                    .padding(.top, 3)
+                    .padding(.top, 4)
                 }
             }
             
-            if showGroupTimestamp && !showSenderHeader {
-                Text(message.createdAt.channelTime)
-                    .scaledFont(size: 10)
-                    .foregroundStyle(theme.textTertiary)
-                    .padding(.top, 2)
+            if message.isPinned || (showGroupTimestamp && !showSenderHeader) {
+                ChannelMessageMeta(
+                    time: showGroupTimestamp && !showSenderHeader ? message.createdAt.channelTime : nil,
+                    isPinned: message.isPinned,
+                    isEdited: false
+                )
+                .padding(.top, 3)
             }
             
             if message.isFailed {
                 Button {
                     Task { await viewModel.retrySendMessage(id: message.id) }
                 } label: {
-                    HStack(spacing: 4) {
-                        Image(systemName: "exclamationmark.triangle.fill")
-                            .scaledFont(size: 11)
-                        Text("Failed to send. Tap to retry.")
-                            .scaledFont(size: 12, weight: .medium)
-                    }
-                    .foregroundStyle(theme.error)
+                    Label("Not sent · Retry", systemImage: "exclamationmark.circle.fill")
+                        .scaledFont(size: 11, weight: .semibold)
+                        .foregroundStyle(theme.error)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 5)
+                        .background(theme.error.opacity(0.12), in: Capsule())
                 }
                 .buttonStyle(.plain)
+                .padding(.top, 4)
+                .accessibilityLabel("Message not sent. Retry")
             }
         }
+        // Gestures live on the content stack (bubble, header, reactions) — not the
+        // full-width row — so a swipe on the empty space beside a message still
+        // opens the sidebar. No contentShape here: only drawn content is hittable.
+        .modifier(ChannelMessageGestures(
+            swipeEnabled: viewModel.hasWriteAccess && !message.isOptimistic,
+            longPressEnabled: !message.isOptimistic && viewModel.editingMessage?.id != message.id,
+            threshold: swipeReplyThreshold,
+            direction: isCurrentUser ? .left : .right,
+            onSwipeChanged: { swipeOffsets[message.id] = $0 },
+            onSwipeEnded: { triggered in
+                if triggered { beginReply(to: message) }
+                withAnimation(.spring(response: 0.35, dampingFraction: 0.72)) {
+                    swipeOffsets[message.id] = nil
+                }
+            },
+            onLongPress: {
+                presentMenu(for: message, isCurrentUser: isCurrentUser,
+                            showHeader: showSenderHeader, showTimestamp: showGroupTimestamp,
+                            position: position)
+            }
+        ))
         .frame(maxWidth: .infinity, alignment: frameAlignment)
         .padding(.horizontal, Spacing.screenPadding)
         .padding(.top, showSenderHeader ? 12 : 2)
-        } menu: {
-            CustomMenuView {
-                CustomMenuButton("Reply", systemImage: "arrowshape.turn.up.left") {
-                    viewModel.setReplyTo(message)
-                }
-                
-                CustomMenuButton("Reply in Thread", systemImage: "bubble.left.and.bubble.right") {
-                    Task { await viewModel.openThread(for: message) }
-                    Haptics.play(.light)
-                }
-                
-                CustomMenuButton(action: { Task { await viewModel.togglePin(messageId: message.id) } }) {
-                    Label(message.isPinned ? "Unpin" : "Pin", systemImage: message.isPinned ? "pin.slash" : "pin")
-                }
-                
-                CustomMenuButton("Copy", systemImage: "doc.on.doc") {
-                    viewModel.copyMessage(message)
-                }
-                
-                if isCurrentUser {
-                    CustomMenuDivider()
-                    
-                    CustomMenuButton("Edit", systemImage: "pencil") {
-                        viewModel.beginEditing(message: message)
-                    }
-                    
-                    CustomMenuButton("Delete", systemImage: "trash", role: .destructive) {
-                        Task { await viewModel.deleteMessage(id: message.id) }
-                    }
-                }
-            }
-        }
+        .padding(.bottom, (message.isPinned || repliesToMe(message)) ? 4 : 0)
+        .background(rowTint(for: message))
         .opacity(message.isOptimistic ? 0.6 : 1.0)
-        // Dismiss the keyboard before the context menu appears so it has the full
-        // screen height available and doesn't appear off-screen.
-        .simultaneousGesture(
-            LongPressGesture(minimumDuration: 0.35).onEnded { _ in
-                UIApplication.shared.sendAction(
-                    #selector(UIResponder.resignFirstResponder),
-                    to: nil, from: nil, for: nil
-                )
-            }
-        )
+        // Tapping a message closes the keyboard. Simultaneous so links, mentions,
+        // images and text selection inside the bubble keep working.
+        .contentShape(Rectangle())
+        .simultaneousGesture(TapGesture().onEnded { dismissKeyboard() })
     }
-    
+
     // MARK: - Sender Avatar
     
     @ViewBuilder
@@ -1116,7 +1374,9 @@ struct ChannelDetailView: View {
             )
         } else {
             let resolvedName = viewModel.resolvedSenderName(for: message)
-            let avatarURL = avatarURLForUser(id: message.userId)
+            let avatarURL = ChannelAvatarURL.forSender(
+                userId: message.userId, isWebhook: message.isFromWebhook, serverBaseURL: viewModel.serverBaseURL
+            )
             UserAvatar(
                 size: size,
                 imageURL: avatarURL,
@@ -1138,7 +1398,9 @@ struct ChannelDetailView: View {
         // Try to find the original message in the loaded list
         if let replyMsg = viewModel.messages.first(where: { $0.id == replyId }) {
             let isModel = viewModel.isModelMessage(replyMsg)
-            let avatarURL = avatarURLForUser(id: replyMsg.userId)
+            let avatarURL: URL? = isModel
+                ? viewModel.resolveModelForMessage(replyMsg)?.resolveAvatarURL(baseURL: viewModel.serverBaseURL)
+                : ChannelAvatarURL.forSender(userId: replyMsg.userId, isWebhook: replyMsg.isFromWebhook, serverBaseURL: viewModel.serverBaseURL)
             ChannelReplyPreview(
                 senderName: viewModel.resolvedSenderName(for: replyMsg),
                 content: replyMsg.content,
@@ -1151,11 +1413,14 @@ struct ChannelDetailView: View {
             }
         } else if let slim = message.replyToMessage {
             // Fallback: use the slim snapshot embedded in the message
-            let avatarURL = avatarURLForUser(id: slim.userId)
+            let slimIsModel = slim.modelId != nil
+            let avatarURL: URL? = slimIsModel
+                ? viewModel.resolveModel(for: slim.modelId)?.resolveAvatarURL(baseURL: viewModel.serverBaseURL)
+                : ChannelAvatarURL.forSender(userId: slim.userId, isWebhook: slim.user?.role == "webhook", serverBaseURL: viewModel.serverBaseURL)
             ChannelReplyPreview(
-                senderName: slim.user?.displayName ?? "Unknown",
+                senderName: slim.modelName ?? slim.user?.displayName ?? "Unknown",
                 content: slim.content,
-                isModel: false,
+                isModel: slimIsModel,
                 avatarURL: avatarURL,
                 authToken: viewModel.serverAuthToken,
                 hasFiles: false
@@ -1203,361 +1468,164 @@ struct ChannelDetailView: View {
                 .focused($isEditFocused)
                 .padding(.horizontal, 12)
                 .padding(.vertical, 8)
-                .background(theme.surfaceContainer.opacity(0.8))
-                .clipShape(RoundedRectangle(cornerRadius: 14))
+                .background(theme.surfaceContainer.opacity(0.6), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
             
             HStack(spacing: 8) {
                 Button { viewModel.cancelEditing() } label: {
                     Text("Cancel")
                         .scaledFont(size: 12, weight: .medium)
-                        .foregroundStyle(theme.textTertiary)
+                        .foregroundStyle(theme.textSecondary)
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 6)
+                        .chatControlGlass(in: Capsule(), fallback: theme.surfaceContainer)
                 }
+                .buttonStyle(.plain)
                 Button { Task { await viewModel.submitEdit() } } label: {
                     Text("Save")
                         .scaledFont(size: 12, weight: .semibold)
-                        .foregroundStyle(theme.brandPrimary)
+                        .foregroundStyle(theme.brandOnPrimary)
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 6)
+                        .background(theme.brandPrimary, in: Capsule())
                 }
+                .buttonStyle(.plain)
                 .disabled(viewModel.editingText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             }
         }
-        .padding(.horizontal, 14)
+        .padding(.horizontal, 12)
         .padding(.vertical, 10)
-        .background(theme.surfaceContainer.opacity(0.3))
-        .clipShape(RoundedRectangle(cornerRadius: 18))
+        .chatControlGlass(in: RoundedRectangle(cornerRadius: 20, style: .continuous), fallback: .ultraThinMaterial)
     }
     
-    // MARK: - Reactions Bar (MF-003: with tooltip on long-press)
-    
-    private func reactionsBar(_ message: ChannelMessage) -> some View {
-        HStack(spacing: 4) {
-            ForEach(message.reactions) { reaction in
-                Button {
-                    Task { await viewModel.toggleReaction(messageId: message.id, emoji: reaction.name) }
-                    Haptics.play(.light)
-                } label: {
-                    let isOwn = reaction.userIds.contains(viewModel.currentUserId ?? "")
-                    HStack(spacing: 2) {
-                        Text(reaction.name.emojiFromShortcode)
-                            .font(.system(size: 13))
-                        if reaction.count > 1 {
-                            Text("\(reaction.count)")
-                                .scaledFont(size: 11, weight: .medium)
-                                .foregroundStyle(isOwn ? theme.brandPrimary : theme.textTertiary)
-                        }
-                    }
-                    .padding(.horizontal, 6)
-                    .padding(.vertical, 3)
-                    .background(
-                        isOwn ? theme.brandPrimary.opacity(0.12) : theme.surfaceContainer.opacity(0.6)
-                    )
-                    .clipShape(Capsule())
-                    .overlay(
-                        Capsule().strokeBorder(
-                            isOwn ? theme.brandPrimary.opacity(0.3) : Color.clear,
-                            lineWidth: 1
-                        )
-                    )
-                }
-                .buttonStyle(.plain)
-                // MF-003: Show reactor names on long-press
-                .simultaneousGesture(
-                    LongPressGesture(minimumDuration: 0.5)
-                        .onEnded { _ in
-                            let summary = reaction.reactorSummary
-                            if !summary.isEmpty {
-                                reactionTooltipText = summary
-                                withAnimation(.easeOut(duration: 0.15)) { showReactionTooltip = true }
-                                // Auto-hide after 2 seconds
-                                Task {
-                                    try? await Task.sleep(for: .seconds(2))
-                                    await MainActor.run {
-                                        withAnimation(.easeOut(duration: 0.15)) { showReactionTooltip = false }
-                                    }
-                                }
-                            }
-                        }
-                )
+    // MARK: - Reactions / Row Tint Helpers
+
+    /// MF-003: Shows "Alice, Bob and 3 others" when a reaction chip is long-pressed.
+    private func showReactors(_ reaction: MessageReaction) {
+        let names = reaction.userIds.enumerated().map { idx, id -> String in
+            if id == viewModel.currentUserId { return "You" }
+            return idx < reaction.userNames.count ? reaction.userNames[idx] : "Someone"
+        }
+        guard !names.isEmpty else { return }
+        let shown = names.prefix(3).joined(separator: ", ")
+        let rest = names.count - 3
+        reactionTooltipText = (rest > 0 ? "\(shown) and \(rest) other\(rest == 1 ? "" : "s")" : shown)
+            + " reacted with \(reaction.name.emojiFromShortcode)"
+        Haptics.play(.light)
+        withAnimation(.easeOut(duration: 0.15)) { showReactionTooltip = true }
+        Task {
+            try? await Task.sleep(for: .seconds(2))
+            await MainActor.run {
+                withAnimation(.easeOut(duration: 0.15)) { showReactionTooltip = false }
             }
-            
-            Button {
-                emojiTargetMessageId = message.id
-                showEmojiKeyboard = true
-                Haptics.play(.light)
-            } label: {
-                Image(systemName: "face.smiling")
-                    .scaledFont(size: 12)
-                    .foregroundStyle(theme.textTertiary)
-                    .frame(width: 24, height: 24)
-                    .background(theme.surfaceContainer.opacity(0.4))
-                    .clipShape(Circle())
-            }
-            .buttonStyle(.plain)
         }
     }
-    
-    // MARK: - Read-Only Banner (MF-005)
-    
-    private var readOnlyBanner: some View {
-        HStack(spacing: 8) {
-            Image(systemName: "eye")
-                .scaledFont(size: 14, weight: .medium)
-                .foregroundStyle(theme.textTertiary)
-            Text("This channel is read-only")
-                .scaledFont(size: 14, weight: .medium)
-                .foregroundStyle(theme.textTertiary)
+
+    /// Web parity: a message replying to *you* (or your model) gets an accent tint.
+    private func repliesToMe(_ message: ChannelMessage) -> Bool {
+        guard let uid = viewModel.currentUserId, message.userId != uid else { return false }
+        if let slim = message.replyToMessage { return slim.targetId == uid }
+        if let replyId = message.replyToId, let original = viewModel.messages.first(where: { $0.id == replyId }) {
+            return original.userId == uid && !viewModel.isModelMessage(original)
         }
-        .frame(maxWidth: .infinity)
-        .padding(.vertical, 14)
-        .background(theme.surfaceContainer.opacity(0.5))
-        .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
-        .padding(.horizontal, Spacing.screenPadding)
-        .padding(.vertical, 8)
+        return false
     }
-    
-    // MARK: - iMessage-Style Reply Focus Overlay
-    //
-    // Shown when the user swipes to reply. Blurs the background, floats the
-    // target message in the center, and presents a focused reply composer at
-    // the bottom — mimicking the iMessage / Signal reply UX.
 
     @ViewBuilder
-    private func replyFocusOverlay(for message: ChannelMessage) -> some View {
-        // The overlay is structured as a ZStack so the blur fills the entire screen
-        // while the content VStack rides *above* the keyboard via normal safe area insets.
-        // Key rules:
-        //   • Background layer: ignores ALL safe areas (covers status bar + home indicator)
-        //   • Content VStack: does NOT ignore the keyboard safe area so it animates up
-        //     with the keyboard automatically — no manual height tracking needed.
-        ZStack(alignment: .bottom) {
-            // ── Full-screen blurred background — sits behind everything ──
-            Color.black.opacity(0.35)
-                .background(.ultraThinMaterial)
-                .ignoresSafeArea()           // covers notch, home indicator, keyboard area
-                .contentShape(Rectangle())
-                .onTapGesture { dismissReplyOverlay() }
-
-            // ── Foreground content: floats above keyboard ──
-            // .overlay{} lives outside SwiftUI's layout tree so automatic keyboard
-            // avoidance does NOT apply. We manually offset by keyboard.height +
-            // the window's bottom safe area inset so the composer fully clears the
-            // keyboard on devices with a home indicator.
-            VStack(spacing: 0) {
-                Spacer(minLength: 0)
-
-                // ── Reply composer — sits directly above the keyboard ──
-                VStack(spacing: 0) {
-                    // Thin accent bar + context preview
-                    HStack(spacing: 6) {
-                        RoundedRectangle(cornerRadius: 2, style: .continuous)
-                            .fill(theme.replyBorder)
-                            .frame(width: 3, height: 36)
-                        VStack(alignment: .leading, spacing: 2) {
-                            HStack(spacing: 4) {
-                                Image(systemName: "arrowshape.turn.up.left.fill")
-                                    .scaledFont(size: 9, weight: .semibold)
-                                    .foregroundStyle(theme.replyBorder)
-                                Text(viewModel.resolvedSenderName(for: message))
-                                    .scaledFont(size: 12, weight: .bold)
-                                    .foregroundStyle(theme.replyBorder)
-                                    .lineLimit(1)
-                            }
-                            let preview = ChannelMessage.parseMentions(in: message.content)
-                            if !preview.isEmpty {
-                                Text(preview)
-                                    .scaledFont(size: 12)
-                                    .foregroundStyle(theme.textTertiary)
-                                    .lineLimit(1)
-                                    .truncationMode(.tail)
-                            }
-                        }
-                        Spacer()
-                        // Dismiss / cancel button
-                        Button {
-                            dismissReplyOverlay()
-                        } label: {
-                            Image(systemName: "xmark.circle.fill")
-                                .scaledFont(size: 22)
-                                .symbolRenderingMode(.palette)
-                                .foregroundStyle(theme.textTertiary, theme.cardBackground.opacity(0.9))
-                        }
-                        .buttonStyle(.plain)
-                        .padding(.trailing, 4)
-                    }
-                    .padding(.horizontal, Spacing.screenPadding)
-                    .padding(.top, 10)
-                    .padding(.bottom, 4)
-
-                    OverlayReplyInputField(
-                        text: $replyOverlayInputText,
-                        placeholder: "Reply to \(viewModel.resolvedSenderName(for: message))…",
-                        onSend: {
-                            let trimmed = replyOverlayInputText.trimmingCharacters(in: .whitespacesAndNewlines)
-                            guard !trimmed.isEmpty else { return }
-                            viewModel.setReplyTo(message)
-                            viewModel.inputText = trimmed
-                            Task { await viewModel.sendMessage() }
-                            dismissReplyOverlay()
-                            Haptics.play(.medium)
-                        },
-                        onDismiss: { dismissReplyOverlay() }
-                    )
-                    .padding(.bottom, 6)
+    private func rowTint(for message: ChannelMessage) -> some View {
+        let shape = RoundedRectangle(cornerRadius: 16, style: .continuous)
+        if repliesToMe(message) {
+            shape.fill(Color.orange.opacity(theme.isDark ? 0.08 : 0.07))
+                .overlay(alignment: .leading) {
+                    Capsule().fill(Color.orange.opacity(0.8)).frame(width: 3).padding(.vertical, 8)
                 }
-                .background(theme.background)
-            }
-            // Push the composer above the keyboard.
-            //
-            // KeyboardTracker.height = rawKeyboardHeight - safeAreaBottom
-            // (it subtracts the safe area so safeAreaInset{bottom} users don't
-            //  double-count it).
-            //
-            // Our overlay uses .ignoresSafeArea() so it extends to the PHYSICAL
-            // screen bottom — we must add safeAreaBottom back to get the correct
-            // physical offset: rawKeyboardHeight = keyboard.height + safeAreaBottom.
-            //
-            // When keyboard is hidden (height == 0), we still pad by safeAreaBottom
-            // so the composer clears the home indicator.
-            .padding(.bottom, keyboard.height + (UIApplication.shared.connectedScenes
-                .compactMap { ($0 as? UIWindowScene)?.keyWindow }
-                .first?.safeAreaInsets.bottom ?? 0))
-            .animation(keyboard.matchedAnimation, value: keyboard.height)
+                .padding(.horizontal, 6)
+        } else if message.isPinned {
+            shape.fill(Color.orange.opacity(theme.isDark ? 0.05 : 0.04))
+                .padding(.horizontal, 6)
+        } else {
+            Color.clear
         }
     }
 
-    // MARK: - Reply Preview Bar
+    /// Up to three distinct repliers for a thread badge (from loaded thread messages).
+    private func threadAvatarURLs(for message: ChannelMessage) -> [URL] {
+        guard viewModel.threadParentMessage?.id == message.id else { return [] }
+        var seen = Set<String>()
+        return viewModel.threadMessages.reversed().compactMap { reply -> URL? in
+            guard seen.insert(reply.effectiveSenderId).inserted, seen.count <= 3 else { return nil }
+            if viewModel.isModelMessage(reply) {
+                return viewModel.resolveModelForMessage(reply)?.resolveAvatarURL(baseURL: viewModel.serverBaseURL)
+            }
+            return ChannelAvatarURL.forSender(userId: reply.userId, isWebhook: reply.isFromWebhook,
+                                              serverBaseURL: viewModel.serverBaseURL)
+        }
+    }
+
+    // MARK: - Bottom Glass Chrome
     //
-    // Shown above the input field when replying via the context menu (not swipe).
-    // Features: sender avatar, name, content preview, smooth slide-in, dismiss button.
+    // Floating typing capsule + the glass composer. Reply / @model / "model will
+    // respond" context lives inside the composer as chips (no separate bars), and
+    // nothing paints an opaque background — messages scroll under the glass.
 
-    private func replyPreviewBar(_ message: ChannelMessage) -> some View {
-        HStack(spacing: 0) {
-            // Left accent bar
-            RoundedRectangle(cornerRadius: 2, style: .continuous)
-                .fill(theme.replyBorder)
-                .frame(width: 3)
-                .padding(.vertical, 8)
-
-            HStack(spacing: 8) {
-                // Sender avatar
-                let avatarURL = avatarURLForUser(id: message.userId)
-                UserAvatar(
-                    size: 22,
-                    imageURL: avatarURL,
-                    name: viewModel.resolvedSenderName(for: message),
-                    authToken: viewModel.serverAuthToken
-                )
-
-                VStack(alignment: .leading, spacing: 2) {
-                    HStack(spacing: 4) {
-                        Image(systemName: "arrowshape.turn.up.left.fill")
-                            .scaledFont(size: 9, weight: .semibold)
-                            .foregroundStyle(theme.replyBorder)
-                        Text("Replying to \(viewModel.resolvedSenderName(for: message))")
-                            .scaledFont(size: 12, weight: .semibold)
-                            .foregroundStyle(theme.replyBorder)
-                            .lineLimit(1)
-                    }
-
-                    let preview = ChannelMessage.parseMentions(in: message.content)
-                    if !preview.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                        Text(preview.prefix(80))
-                            .scaledFont(size: 12)
-                            .foregroundStyle(theme.textSecondary)
-                            .lineLimit(1)
-                            .truncationMode(.tail)
-                    } else if !message.files.isEmpty {
-                        Label("Attachment", systemImage: "paperclip")
-                            .scaledFont(size: 12)
-                            .foregroundStyle(theme.textSecondary)
-                    }
-                }
-
-                Spacer()
-
-                Button {
-                    viewModel.clearReply()
-                    Haptics.play(.light)
-                } label: {
-                    Image(systemName: "xmark.circle.fill")
-                        .scaledFont(size: 20)
-                        .foregroundStyle(theme.textTertiary)
-                }
-                .buttonStyle(.plain)
+    private var bottomChrome: some View {
+        VStack(spacing: 0) {
+            if !viewModel.typingUsers.isEmpty {
+                ChannelTypingCapsule(names: viewModel.typingUsers.map(\.name))
+                    .padding(.horizontal, Spacing.screenPadding)
+                    .padding(.bottom, 4)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
             }
-            .padding(.horizontal, 10)
-            .padding(.vertical, 8)
-        }
-        .background(theme.replyBackground)
-        .transition(.asymmetric(
-            insertion: .move(edge: .bottom).combined(with: .opacity),
-            removal: .move(edge: .bottom).combined(with: .opacity)
-        ))
-    }
-    
-    // MARK: - Model Mention Bar
-    
-    private var modelMentionBar: some View {
-        HStack(spacing: 6) {
-            Image(systemName: "cpu")
-                .scaledFont(size: 11, weight: .bold)
-                .foregroundStyle(theme.mentionModelText)
-            Text(viewModel.mentionedModelName ?? "")
-                .scaledFont(size: 13, weight: .semibold)
-                .foregroundStyle(theme.textPrimary)
-            Text("will respond to this message")
-                .scaledFont(size: 12)
-                .foregroundStyle(theme.textTertiary)
-            
-            Spacer()
-            
-            Button {
-                viewModel.clearModelMention()
-                Haptics.play(.light)
-            } label: {
-                Image(systemName: "xmark.circle.fill")
-                    .scaledFont(size: 16)
-                    .foregroundStyle(theme.textTertiary)
+            // MF-005: Only show input if user has write access
+            if viewModel.hasWriteAccess {
+                channelInputField
+            } else {
+                ChannelReadOnlyBanner()
             }
-            .buttonStyle(.plain)
         }
-        .padding(.horizontal, Spacing.screenPadding)
-        .padding(.vertical, 6)
-        .background(theme.mentionModelBackground)
+        .animation(.spring(response: 0.3, dampingFraction: 0.85), value: viewModel.typingUsers.map(\.id))
     }
-    
-    // MARK: - Typing Indicator Bar
 
-    /// Shows "Alice is typing…" or "Alice and Bob are typing…" below the input.
-    /// Matches the web client's behaviour (Channel.svelte → typingUsers state).
-    private var typingIndicatorBar: some View {
-        HStack(spacing: 6) {
-            // Animated three-dot pulse
-            TypingDotsView()
-            
-            Text(typingLabel)
-                .scaledFont(size: 12)
-                .foregroundStyle(theme.textTertiary)
-            
-            Spacer()
+    /// Context chips for the composer (reply target, @model, bot-reply hint).
+    private var composerChips: [ChannelComposerChip] {
+        var chips: [ChannelComposerChip] = []
+        if let reply = viewModel.replyToMessage {
+            let preview = ChannelMessage.parseMentions(in: reply.content)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            chips.append(ChannelComposerChip(
+                id: "reply-\(reply.id)",
+                style: .reply,
+                icon: "arrowshape.turn.up.left.fill",
+                title: "Replying to \(viewModel.resolvedSenderName(for: reply))",
+                subtitle: preview.isEmpty ? (reply.files.isEmpty ? nil : "Attachment") : String(preview.prefix(90)),
+                onTap: { scrollToAndHighlight(messageId: reply.id) },
+                onRemove: { viewModel.clearReply() }
+            ))
         }
-        .padding(.horizontal, Spacing.screenPadding)
-        .padding(.vertical, 6)
-        .transition(.asymmetric(
-            insertion: .move(edge: .bottom).combined(with: .opacity),
-            removal: .opacity
-        ))
-    }
-    
-    private var typingLabel: String {
-        let names = viewModel.typingUsers.prefix(3).map(\.name)
-        switch names.count {
-        case 1: return "\(names[0]) is typing…"
-        case 2: return "\(names[0]) and \(names[1]) are typing…"
-        default: return "\(names[0]), \(names[1]) and others are typing…"
+        if let modelName = viewModel.mentionedModelName {
+            chips.append(ChannelComposerChip(
+                id: "model-\(modelName)",
+                style: .model,
+                icon: "cpu",
+                title: "\(modelName) will respond",
+                subtitle: nil,
+                onTap: nil,
+                onRemove: { viewModel.clearModelMention() }
+            ))
+        } else if let replyModel = viewModel.replyTargetModelName {
+            // Web parity: replying to a model's message makes that model answer.
+            chips.append(ChannelComposerChip(
+                id: "reply-model-\(replyModel)",
+                style: .model,
+                icon: "sparkles",
+                title: "\(replyModel) will respond",
+                subtitle: nil,
+                onTap: nil,
+                onRemove: nil
+            ))
         }
+        return chips
     }
-    
-    // MARK: - Input Field
 
     private var channelInputField: some View {
         @Bindable var vm = viewModel
@@ -1569,6 +1637,7 @@ struct ChannelDetailView: View {
             isEnabled: true,
             onSend: { await viewModel.sendMessage() },
             canSend: viewModel.canSend,
+            chips: composerChips,
             onAttachmentTapped: { showAttachmentPicker = true },
             onPasteAttachments: { pasted in
                 vm.attachments.append(contentsOf: pasted)
@@ -1583,6 +1652,7 @@ struct ChannelDetailView: View {
             },
             onAtTrigger: { query in
                 mentionQuery = query
+                viewModel.searchMentions(query)
                 if !isShowingMentionPicker {
                     withAnimation(.easeOut(duration: 0.2)) { isShowingMentionPicker = true }
                 }
@@ -1594,65 +1664,165 @@ struct ChannelDetailView: View {
                     withAnimation(.easeOut(duration: 0.2)) { isShowingChannelPicker = true }
                 }
             },
-            onHashDismiss: { dismissChannelPicker() }
+            onHashDismiss: { dismissChannelPicker() },
+            onSlashTrigger: { query in
+                promptQuery = query
+                if !isShowingPromptPicker {
+                    viewModel.loadPrompts()
+                    withAnimation(.easeOut(duration: 0.2)) { isShowingPromptPicker = true }
+                }
+            },
+            onSlashDismiss: { dismissPromptPicker() },
+            dictationService: dependencies.dictationService.context == dictationContext ? dependencies.dictationService : nil,
+            onDictationStart: dependencies.authViewModel.chatPermissions.stt ? { startDictation() } : nil,
+            onDictationStop: { dependencies.dictationService.stopDictation() },
+            onDictationCancel: { dependencies.dictationService.cancelDictation() }
         )
     }
-    
+
+    // MARK: - Dictation (shared service with the main chat)
+
+    /// Draft identity for dictation recovery: server + account + channel.
+    private var dictationContext: DictationContext? {
+        guard let server = dependencies.serverConfigStore.activeServer,
+              let user = dependencies.authViewModel.currentUser,
+              dependencies.authViewModel.phase == .authenticated else { return nil }
+        return DictationContext(server: server.url, account: user.id, conversation: "channel:\(viewModel.channelId)")
+    }
+
+    private func startDictation() {
+        let service = dependencies.dictationService
+        guard let context = dictationContext else { return }
+        service.onError = { [weak service] message in
+            if service?.showsRecovery != true { showError(message) }
+        }
+        service.onAutoStopped = nil
+        service.bind(to: context, isCurrent: { dictationContext == context },
+                     draft: { [weak viewModel] in viewModel?.inputText },
+                     deliver: { [weak viewModel] text in viewModel?.inputText = text })
+        Task { await service.startDictation() }
+    }
+
+    private func dismissPromptPicker() {
+        withAnimation(.easeOut(duration: 0.15)) {
+            isShowingPromptPicker = false
+            promptQuery = ""
+        }
+    }
+
     // MARK: - Empty Channel
     
-    private var emptyChannelView: some View {
-        VStack(spacing: Spacing.md) {
+    /// Web parity (Messages.svelte): "This channel was created on …" once the top is reached.
+    private var channelStartHeader: some View {
+        VStack(alignment: .leading, spacing: 6) {
             if viewModel.isDM {
-                Image(systemName: "person.crop.circle")
-                    .scaledFont(size: 40)
-                    .foregroundStyle(Color.green.opacity(0.5))
-                Text("Say hello to \(viewModel.channelDisplayTitle)")
-                    .scaledFont(size: 16, weight: .medium)
-                    .foregroundStyle(theme.textSecondary)
-                Text("Send a message or @mention a model")
-                    .scaledFont(size: 14)
-                    .foregroundStyle(theme.textTertiary)
+                dmAvatarStack(size: 40)
             } else {
-                Image(systemName: "bubble.left.and.bubble.right")
-                    .scaledFont(size: 40)
-                    .foregroundStyle(theme.textTertiary.opacity(0.5))
-                Text("No messages yet")
-                    .scaledFont(size: 16, weight: .medium)
+                Image(systemName: viewModel.channel?.isPrivate == true ? "lock" : "number")
+                    .scaledFont(size: 20, weight: .semibold)
                     .foregroundStyle(theme.textSecondary)
-                Text("Start the conversation with @model or @user")
-                    .scaledFont(size: 14)
+                    .frame(width: 44, height: 44)
+                    .chatControlGlass(in: RoundedRectangle(cornerRadius: 12, style: .continuous), fallback: theme.surfaceContainer)
+            }
+            Text(viewModel.channelDisplayTitle)
+                .scaledFont(size: 22, weight: .semibold)
+                .foregroundStyle(theme.textPrimary)
+            if let created = viewModel.channel?.createdAt {
+                Text(viewModel.isDM
+                     ? "This is the beginning of your conversation. Started \(created.formatted(date: .long, time: .omitted))."
+                     : "This channel was created on \(created.formatted(date: .long, time: .omitted)). This is the very beginning of the \(viewModel.channelDisplayTitle) channel.")
+                    .scaledFont(size: 13)
                     .foregroundStyle(theme.textTertiary)
             }
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, Spacing.screenPadding)
+        .padding(.top, 24)
+        .padding(.bottom, 12)
+    }
+
+    private var emptyChannelView: some View {
+        VStack(spacing: Spacing.md) {
+            Group {
+                if viewModel.isDM {
+                    dmAvatarStack(size: 56)
+                } else {
+                    Image(systemName: viewModel.channel?.isPrivate == true ? "lock.fill" : "number")
+                        .scaledFont(size: 24, weight: .semibold)
+                        .foregroundStyle(theme.brandPrimary)
+                        .frame(width: 64, height: 64)
+                        .chatControlGlass(in: RoundedRectangle(cornerRadius: 20, style: .continuous),
+                                          fallback: theme.surfaceContainer)
+                }
+            }
+            VStack(spacing: 4) {
+                Text(viewModel.isDM ? "Say hello to \(viewModel.channelDisplayTitle)" : "Welcome to #\(viewModel.channelDisplayTitle)")
+                    .scaledFont(size: 17, weight: .semibold)
+                    .foregroundStyle(theme.textPrimary)
+                    .multilineTextAlignment(.center)
+                Text("Send the first message, or @mention a model to bring it into the conversation.")
+                    .scaledFont(size: 13)
+                    .foregroundStyle(theme.textTertiary)
+                    .multilineTextAlignment(.center)
+            }
+            if viewModel.hasWriteAccess {
+                HStack(spacing: 8) {
+                    emptyStateAction("Say hi 👋", icon: "hand.wave") { viewModel.inputText = "Hi everyone! 👋" }
+                    emptyStateAction("@ a model", icon: "sparkles") { viewModel.inputText += "@" }
+                }
+                .padding(.top, 4)
+            }
+        }
+        .padding(.horizontal, 32)
+        .frame(maxWidth: 420)
+    }
+
+    private func emptyStateAction(_ title: String, icon: String, action: @escaping () -> Void) -> some View {
+        Button {
+            Haptics.play(.light)
+            action()
+            NotificationCenter.default.post(name: .chatInputFieldRequestFocus, object: nil)
+        } label: {
+            Label(title, systemImage: icon)
+                .scaledFont(size: 13, weight: .medium)
+                .foregroundStyle(theme.textPrimary)
+                .padding(.horizontal, 14)
+                .padding(.vertical, 8)
+                .chatControlGlass(in: Capsule(), fallback: theme.surfaceContainer)
+        }
+        .buttonStyle(.plain)
     }
     
     // MARK: - Loading (INC-007: Animated shimmer)
     
+    /// Skeleton that mirrors the real layout: alternating bubbles with stable widths.
     private var loadingPlaceholders: some View {
-        VStack(spacing: 16) {
-            ForEach(0..<5, id: \.self) { _ in
+        let rows: [(own: Bool, widths: [CGFloat])] = [
+            (false, [180, 120]), (true, [150]), (false, [240, 200, 90]),
+            (true, [110, 170]), (false, [160])
+        ]
+        return VStack(spacing: 14) {
+            ForEach(Array(rows.enumerated()), id: \.offset) { _, row in
                 HStack(alignment: .top, spacing: 8) {
-                    Circle()
-                        .fill(theme.surfaceContainer.opacity(0.4))
-                        .frame(width: 32, height: 32)
-                    VStack(alignment: .leading, spacing: 6) {
-                        RoundedRectangle(cornerRadius: 4)
-                            .fill(theme.surfaceContainer.opacity(0.4))
-                            .frame(width: CGFloat.random(in: 80...140), height: 14)
-                        RoundedRectangle(cornerRadius: 4)
-                            .fill(theme.surfaceContainer.opacity(0.3))
-                            .frame(width: CGFloat.random(in: 150...280), height: 14)
-                        RoundedRectangle(cornerRadius: 4)
-                            .fill(theme.surfaceContainer.opacity(0.2))
-                            .frame(width: CGFloat.random(in: 100...200), height: 14)
+                    if row.own { Spacer(minLength: 60) } else {
+                        Circle().fill(theme.surfaceContainer.opacity(0.5)).frame(width: 28, height: 28)
                     }
-                    Spacer()
+                    VStack(alignment: row.own ? .trailing : .leading, spacing: 4) {
+                        ForEach(Array(row.widths.enumerated()), id: \.offset) { _, w in
+                            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                                .fill(row.own ? theme.brandPrimary.opacity(0.18) : theme.surfaceContainer.opacity(0.5))
+                                .frame(width: w, height: 34)
+                        }
+                    }
+                    if !row.own { Spacer(minLength: 60) }
                 }
                 .padding(.horizontal, Spacing.screenPadding)
             }
+            Spacer()
         }
-        .redacted(reason: .placeholder)
+        .padding(.top, 24)
         .shimmer()
+        .accessibilityLabel("Loading messages")
     }
     
     // MARK: - Scroll FAB
@@ -1660,24 +1830,43 @@ struct ChannelDetailView: View {
     @ViewBuilder
     private var scrollToBottomFAB: some View {
         if isScrolledUp && !viewModel.messages.isEmpty {
-            ZStack {
-                Circle().fill(.ultraThinMaterial).frame(width: 36, height: 36)
-                    .shadow(color: .black.opacity(0.15), radius: 6, y: 2)
+            ZStack(alignment: .topTrailing) {
                 Image(systemName: "chevron.down")
-                    .scaledFont(size: 12, weight: .bold)
+                    .scaledFont(size: 13, weight: .bold)
                     .foregroundStyle(theme.textSecondary)
+                    .frame(width: 40, height: 40)
+                    .chatControlGlass(in: Circle(), fallback: .ultraThinMaterial)
+                if unseenCount > 0 {
+                    Text(unseenCount > 99 ? "99+" : "\(unseenCount)")
+                        .scaledFont(size: 10, weight: .bold)
+                        .foregroundStyle(theme.brandOnPrimary)
+                        .padding(.horizontal, 5)
+                        .frame(minWidth: 18, minHeight: 18)
+                        .background(theme.brandPrimary, in: Capsule())
+                        .offset(x: 4, y: -4)
+                        .transition(.scale.combined(with: .opacity))
+                }
             }
             .contentShape(Circle())
-            .highPriorityGesture(TapGesture().onEnded {
-                withAnimation { scrollPosition.scrollTo(edge: .bottom) }
-                Haptics.play(.light)
-            })
-            .padding(.trailing, Spacing.md)
+            .onTapGesture { scrollToBottom() }
+            .accessibilityElement(children: .ignore)
+            .accessibilityAddTraits(.isButton)
+            .accessibilityLabel(unseenCount > 0 ? "\(unseenCount) new messages, scroll to bottom" : "Scroll to bottom")
+            .accessibilityAction { scrollToBottom() }
             .padding(.bottom, Spacing.sm)
             .transition(.scale(scale: 0.7).combined(with: .opacity))
         }
     }
     
+    private func scrollToBottom() {
+        Haptics.play(.light)
+        withAnimation(.spring(response: 0.45, dampingFraction: 0.9)) {
+            scrollPosition.scrollTo(edge: .bottom)
+            isScrolledUp = false
+            unseenCount = 0
+        }
+    }
+
     // MARK: - Copied Toast
     
     private var copiedToast: some View {
@@ -1685,11 +1874,10 @@ struct ChannelDetailView: View {
             Image(systemName: "doc.on.doc.fill").scaledFont(size: 12)
             Text("Copied").scaledFont(size: 12, weight: .medium)
         }
-        .foregroundStyle(theme.textInverse)
+        .foregroundStyle(theme.textPrimary)
         .padding(.horizontal, Spacing.md)
         .padding(.vertical, Spacing.sm)
-        .background(theme.textPrimary.opacity(0.85))
-        .clipShape(Capsule())
+        .chatControlGlass(in: Capsule(), fallback: .ultraThinMaterial)
         .padding(.top, Spacing.md)
         .transition(.toastTransition)
     }
@@ -1769,14 +1957,6 @@ struct ChannelDetailView: View {
             downloadErrorMessage = "Failed to load file: \(error.localizedDescription)"
             showDownloadError = true
         }
-    }
-}
-
-// MARK: - Channel Reaction Provider
-
-struct ChannelReactionProvider: ReactionProvider {
-    func reactions() -> [String] {
-        ["👍", "❤️", "😂", "😮", "😢", "🔥", "🎉", "➕"]
     }
 }
 

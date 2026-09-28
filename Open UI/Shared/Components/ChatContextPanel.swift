@@ -13,6 +13,8 @@ struct ChatContextPanel: View {
     @State private var draft: ChatAdvancedParams
     @State private var isFilesExpanded: Bool = true
     @State private var isAdvancedExpanded: Bool = false
+    @State private var confirmCompaction = false
+    @State private var variableForm: ChatVariableForm?
 
     init(viewModel: ChatViewModel, params: Binding<ChatAdvancedParams>) {
         self.viewModel = viewModel
@@ -49,14 +51,32 @@ struct ChatContextPanel: View {
     var body: some View {
         NavigationStack {
             List {
+                contextUsageSection
                 filesSection
                 valvesSection
+                if let form = viewModel.makeChatVariableForm() {
+                    Section {
+                        Button { variableForm = form } label: {
+                            Label("Chat Variables", systemImage: "curlybraces")
+                        }
+                        .disabled(viewModel.isStreaming || viewModel.isSavingChatVariables)
+                    }
+                }
                 systemPromptSection
                 advancedSection
             }
             .listStyle(.insetGrouped)
             .navigationTitle("Controls")
             .navigationBarTitleDisplayMode(.inline)
+            .interactiveDismissDisabled(viewModel.isCompactingContext)
+            .confirmationDialog("Compact conversation context?", isPresented: $confirmCompaction, titleVisibility: .visible) {
+                Button("Compact context") { Task { await viewModel.compactContext() } }
+            } message: {
+                Text("The server summarizes older turns for future responses. Original messages remain in the conversation.")
+            }
+            .sheet(item: $variableForm) { form in
+                ChatVariablesSheet(viewModel: viewModel, form: form).themed()
+            }
             .task {
                 // Load tools + functions so the Valves section can show them.
                 // loadTools() is cheap if already loaded (returns after populating availableTools).
@@ -66,14 +86,18 @@ struct ChatContextPanel: View {
             }
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
-                    Button("Cancel") { dismiss() }
+                    Button { dismiss() } label: { Image(systemName: "xmark") }
+                        .accessibilityLabel("Cancel")
+                        .disabled(viewModel.isCompactingContext)
                 }
                 ToolbarItem(placement: .confirmationAction) {
-                    Button("Save") {
+                    Button {
                         params = draft
                         dismiss()
-                    }
+                    } label: { Image(systemName: "checkmark") }
+                    .accessibilityLabel("Save")
                     .fontWeight(.semibold)
+                    .disabled(viewModel.isCompactingContext)
                 }
                 ToolbarItem(placement: .bottomBar) {
                     Button(role: .destructive) {
@@ -88,6 +112,41 @@ struct ChatContextPanel: View {
     }
 
     // MARK: - Files Section
+
+    @ViewBuilder
+    private var contextUsageSection: some View {
+        if viewModel.conversation?.contextUsage != nil || viewModel.contextNeedsRefresh {
+            Section {
+                if let usage = viewModel.conversation?.contextUsage {
+                    LabeledContent("Estimated tokens", value: usage.tokens.formatted())
+                    LabeledContent("Compaction threshold", value: usage.threshold.formatted())
+                    ProgressView(value: min(1, usage.fraction))
+                        .accessibilityLabel("Context usage")
+                        .accessibilityValue(usage.fraction.formatted(.percent.precision(.fractionLength(0))))
+                }
+                if viewModel.isCompactingContext {
+                    HStack { ProgressView(); Text("Updating context…") }
+                } else if viewModel.contextNeedsRefresh {
+                    Button("Refresh context") { Task { await viewModel.compactContext(refreshOnly: true) } }
+                        .disabled(viewModel.isStreaming)
+                } else {
+                    Button("Compact context") { confirmCompaction = true }
+                        .disabled(viewModel.isStreaming || viewModel.conversation?.isTemporary != false)
+                }
+                if let error = viewModel.contextCompactionError {
+                    Text(error).foregroundStyle(.red)
+                    Text("Refresh context before sending again. Refresh does not repeat the compaction request.")
+                        .font(.footnote).foregroundStyle(.secondary)
+                } else if let notice = viewModel.contextCompactionNotice {
+                    Text(notice).font(.footnote).foregroundStyle(.secondary)
+                }
+            } header: {
+                Text("Conversation context")
+            } footer: {
+                Text("Usage is estimated against the server's compaction threshold, not the model's maximum context window.")
+            }
+        }
+    }
 
     private var filesSection: some View {
         Section {
