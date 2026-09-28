@@ -111,8 +111,10 @@ final class NotesManager: @unchecked Sendable {
     /// Only an explicit body edit replaces the server's rich content — the server
     /// replaces `data.content` wholesale, so renames and local attachment bookkeeping
     /// must not send it (that would discard the note's JSON/HTML representation).
+    /// Read-only shared notes are rejected before touching the local cache.
     @discardableResult
     func updateNote(_ note: Note, contentChanged: Bool = false) async -> Bool {
+        guard note.canEdit else { return false }
         // Always update local cache first
         updateLocalNote(note)
 
