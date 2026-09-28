@@ -79,15 +79,18 @@ struct TerminalFileViewer: View {
     private var toolbar: some ToolbarContent {
         ToolbarItem(placement: .cancellationAction) {
             if isEditing {
-                Button("Cancel") { if isDirty { confirmDiscard = true } else { isEditing = false } }
+                Button("Cancel", systemImage: "xmark") { if isDirty { confirmDiscard = true } else { isEditing = false } }
+                    .labelStyle(.iconOnly).tint(.secondary)
             } else {
-                Button("Done") { dismiss() }
+                Button("Done", systemImage: "xmark") { dismiss() }
+                    .labelStyle(.iconOnly).tint(.secondary)
             }
         }
         ToolbarItemGroup(placement: .primaryAction) {
             if isEditing {
                 if isSaving { ProgressView() } else {
-                    Button("Save") { Task { await save() } }.fontWeight(.semibold).disabled(!isDirty)
+                    Button("Save", systemImage: "checkmark") { Task { await save() } }
+                        .labelStyle(.iconOnly).disabled(!isDirty)
                 }
             } else {
                 if canEdit {

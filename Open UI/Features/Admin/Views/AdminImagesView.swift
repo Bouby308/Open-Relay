@@ -746,7 +746,9 @@ struct WorkflowEditorSheet: View {
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
-                    Button("Cancel") { dismiss() }
+                    Button("Cancel", systemImage: "xmark") { dismiss() }
+                        .labelStyle(.iconOnly)
+                        .tint(.secondary)
                 }
                 ToolbarItem(placement: .primaryAction) {
                     HStack(spacing: Spacing.sm) {
@@ -760,13 +762,13 @@ struct WorkflowEditorSheet: View {
                         }
 
                         // Save button
-                        Button("Save") {
+                        Button("Save", systemImage: "checkmark") {
                             if validateJSON() {
                                 viewModel.saveWorkflowFromEditor()
                                 dismiss()
                             }
                         }
-                        .fontWeight(.semibold)
+                        .labelStyle(.iconOnly)
                     }
                 }
             }

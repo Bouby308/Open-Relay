@@ -33,7 +33,10 @@ struct TerminalCompareView: View {
             .navigationTitle("Compare")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .cancellationAction) { Button("Done") { dismiss() } }
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Done", systemImage: "xmark") { dismiss() }
+                        .labelStyle(.iconOnly).tint(.secondary)
+                }
                 ToolbarItem(placement: .primaryAction) {
                     Menu {
                         Toggle("Ignore Whitespace", isOn: $ignoreWhitespace)

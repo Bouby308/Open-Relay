@@ -44,9 +44,13 @@ struct TerminalFolderPickerView: View {
             .navigationTitle(TerminalPath.name(of: path))
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel", systemImage: "xmark") { dismiss() }
+                        .labelStyle(.iconOnly).tint(.secondary)
+                }
                 ToolbarItem(placement: .confirmationAction) {
-                    Button("Move Here") { onPick(path); dismiss() }
+                    Button("Move Here", systemImage: "checkmark") { onPick(path); dismiss() }
+                        .labelStyle(.iconOnly)
                         .disabled(!writable || sources.allSatisfy { TerminalPath.parent(of: $0) == path }
                                   || sources.contains { TerminalPath.isInside(path, $0) })
                 }

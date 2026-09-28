@@ -129,7 +129,10 @@ struct TerminalPortPreviewView: View {
             .ignoresSafeArea(edges: .bottom)
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .cancellationAction) { Button("Done") { dismiss() } }
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Done", systemImage: "xmark") { dismiss() }
+                        .labelStyle(.iconOnly).tint(.secondary)
+                }
                 ToolbarItem(placement: .principal) {
                     TextField("localhost:\(port.port)", text: $address)
                         .scaledFont(size: 13, design: .monospaced)
