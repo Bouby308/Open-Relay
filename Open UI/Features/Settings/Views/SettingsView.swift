@@ -126,6 +126,19 @@ struct SettingsView: View {
                         }
                     }
 
+                    // Apple Watch companion app
+                    SettingsSection(header: "Apple Watch") {
+                        SettingsCell(
+                            icon: "applewatch",
+                            title: "Apple Watch",
+                            subtitle: WatchSettingsView.subtitle,
+                            showDivider: false,
+                            accessory: .chevron
+                        ) {
+                            navigationPath.append(SettingsDestination.appleWatch)
+                        }
+                    }
+
                     // Notifications
                     SettingsSection(header: "Notifications") {
                         SettingsCell(
@@ -277,6 +290,8 @@ struct SettingsView: View {
                     ChatSettingsView()
                 case .voiceHub:
                     VoiceSettingsHubView()
+                case .appleWatch:
+                    WatchSettingsView()
                 case .ttsSettings:
                     TTSSettingsView()
                 case .sttSettings:
@@ -389,6 +404,7 @@ enum SettingsDestination: Hashable {
     case about
     case chatSettings
     case voiceHub
+    case appleWatch
     case ttsSettings
     case sttSettings
     case voiceCallSettings
@@ -585,6 +601,8 @@ struct ChatSettingsView: View {
                     .foregroundStyle(theme.textTertiary)
                     .listRowSeparator(.hidden)
             }
+
+            UploadContextSettings()
 
             Section {
                 Picker("Scroll Controls", selection: $chatScrollControls) {

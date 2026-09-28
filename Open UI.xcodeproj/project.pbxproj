@@ -47,6 +47,8 @@
 		38FEA31A2FA2A18600A98F25 /* MLXAudioSTT in Frameworks */ = {isa = PBXBuildFile; productRef = 38FEA3192FA2A18600A98F25 /* MLXAudioSTT */; };
 		38FEA31C2FA2A18600A98F25 /* MLXAudioTTS in Frameworks */ = {isa = PBXBuildFile; productRef = 38FEA31B2FA2A18600A98F25 /* MLXAudioTTS */; };
 		38SHARE012F00000000000001 /* OpenUIShareExtension.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = 38SHARE022F00000000000002 /* OpenUIShareExtension.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
+		38WATCH012F00000000000001 /* OpenRelayWatch.app in Embed Watch Content */ = {isa = PBXBuildFile; fileRef = 38WATCH022F00000000000002 /* OpenRelayWatch.app */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
+		38WWID012F00000000000001 /* OpenRelayWatchWidgets.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = 38WWID022F00000000000002 /* OpenRelayWatchWidgets.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -64,6 +66,20 @@
 			remoteGlobalIDString = 38SHARE042F00000000000004;
 			remoteInfo = OpenUIShareExtension;
 		};
+		38WATCH032F00000000000003 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 38EB66752F39CE5A00AED774 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 38WATCH042F00000000000004;
+			remoteInfo = OpenRelayWatch;
+		};
+		38WWID032F00000000000003 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 38EB66752F39CE5A00AED774 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 38WWID042F00000000000004;
+			remoteInfo = OpenRelayWatchWidgets;
+		};
 /* End PBXContainerItemProxy section */
 
 /* Begin PBXCopyFilesBuildPhase section */
@@ -79,6 +95,28 @@
 			name = "Embed Foundation Extensions";
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		38WATCH0E2F0000000000000E /* Embed Watch Content */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "$(CONTENTS_FOLDER_PATH)/Watch";
+			dstSubfolderSpec = 16;
+			files = (
+				38WATCH012F00000000000001 /* OpenRelayWatch.app in Embed Watch Content */,
+			);
+			name = "Embed Watch Content";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		38WWID0E2F0000000000000E /* Embed Foundation Extensions */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "";
+			dstSubfolderSpec = 13;
+			files = (
+				38WWID012F00000000000001 /* OpenRelayWatchWidgets.appex in Embed Foundation Extensions */,
+			);
+			name = "Embed Foundation Extensions";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
@@ -87,6 +125,8 @@
 		3852C7102F71110800283682 /* SwiftUI.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = SwiftUI.framework; path = System/Library/Frameworks/SwiftUI.framework; sourceTree = SDKROOT; };
 		38EB667D2F39CE5A00AED774 /* Open UI.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "Open UI.app"; sourceTree = BUILT_PRODUCTS_DIR; };
 		38SHARE022F00000000000002 /* OpenUIShareExtension.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = OpenUIShareExtension.appex; sourceTree = BUILT_PRODUCTS_DIR; };
+		38WATCH022F00000000000002 /* OpenRelayWatch.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = OpenRelayWatch.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		38WWID022F00000000000002 /* OpenRelayWatchWidgets.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = OpenRelayWatchWidgets.appex; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
@@ -118,6 +158,37 @@
 			);
 			target = 3852C70B2F71110800283682 /* OpenUIWidgetsExtension */;
 		};
+		38WATCH052F00000000000005 /* Exceptions for "OpenRelayWatch" folder in "OpenRelayWatch" target */ = {
+			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
+			membershipExceptions = (
+				Info.plist,
+			);
+			target = 38WATCH042F00000000000004 /* OpenRelayWatch */;
+		};
+		38WATCH0F2F0000000000000F /* Exceptions for "Open UI" folder in "OpenRelayWatch" target */ = {
+			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
+			membershipExceptions = (
+				Shared/Watch/WatchModels.swift,
+				Shared/Watch/WatchProtocol.swift,
+				Shared/Watch/WidgetState.swift,
+			);
+			target = 38WATCH042F00000000000004 /* OpenRelayWatch */;
+		};
+		38WWID052F00000000000005 /* Exceptions for "OpenRelayWatchWidgets" folder in "OpenRelayWatchWidgets" target */ = {
+			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
+			membershipExceptions = (
+				Info.plist,
+			);
+			target = 38WWID042F00000000000004 /* OpenRelayWatchWidgets */;
+		};
+		38WWID0F2F0000000000000F /* Exceptions for "Open UI" folder in "OpenRelayWatchWidgets" target */ = {
+			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
+			membershipExceptions = (
+				Shared/Watch/WatchProtocol.swift,
+				Shared/Watch/WidgetState.swift,
+			);
+			target = 38WWID042F00000000000004 /* OpenRelayWatchWidgets */;
+		};
 /* End PBXFileSystemSynchronizedBuildFileExceptionSet section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
@@ -134,6 +205,8 @@
 			exceptions = (
 				38EB66802F39CE5B00AED774 /* Exceptions for "Open UI" folder in "Open UI" target */,
 				38VCLA012F00000000000001 /* Exceptions for "Open UI" folder in "OpenUIWidgetsExtension" target */,
+				38WATCH0F2F0000000000000F /* Exceptions for "Open UI" folder in "OpenRelayWatch" target */,
+				38WWID0F2F0000000000000F /* Exceptions for "Open UI" folder in "OpenRelayWatchWidgets" target */,
 			);
 			path = "Open UI";
 			sourceTree = "<group>";
@@ -144,6 +217,22 @@
 				38SHARE052F00000000000005 /* Exceptions for "OpenUIShareExtension" folder in "OpenUIShareExtension" target */,
 			);
 			path = OpenUIShareExtension;
+			sourceTree = "<group>";
+		};
+		38WATCH062F00000000000006 /* OpenRelayWatch */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			exceptions = (
+				38WATCH052F00000000000005 /* Exceptions for "OpenRelayWatch" folder in "OpenRelayWatch" target */,
+			);
+			path = OpenRelayWatch;
+			sourceTree = "<group>";
+		};
+		38WWID062F00000000000006 /* OpenRelayWatchWidgets */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			exceptions = (
+				38WWID052F00000000000005 /* Exceptions for "OpenRelayWatchWidgets" folder in "OpenRelayWatchWidgets" target */,
+			);
+			path = OpenRelayWatchWidgets;
 			sourceTree = "<group>";
 		};
 /* End PBXFileSystemSynchronizedRootGroup section */
@@ -208,6 +297,20 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		38WATCH072F00000000000007 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		38WWID072F00000000000007 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
@@ -226,6 +329,8 @@
 				38EB667F2F39CE5A00AED774 /* Open UI */,
 				3852C7122F71110800283682 /* OpenUIWidgets */,
 				38SHARE062F00000000000006 /* OpenUIShareExtension */,
+				38WATCH062F00000000000006 /* OpenRelayWatch */,
+				38WWID062F00000000000006 /* OpenRelayWatchWidgets */,
 				3852C70D2F71110800283682 /* Frameworks */,
 				38EB667E2F39CE5A00AED774 /* Products */,
 			);
@@ -237,6 +342,8 @@
 				38EB667D2F39CE5A00AED774 /* Open UI.app */,
 				3852C70C2F71110800283682 /* OpenUIWidgetsExtension.appex */,
 				38SHARE022F00000000000002 /* OpenUIShareExtension.appex */,
+				38WATCH022F00000000000002 /* OpenRelayWatch.app */,
+				38WWID022F00000000000002 /* OpenRelayWatchWidgets.appex */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -274,12 +381,14 @@
 				38EB667A2F39CE5A00AED774 /* Frameworks */,
 				38EB667B2F39CE5A00AED774 /* Resources */,
 				38A141942F4B9A1A00697C6F /* Embed Foundation Extensions */,
+				38WATCH0E2F0000000000000E /* Embed Watch Content */,
 			);
 			buildRules = (
 			);
 			dependencies = (
 				3852C7212F71110900283682 /* PBXTargetDependency */,
 				38SHARE0B2F0000000000000B /* PBXTargetDependency */,
+				38WATCH0B2F0000000000000B /* PBXTargetDependency */,
 			);
 			fileSystemSynchronizedGroups = (
 				38EB667F2F39CE5A00AED774 /* Open UI */,
@@ -349,6 +458,52 @@
 			productReference = 38SHARE022F00000000000002 /* OpenUIShareExtension.appex */;
 			productType = "com.apple.product-type.app-extension";
 		};
+		38WATCH042F00000000000004 /* OpenRelayWatch */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 38WATCH0A2F0000000000000A /* Build configuration list for PBXNativeTarget "OpenRelayWatch" */;
+			buildPhases = (
+				38WATCH082F00000000000008 /* Sources */,
+				38WATCH072F00000000000007 /* Frameworks */,
+				38WATCH092F00000000000009 /* Resources */,
+				38WWID0E2F0000000000000E /* Embed Foundation Extensions */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				38WWID0B2F0000000000000B /* PBXTargetDependency */,
+			);
+			fileSystemSynchronizedGroups = (
+				38WATCH062F00000000000006 /* OpenRelayWatch */,
+			);
+			name = OpenRelayWatch;
+			packageProductDependencies = (
+			);
+			productName = OpenRelayWatch;
+			productReference = 38WATCH022F00000000000002 /* OpenRelayWatch.app */;
+			productType = "com.apple.product-type.application";
+		};
+		38WWID042F00000000000004 /* OpenRelayWatchWidgets */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 38WWID0A2F0000000000000A /* Build configuration list for PBXNativeTarget "OpenRelayWatchWidgets" */;
+			buildPhases = (
+				38WWID082F00000000000008 /* Sources */,
+				38WWID072F00000000000007 /* Frameworks */,
+				38WWID092F00000000000009 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			fileSystemSynchronizedGroups = (
+				38WWID062F00000000000006 /* OpenRelayWatchWidgets */,
+			);
+			name = OpenRelayWatchWidgets;
+			packageProductDependencies = (
+			);
+			productName = OpenRelayWatchWidgets;
+			productReference = 38WWID022F00000000000002 /* OpenRelayWatchWidgets.appex */;
+			productType = "com.apple.product-type.app-extension";
+		};
 /* End PBXNativeTarget section */
 
 /* Begin PBXProject section */
@@ -367,6 +522,12 @@
 					};
 					38SHARE042F00000000000004 = {
 						CreatedOnToolsVersion = 26.3;
+					};
+					38WATCH042F00000000000004 = {
+						CreatedOnToolsVersion = 26.6;
+					};
+					38WWID042F00000000000004 = {
+						CreatedOnToolsVersion = 26.6;
 					};
 				};
 			};
@@ -398,6 +559,8 @@
 				38EB667C2F39CE5A00AED774 /* Open UI */,
 				3852C70B2F71110800283682 /* OpenUIWidgetsExtension */,
 				38SHARE042F00000000000004 /* OpenUIShareExtension */,
+				38WATCH042F00000000000004 /* OpenRelayWatch */,
+				38WWID042F00000000000004 /* OpenRelayWatchWidgets */,
 			);
 		};
 /* End PBXProject section */
@@ -418,6 +581,20 @@
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 		38SHARE092F00000000000009 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		38WATCH092F00000000000009 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		38WWID092F00000000000009 /* Resources */ = {
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
@@ -448,6 +625,20 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		38WATCH082F00000000000008 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		38WWID082F00000000000008 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXSourcesBuildPhase section */
 
 /* Begin PBXTargetDependency section */
@@ -460,6 +651,16 @@
 			isa = PBXTargetDependency;
 			target = 38SHARE042F00000000000004 /* OpenUIShareExtension */;
 			targetProxy = 38SHARE032F00000000000003 /* PBXContainerItemProxy */;
+		};
+		38WATCH0B2F0000000000000B /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 38WATCH042F00000000000004 /* OpenRelayWatch */;
+			targetProxy = 38WATCH032F00000000000003 /* PBXContainerItemProxy */;
+		};
+		38WWID0B2F0000000000000B /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 38WWID042F00000000000004 /* OpenRelayWatchWidgets */;
+			targetProxy = 38WWID032F00000000000003 /* PBXContainerItemProxy */;
 		};
 /* End PBXTargetDependency section */
 
@@ -483,7 +684,7 @@
 					"@executable_path/Frameworks",
 					"@executable_path/../../Frameworks",
 				);
-				MARKETING_VERSION = 5.9;
+				MARKETING_VERSION = 6.0;
 				PRODUCT_BUNDLE_IDENTIFIER = com.openui.openui.OpenUIWidget;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SKIP_INSTALL = YES;
@@ -515,7 +716,7 @@
 					"@executable_path/Frameworks",
 					"@executable_path/../../Frameworks",
 				);
-				MARKETING_VERSION = 5.9;
+				MARKETING_VERSION = 6.0;
 				PRODUCT_BUNDLE_IDENTIFIER = com.openui.openui.OpenUIWidget;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SKIP_INSTALL = YES;
@@ -666,12 +867,15 @@
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = "Open UI/Info.plist";
 				INFOPLIST_KEY_CFBundleDisplayName = "Open Relay";
+				INFOPLIST_KEY_ITSAppUsesNonExemptEncryption = NO;
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.productivity";
 				INFOPLIST_KEY_LSSupportsOpeningDocumentsInPlace = YES;
 				INFOPLIST_KEY_NSCameraUsageDescription = "Open Relay needs camera access to capture photos and documents for chat attachments.";
 				INFOPLIST_KEY_NSFaceIDUsageDescription = "Open Relay uses Face ID to protect your account and conversations.";
+				INFOPLIST_KEY_NSLocalNetworkUsageDescription = "Open Relay uses your local network to connect to your self-hosted OpenWebUI server.";
+				INFOPLIST_KEY_NSLocationWhenInUseUsageDescription = "Open Relay uses your location to provide location-aware responses when you enable the Share Location feature in Privacy & Security settings.";
 				INFOPLIST_KEY_NSMicrophoneUsageDescription = "Open Relay needs microphone access for voice input and voice calls.";
-				INFOPLIST_KEY_NSPhotoLibraryAddUsageDescription = "Open Relay needs permission to save images generated in conversations to your photo library.";
+				INFOPLIST_KEY_NSPhotoLibraryAddUsageDescription = "Open Relay needs access to save images from chat to your Photos library.";
 				INFOPLIST_KEY_NSPhotoLibraryUsageDescription = "Open Relay needs photo library access to attach images to your conversations.";
 				INFOPLIST_KEY_NSSpeechRecognitionUsageDescription = "Open Relay uses speech recognition to convert your voice input to text.";
 				INFOPLIST_KEY_NSSupportsLiveActivities = YES;
@@ -685,7 +889,7 @@
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				MARKETING_VERSION = 5.9;
+				MARKETING_VERSION = 6.0;
 				PRODUCT_BUNDLE_IDENTIFIER = com.openui.openui;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;
@@ -715,12 +919,15 @@
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = "Open UI/Info.plist";
 				INFOPLIST_KEY_CFBundleDisplayName = "Open Relay";
+				INFOPLIST_KEY_ITSAppUsesNonExemptEncryption = NO;
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.productivity";
 				INFOPLIST_KEY_LSSupportsOpeningDocumentsInPlace = YES;
 				INFOPLIST_KEY_NSCameraUsageDescription = "Open Relay needs camera access to capture photos and documents for chat attachments.";
 				INFOPLIST_KEY_NSFaceIDUsageDescription = "Open Relay uses Face ID to protect your account and conversations.";
+				INFOPLIST_KEY_NSLocalNetworkUsageDescription = "Open Relay uses your local network to connect to your self-hosted OpenWebUI server.";
+				INFOPLIST_KEY_NSLocationWhenInUseUsageDescription = "Open Relay uses your location to provide location-aware responses when you enable the Share Location feature in Privacy & Security settings.";
 				INFOPLIST_KEY_NSMicrophoneUsageDescription = "Open Relay needs microphone access for voice input and voice calls.";
-				INFOPLIST_KEY_NSPhotoLibraryAddUsageDescription = "Open Relay needs permission to save images generated in conversations to your photo library.";
+				INFOPLIST_KEY_NSPhotoLibraryAddUsageDescription = "Open Relay needs access to save images from chat to your Photos library.";
 				INFOPLIST_KEY_NSPhotoLibraryUsageDescription = "Open Relay needs photo library access to attach images to your conversations.";
 				INFOPLIST_KEY_NSSpeechRecognitionUsageDescription = "Open Relay uses speech recognition to convert your voice input to text.";
 				INFOPLIST_KEY_NSSupportsLiveActivities = YES;
@@ -734,7 +941,7 @@
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				MARKETING_VERSION = 5.9;
+				MARKETING_VERSION = 6.0;
 				PRODUCT_BUNDLE_IDENTIFIER = com.openui.openui;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;
@@ -767,7 +974,7 @@
 					"@executable_path/Frameworks",
 					"@executable_path/../../Frameworks",
 				);
-				MARKETING_VERSION = 5.9;
+				MARKETING_VERSION = 6.0;
 				PRODUCT_BUNDLE_IDENTIFIER = com.openui.openui.ShareExtension;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SKIP_INSTALL = YES;
@@ -794,7 +1001,7 @@
 					"@executable_path/Frameworks",
 					"@executable_path/../../Frameworks",
 				);
-				MARKETING_VERSION = 5.9;
+				MARKETING_VERSION = 6.0;
 				PRODUCT_BUNDLE_IDENTIFIER = com.openui.openui.ShareExtension;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SKIP_INSTALL = YES;
@@ -802,6 +1009,138 @@
 				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
 				SWIFT_VERSION = 5.0;
 				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Release;
+		};
+		38WATCH0C2F0000000000000C /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_ENTITLEMENTS = OpenRelayWatch/OpenRelayWatch.entitlements;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = 6ARX8PF3MT;
+				ENABLE_PREVIEWS = YES;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = OpenRelayWatch/Info.plist;
+				INFOPLIST_KEY_CFBundleDisplayName = "Open Relay";
+				INFOPLIST_KEY_NSMicrophoneUsageDescription = "Open Relay uses the microphone so you can talk to your AI assistant from your watch.";
+				INFOPLIST_KEY_UISupportedInterfaceOrientations = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown";
+				INFOPLIST_KEY_WKCompanionAppBundleIdentifier = com.openui.openui;
+				INFOPLIST_KEY_WKRunsIndependentlyOfCompanionApp = NO;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				MARKETING_VERSION = 6.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.openui.openui.watchkitapp;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = watchos;
+				SKIP_INSTALL = YES;
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = 4;
+				WATCHOS_DEPLOYMENT_TARGET = 11.0;
+			};
+			name = Debug;
+		};
+		38WATCH0D2F0000000000000D /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_ENTITLEMENTS = OpenRelayWatch/OpenRelayWatch.entitlements;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = 6ARX8PF3MT;
+				ENABLE_PREVIEWS = YES;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = OpenRelayWatch/Info.plist;
+				INFOPLIST_KEY_CFBundleDisplayName = "Open Relay";
+				INFOPLIST_KEY_NSMicrophoneUsageDescription = "Open Relay uses the microphone so you can talk to your AI assistant from your watch.";
+				INFOPLIST_KEY_UISupportedInterfaceOrientations = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown";
+				INFOPLIST_KEY_WKCompanionAppBundleIdentifier = com.openui.openui;
+				INFOPLIST_KEY_WKRunsIndependentlyOfCompanionApp = NO;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				MARKETING_VERSION = 6.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.openui.openui.watchkitapp;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = watchos;
+				SKIP_INSTALL = YES;
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = 4;
+				VALIDATE_PRODUCT = YES;
+				WATCHOS_DEPLOYMENT_TARGET = 11.0;
+			};
+			name = Release;
+		};
+		38WWID0C2F0000000000000C /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_ENTITLEMENTS = OpenRelayWatchWidgets/OpenRelayWatchWidgets.entitlements;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = 6ARX8PF3MT;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = OpenRelayWatchWidgets/Info.plist;
+				INFOPLIST_KEY_CFBundleDisplayName = "Open Relay";
+				INFOPLIST_KEY_NSHumanReadableCopyright = "";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@executable_path/../../Frameworks",
+				);
+				MARKETING_VERSION = 6.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.openui.openui.watchkitapp.widgets;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = watchos;
+				SKIP_INSTALL = YES;
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = 4;
+				WATCHOS_DEPLOYMENT_TARGET = 11.0;
+			};
+			name = Debug;
+		};
+		38WWID0D2F0000000000000D /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_ENTITLEMENTS = OpenRelayWatchWidgets/OpenRelayWatchWidgets.entitlements;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = 6ARX8PF3MT;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = OpenRelayWatchWidgets/Info.plist;
+				INFOPLIST_KEY_CFBundleDisplayName = "Open Relay";
+				INFOPLIST_KEY_NSHumanReadableCopyright = "";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@executable_path/../../Frameworks",
+				);
+				MARKETING_VERSION = 6.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.openui.openui.watchkitapp.widgets;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = watchos;
+				SKIP_INSTALL = YES;
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = 4;
+				VALIDATE_PRODUCT = YES;
+				WATCHOS_DEPLOYMENT_TARGET = 11.0;
 			};
 			name = Release;
 		};
@@ -840,6 +1179,24 @@
 			buildConfigurations = (
 				38SHARE0C2F0000000000000C /* Debug */,
 				38SHARE0D2F0000000000000D /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		38WATCH0A2F0000000000000A /* Build configuration list for PBXNativeTarget "OpenRelayWatch" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				38WATCH0C2F0000000000000C /* Debug */,
+				38WATCH0D2F0000000000000D /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		38WWID0A2F0000000000000A /* Build configuration list for PBXNativeTarget "OpenRelayWatchWidgets" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				38WWID0C2F0000000000000C /* Debug */,
+				38WWID0D2F0000000000000D /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;

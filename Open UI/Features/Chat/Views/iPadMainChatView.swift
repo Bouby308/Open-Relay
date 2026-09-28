@@ -1236,6 +1236,7 @@ struct iPadSidebarContent: View {
     @State private var pendingVoiceCallAction: (() -> Void)?
 
     /// Top-level section collapse states (shared with iPhone via same AppStorage keys).
+    @AppStorage("sidebar_models_expanded") private var modelsExpanded: Bool = true
     @AppStorage("sidebar_folders_expanded") private var foldersExpanded: Bool = true
     @AppStorage("sidebar_shared_folders_expanded") private var sharedFoldersExpanded: Bool = true
     @AppStorage("sidebar_channels_expanded") private var channelsExpanded: Bool = true
@@ -1573,64 +1574,83 @@ struct iPadSidebarContent: View {
 
         if !pinnedModels.isEmpty {
             VStack(alignment: .leading, spacing: 0) {
-                // Section header
-                HStack(spacing: 6) {
-                    Image(systemName: "cpu")
-                        .scaledFont(size: 9, weight: .semibold, context: .list)
-                        .foregroundStyle(theme.textTertiary)
-                    Text("Models")
-                        .scaledFont(size: 12, weight: .medium, context: .list)
-                        .fontWeight(.bold)
-                        .foregroundStyle(theme.textTertiary)
-                        .textCase(.uppercase)
-                        .tracking(0.5)
-                    Spacer()
+                // Collapsible section header
+                Button {
+                    withAnimation(MicroAnimation.snappy) {
+                        modelsExpanded.toggle()
+                    }
+                    Haptics.play(.light)
+                } label: {
+                    HStack(spacing: 6) {
+                        Image(systemName: "chevron.down")
+                            .scaledFont(size: 8, weight: .bold, context: .list)
+                            .foregroundStyle(theme.textTertiary)
+                            .rotationEffect(.degrees(modelsExpanded ? 0 : -90))
+                            .animation(MicroAnimation.snappy, value: modelsExpanded)
+                        Image(systemName: "cpu")
+                            .scaledFont(size: 9, weight: .semibold, context: .list)
+                            .foregroundStyle(theme.textTertiary)
+                        Text("Models")
+                            .scaledFont(size: 12, weight: .medium, context: .list)
+                            .fontWeight(.bold)
+                            .foregroundStyle(theme.textTertiary)
+                            .textCase(.uppercase)
+                            .tracking(0.5)
+                        Spacer()
+                    }
+                    .padding(.horizontal, Spacing.md)
+                    .padding(.vertical, Spacing.sm)
+                    .contentShape(Rectangle())
                 }
-                .padding(.horizontal, Spacing.md)
-                .padding(.vertical, Spacing.sm)
+                .buttonStyle(.plain)
+                .accessibilityLabel("Models")
+                .accessibilityValue(modelsExpanded ? "Expanded" : "Collapsed")
+                .accessibilityIdentifier("sidebar-models-header")
 
                 // Pinned model rows
-                ForEach(pinnedModels) { model in
-                    let isSelected = model.id == vm.selectedModelId
-                    Button {
-                        let modelId = model.id
-                        onNewChat()
-                        let newVM = dependencies.activeChatStore.viewModel(for: nil)
-                        newVM.selectModel(modelId)
-                    } label: {
-                        HStack(spacing: 8) {
-                            ModelAvatar(
-                                size: 22,
-                                imageURL: vm.resolvedImageURL(for: model),
-                                label: model.shortName,
-                                authToken: vm.serverAuthToken
-                            )
-                            Text(model.shortName)
-                                .scaledFont(size: 14, context: .list)
-                                .fontWeight(isSelected ? .semibold : .regular)
-                                .foregroundStyle(isSelected ? theme.textPrimary : theme.textSecondary)
-                                .lineLimit(1)
-                            Spacer()
-                            // Always render checkmark to avoid layout shifts on insertion/removal
-                            Image(systemName: "checkmark")
-                                .scaledFont(size: 11, weight: .semibold, context: .list)
-                                .foregroundStyle(theme.brandPrimary)
-                                .opacity(isSelected ? 1 : 0)
-                        }
-                        .padding(.horizontal, Spacing.md)
-                        .padding(.vertical, 7)
-                        .background(isSelected ? theme.brandPrimary.opacity(0.1) : Color.clear)
-                        .clipShape(RoundedRectangle(cornerRadius: CornerRadius.sm, style: .continuous))
-                        .contentShape(Rectangle())
-                    }
-                    .buttonStyle(.plain)
-                    .transaction { $0.animation = nil }
-                    .contextMenu {
-                        Button(role: .destructive) {
-                            vm.togglePinModel(model.id)
-                            Haptics.play(.medium)
+                if modelsExpanded {
+                    ForEach(pinnedModels) { model in
+                        let isSelected = model.id == vm.selectedModelId
+                        Button {
+                            let modelId = model.id
+                            onNewChat()
+                            let newVM = dependencies.activeChatStore.viewModel(for: nil)
+                            newVM.selectModel(modelId)
                         } label: {
-                            Label("Unpin", systemImage: "pin.slash")
+                            HStack(spacing: 8) {
+                                ModelAvatar(
+                                    size: 22,
+                                    imageURL: vm.resolvedImageURL(for: model),
+                                    label: model.shortName,
+                                    authToken: vm.serverAuthToken
+                                )
+                                Text(model.shortName)
+                                    .scaledFont(size: 14, context: .list)
+                                    .fontWeight(isSelected ? .semibold : .regular)
+                                    .foregroundStyle(isSelected ? theme.textPrimary : theme.textSecondary)
+                                    .lineLimit(1)
+                                Spacer()
+                                // Always render checkmark to avoid layout shifts on insertion/removal
+                                Image(systemName: "checkmark")
+                                    .scaledFont(size: 11, weight: .semibold, context: .list)
+                                    .foregroundStyle(theme.brandPrimary)
+                                    .opacity(isSelected ? 1 : 0)
+                            }
+                            .padding(.horizontal, Spacing.md)
+                            .padding(.vertical, 7)
+                            .background(isSelected ? theme.brandPrimary.opacity(0.1) : Color.clear)
+                            .clipShape(RoundedRectangle(cornerRadius: CornerRadius.sm, style: .continuous))
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .transaction { $0.animation = nil }
+                        .contextMenu {
+                            Button(role: .destructive) {
+                                vm.togglePinModel(model.id)
+                                Haptics.play(.medium)
+                            } label: {
+                                Label("Unpin", systemImage: "pin.slash")
+                            }
                         }
                     }
                 }

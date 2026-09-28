@@ -451,6 +451,11 @@ struct AuthMethodSelectionView: View {
 
                 // Auth methods
                 VStack(spacing: Spacing.md) {
+                    // System-browser sign-in errors only (native SSO servers).
+                    if let error = viewModel.nativeSSOError {
+                        AuthErrorBanner(message: error)
+                    }
+
                     // OAuth provider buttons
                     if !enabledOAuthProviders.isEmpty {
                         VStack(spacing: Spacing.sm) {
@@ -578,10 +583,17 @@ struct AuthMethodSelectionView: View {
         let displayName = viewModel.oauthProviders?.displayName(for: provider)
             ?? provider.capitalized
         let iconName = OAuthProviders.iconName(for: provider)
+        // System-browser flow only for the opted-in generic OIDC provider.
+        // Every other provider (Google, GitHub, Microsoft, …) is unchanged.
+        let useNative = viewModel.usesNativeSSO(for: provider)
 
         return Button {
             viewModel.selectedSSOProvider = provider
-            viewModel.goToPhase(.ssoLogin)
+            if useNative {
+                Task { await viewModel.startNativeSSOSignIn() }
+            } else {
+                viewModel.goToPhase(.ssoLogin)
+            }
         } label: {
             HStack(spacing: Spacing.md) {
                 Image(systemName: iconName)
@@ -595,9 +607,14 @@ struct AuthMethodSelectionView: View {
 
                 Spacer()
 
-                Image(systemName: "arrow.right")
-                    .scaledFont(size: 12, weight: .semibold)
-                    .foregroundStyle(theme.buttonPrimaryText.opacity(0.7))
+                if useNative && viewModel.isLoggingIn {
+                    ProgressView()
+                        .tint(theme.buttonPrimaryText)
+                } else {
+                    Image(systemName: "arrow.right")
+                        .scaledFont(size: 12, weight: .semibold)
+                        .foregroundStyle(theme.buttonPrimaryText.opacity(0.7))
+                }
             }
             .padding(.horizontal, Spacing.md)
             .frame(maxWidth: .infinity)
@@ -611,6 +628,7 @@ struct AuthMethodSelectionView: View {
         .clipShape(RoundedRectangle(cornerRadius: CornerRadius.button + 4, style: .continuous))
         .buttonStyle(.plain)
         .pressEffect()
+        .disabled(useNative && viewModel.isLoggingIn)
     }
 
     // MARK: - Divider with Text

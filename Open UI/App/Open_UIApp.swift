@@ -26,6 +26,17 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
     /// Consumed by the `scenePhase == .active` handler in `Open_UIApp`.
     static var pendingShortcutAction: String?
 
+    /// Activates the Apple Watch link as early as possible so a background
+    /// wake from the watch can be answered before any UI exists. The link
+    /// never touches auth state (see `WatchSessionManager`).
+    func application(
+        _ application: UIApplication,
+        didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil
+    ) -> Bool {
+        WatchSessionManager.shared.activate()
+        return true
+    }
+
     /// Return a scene configuration that uses our custom SceneDelegate.
     func application(
         _ application: UIApplication,
@@ -179,6 +190,8 @@ struct Open_UIApp: App {
                             _ = await (appCheck, serverCheck)
                         }
 
+                        // Keep the Apple Watch app's chat list fresh.
+                        WatchRelayService.shared.refreshWatchIfNeeded()
                         // Process pending actions after a short delay so that
                         // MainChatView / iPadMainChatView have time to mount
                         // their .onReceive handlers before we post notifications.
@@ -317,6 +330,12 @@ struct Open_UIApp: App {
                         handleDeepLink(url)
                     }
                 }
+                // Handoff from the Apple Watch: "Open on iPhone" → that chat.
+                .onContinueUserActivity(WatchProtocol.chatActivityType) { activity in
+                    guard let id = activity.userInfo?[WatchProtocol.chatActivityIdKey] as? String,
+                          let url = URL(string: "openui://chat/\(id)") else { return }
+                    handleDeepLink(url)
+                }
         }
     }
 
@@ -351,6 +370,10 @@ struct Open_UIApp: App {
     /// Handles deep links from widgets and external sources.
     private func handleDeepLink(_ url: URL) {
         guard let host = url.host() else { return }
+
+        // Native SSO callbacks are consumed by ASWebAuthenticationSession; if one
+        // ever reaches the app directly, ignore it rather than routing anywhere.
+        if host == NativeOIDCAuthenticator.callbackHost { return }
 
         switch host {
         case "new-chat":

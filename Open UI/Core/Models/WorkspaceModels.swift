@@ -1188,7 +1188,17 @@ struct ModelDetail: Identifiable, Sendable {
     var capUsage: Bool
     var capCitations: Bool
     var capStatusUpdates: Bool
+    var capMemory: Bool
     var capBuiltinTools: Bool
+
+    // Default Terminal (meta.terminalId) — nil/empty = None
+    var terminalId: String?
+
+    /// The original `meta` object as received from the server (JSON-encoded so the
+    /// struct stays `Sendable`). Used as the base when saving so keys the app doesn't
+    /// manage (e.g. `i18n`, `background_image_url`) are preserved — mirrors the web
+    /// editor, which mutates `info.meta` in place rather than rebuilding it.
+    var originalMetaJSON: Data?
 
     // Default Features (meta.defaultFeatureIds)
     var defaultFeatureWebSearch: Bool
@@ -1197,6 +1207,7 @@ struct ModelDetail: Identifiable, Sendable {
 
     // Builtin Tools (meta.builtinTools)
     var builtinTime: Bool
+    var builtinUserInput: Bool
     var builtinMemory: Bool
     var builtinChats: Bool
     var builtinNotes: Bool
@@ -1224,7 +1235,7 @@ struct ModelDetail: Identifiable, Sendable {
     // Suggestion Prompts (meta.suggestion_prompts)
     var suggestionPrompts: [SuggestionPrompt]
 
-    // TTS Voice (meta.tts_voice)
+    // TTS Voice (meta.tts.voice — legacy meta.tts_voice is read as a fallback)
     var ttsVoice: String
 
     // Advanced Params — nil = Default (not sent), non-nil = Custom (sent)
@@ -1278,12 +1289,13 @@ struct ModelDetail: Identifiable, Sendable {
          systemPrompt: String = "",
          capVision: Bool = true, capFileUpload: Bool = true, capFileContext: Bool = true,
          capWebSearch: Bool = true, capImageGeneration: Bool = true, capCodeInterpreter: Bool = true,
-         capTerminal: Bool = false,
-         capUsage: Bool = true, capCitations: Bool = true, capStatusUpdates: Bool = true,
-         capBuiltinTools: Bool = true,
+         capTerminal: Bool = true,
+         capUsage: Bool = false, capCitations: Bool = true, capStatusUpdates: Bool = true,
+         capMemory: Bool = true, capBuiltinTools: Bool = true, terminalId: String? = nil,
          defaultFeatureWebSearch: Bool = true, defaultFeatureImageGen: Bool = false,
          defaultFeatureCodeInterpreter: Bool = false,
-         builtinTime: Bool = true, builtinMemory: Bool = true, builtinChats: Bool = true,
+         builtinTime: Bool = true, builtinUserInput: Bool = true,
+         builtinMemory: Bool = true, builtinChats: Bool = true,
          builtinNotes: Bool = true, builtinKnowledge: Bool = true, builtinFiles: Bool = true,
          builtinChannels: Bool = true, builtinNotifications: Bool = true,
          builtinTaskManagement: Bool = true, builtinAutomations: Bool = true, builtinCalendar: Bool = true,
@@ -1299,11 +1311,13 @@ struct ModelDetail: Identifiable, Sendable {
         self.capWebSearch = capWebSearch; self.capImageGeneration = capImageGeneration
         self.capCodeInterpreter = capCodeInterpreter; self.capTerminal = capTerminal; self.capUsage = capUsage
         self.capCitations = capCitations; self.capStatusUpdates = capStatusUpdates
-        self.capBuiltinTools = capBuiltinTools
+        self.capMemory = capMemory; self.capBuiltinTools = capBuiltinTools
+        self.terminalId = terminalId; self.originalMetaJSON = nil
         self.defaultFeatureWebSearch = defaultFeatureWebSearch
         self.defaultFeatureImageGen = defaultFeatureImageGen
         self.defaultFeatureCodeInterpreter = defaultFeatureCodeInterpreter
-        self.builtinTime = builtinTime; self.builtinMemory = builtinMemory; self.builtinChats = builtinChats
+        self.builtinTime = builtinTime; self.builtinUserInput = builtinUserInput
+        self.builtinMemory = builtinMemory; self.builtinChats = builtinChats
         self.builtinNotes = builtinNotes; self.builtinKnowledge = builtinKnowledge
         self.builtinFiles = builtinFiles; self.builtinChannels = builtinChannels
         self.builtinNotifications = builtinNotifications
@@ -1349,9 +1363,15 @@ struct ModelDetail: Identifiable, Sendable {
         else { self.updatedAt = nil }
 
         let meta = json["meta"] as? [String: Any] ?? [:]
+        self.originalMetaJSON = JSONSerialization.isValidJSONObject(meta)
+            ? try? JSONSerialization.data(withJSONObject: meta) : nil
         self.description = meta["description"] as? String
         self.profileImageURL = meta["profile_image_url"] as? String
-        self.ttsVoice = meta["tts_voice"] as? String ?? ""
+        self.ttsVoice = (meta["tts"] as? [String: Any])?["voice"] as? String
+            ?? meta["tts_voice"] as? String ?? ""
+        if let tid = meta["terminalId"] as? String, !tid.isEmpty {
+            self.terminalId = tid
+        } else { self.terminalId = nil }
 
         if let tagArray = meta["tags"] as? [[String: Any]] {
             self.tags = tagArray.compactMap { $0["name"] as? String }
@@ -1384,10 +1404,12 @@ struct ModelDetail: Identifiable, Sendable {
         self.capWebSearch = caps["web_search"] as? Bool ?? true
         self.capImageGeneration = caps["image_generation"] as? Bool ?? true
         self.capCodeInterpreter = caps["code_interpreter"] as? Bool ?? true
-        self.capTerminal = caps["terminal"] as? Bool ?? false
-        self.capUsage = caps["usage"] as? Bool ?? true
+        // Defaults mirror OpenWebUI's DEFAULT_CAPABILITIES (usage off, everything else on).
+        self.capTerminal = caps["terminal"] as? Bool ?? true
+        self.capUsage = caps["usage"] as? Bool ?? false
         self.capCitations = caps["citations"] as? Bool ?? true
         self.capStatusUpdates = caps["status_updates"] as? Bool ?? true
+        self.capMemory = caps["memory"] as? Bool ?? true
         self.capBuiltinTools = caps["builtin_tools"] as? Bool ?? true
 
         let defF = meta["defaultFeatureIds"] as? [String] ?? []
@@ -1397,6 +1419,7 @@ struct ModelDetail: Identifiable, Sendable {
 
         let bt = meta["builtinTools"] as? [String: Any] ?? [:]
         self.builtinTime = bt["time"] as? Bool ?? true
+        self.builtinUserInput = bt["user_input"] as? Bool ?? true
         self.builtinMemory = bt["memory"] as? Bool ?? true
         self.builtinChats = bt["chats"] as? Bool ?? true
         self.builtinNotes = bt["notes"] as? Bool ?? true
@@ -1519,31 +1542,56 @@ struct ModelDetail: Identifiable, Sendable {
     }
 
     func buildMetaPayload() -> [String: Any] {
-        var meta: [String: Any] = [:]
+        // Start from the server's original meta so keys this app doesn't manage
+        // (i18n, background_image_url, future fields…) survive a save.
+        var meta: [String: Any] = originalMetaJSON
+            .flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] } ?? [:]
         meta["profile_image_url"] = profileImageURL ?? "/static/favicon.png"
         meta["description"] = description.flatMap { $0.isEmpty ? nil : $0 } as Any? ?? NSNull()
         meta["tags"] = tags.map { ["name": $0] }
-        meta["capabilities"] = [
+
+        // Capabilities — merged over any server-side keys we don't render.
+        var caps = meta["capabilities"] as? [String: Any] ?? [:]
+        let knownCaps: [String: Bool] = [
             "vision": capVision, "file_upload": capFileUpload, "file_context": capFileContext,
             "web_search": capWebSearch, "image_generation": capImageGeneration,
             "code_interpreter": capCodeInterpreter, "terminal": capTerminal, "usage": capUsage,
-            "citations": capCitations, "status_updates": capStatusUpdates, "builtin_tools": capBuiltinTools
+            "citations": capCitations, "status_updates": capStatusUpdates, "memory": capMemory,
+            "builtin_tools": capBuiltinTools
         ]
+        for (k, v) in knownCaps { caps[k] = v }
+        meta["capabilities"] = caps
+
+        // Default features — only features whose capability is enabled (matches web UI).
         var defF: [String] = []
-        if defaultFeatureWebSearch { defF.append("web_search") }
-        if defaultFeatureImageGen { defF.append("image_generation") }
-        if defaultFeatureCodeInterpreter { defF.append("code_interpreter") }
-        meta["defaultFeatureIds"] = defF
-        meta["builtinTools"] = [
-            "time": builtinTime, "memory": builtinMemory, "chats": builtinChats,
-            "notes": builtinNotes, "knowledge": builtinKnowledge, "files": builtinFiles,
-            "channels": builtinChannels, "notifications": builtinNotifications,
+        if defaultFeatureWebSearch && capWebSearch { defF.append("web_search") }
+        if defaultFeatureImageGen && capImageGeneration { defF.append("image_generation") }
+        if defaultFeatureCodeInterpreter && capCodeInterpreter { defF.append("code_interpreter") }
+        if defF.isEmpty { meta.removeValue(forKey: "defaultFeatureIds") } else { meta["defaultFeatureIds"] = defF }
+
+        // Builtin tools — the web UI stores only disabled tools (`false`) and deletes
+        // enabled ones, so tools added to the server later default to on.
+        var bt = meta["builtinTools"] as? [String: Any] ?? [:]
+        let knownTools: [String: Bool] = [
+            "time": builtinTime, "user_input": builtinUserInput, "memory": builtinMemory,
+            "chats": builtinChats, "notes": builtinNotes, "knowledge": builtinKnowledge,
+            "files": builtinFiles, "channels": builtinChannels, "notifications": builtinNotifications,
             // Web UI key is "tasks" (not "task_management")
             "tasks": builtinTaskManagement, "automations": builtinAutomations,
             "calendar": builtinCalendar, "subagents": builtinSubagents,
             "web_search": builtinWebSearch, "image_generation": builtinImageGen,
             "code_interpreter": builtinCodeInterpreter
         ]
+        bt.removeValue(forKey: "task_management")
+        for (k, enabled) in knownTools {
+            if enabled { bt.removeValue(forKey: k) } else { bt[k] = false }
+        }
+        if bt.isEmpty { meta.removeValue(forKey: "builtinTools") } else { meta["builtinTools"] = bt }
+
+        // Default terminal
+        if let tid = terminalId, !tid.isEmpty { meta["terminalId"] = tid }
+        else { meta.removeValue(forKey: "terminalId") }
+
         meta["knowledge"] = knowledgeItems.map { ["type": $0.type.rawValue, "id": $0.id, "name": $0.name] }
         meta["toolIds"] = toolIds
         meta["filterIds"] = filterIds
@@ -1553,7 +1601,13 @@ struct ModelDetail: Identifiable, Sendable {
         meta["suggestion_prompts"] = suggestionPrompts.isEmpty
             ? NSNull()
             : suggestionPrompts.map { $0.toJSON() }
-        if !ttsVoice.trimmingCharacters(in: .whitespaces).isEmpty { meta["tts_voice"] = ttsVoice }
+
+        // TTS voice — web UI reads meta.tts.voice. Drop the legacy key this app used to write.
+        meta.removeValue(forKey: "tts_voice")
+        var tts = meta["tts"] as? [String: Any] ?? [:]
+        let voice = ttsVoice.trimmingCharacters(in: .whitespaces)
+        if voice.isEmpty { tts.removeValue(forKey: "voice") } else { tts["voice"] = voice }
+        if tts.isEmpty { meta.removeValue(forKey: "tts") } else { meta["tts"] = tts }
         return meta
     }
 

@@ -38,10 +38,11 @@ final class AdminModelsSettingsViewModel {
     var capWebSearch = true
     var capImageGeneration = true
     var capCodeInterpreter = true
-    var capTerminal = false
+    var capTerminal = true
     var capUsage = false
     var capCitations = true
     var capStatusUpdates = true
+    var capMemory = true
     var capBuiltinTools = true
 
     // Default Features
@@ -51,6 +52,7 @@ final class AdminModelsSettingsViewModel {
 
     // Builtin Tools
     var btTime = true
+    var btUserInput = true
     var btMemory = true
     var btChats = true
     var btNotes = true
@@ -284,18 +286,21 @@ final class AdminModelsSettingsViewModel {
             "usage": capUsage,
             "citations": capCitations,
             "status_updates": capStatusUpdates,
+            "memory": capMemory,
             "builtin_tools": capBuiltinTools
         ]
 
         // Build default feature IDs
         var defaultFeatureIds: [String] = []
-        if defWebSearch { defaultFeatureIds.append("web_search") }
-        if defImageGeneration { defaultFeatureIds.append("image_generation") }
-        if defCodeInterpreter { defaultFeatureIds.append("code_interpreter") }
+        if defWebSearch && capWebSearch { defaultFeatureIds.append("web_search") }
+        if defImageGeneration && capImageGeneration { defaultFeatureIds.append("image_generation") }
+        if defCodeInterpreter && capCodeInterpreter { defaultFeatureIds.append("code_interpreter") }
 
-        // Build builtin tools dict
-        let builtinTools: [String: Any] = [
+        // Build builtin tools dict — web UI stores only disabled tools (`false`) so
+        // tools added to the server later default to enabled.
+        let allBuiltinTools: [String: Bool] = [
             "time": btTime,
+            "user_input": btUserInput,
             "memory": btMemory,
             "chats": btChats,
             "notes": btNotes,
@@ -311,6 +316,7 @@ final class AdminModelsSettingsViewModel {
             "calendar": btCalendar,
             "subagents": btSubagents
         ]
+        let builtinTools: [String: Any] = allBuiltinTools.filter { !$0.value }.mapValues { $0 as Any }
 
         // Build params dict — only include non-nil values
         var params: [String: Any] = [:]
@@ -406,10 +412,11 @@ final class AdminModelsSettingsViewModel {
                 capWebSearch = caps["web_search"] as? Bool ?? true
                 capImageGeneration = caps["image_generation"] as? Bool ?? true
                 capCodeInterpreter = caps["code_interpreter"] as? Bool ?? true
-                capTerminal = caps["terminal"] as? Bool ?? false
+                capTerminal = caps["terminal"] as? Bool ?? true
                 capUsage = caps["usage"] as? Bool ?? false
                 capCitations = caps["citations"] as? Bool ?? true
                 capStatusUpdates = caps["status_updates"] as? Bool ?? true
+                capMemory = caps["memory"] as? Bool ?? true
                 capBuiltinTools = caps["builtin_tools"] as? Bool ?? true
             }
             if let defFeatures = meta["defaultFeatureIds"] as? [String] {
@@ -419,6 +426,7 @@ final class AdminModelsSettingsViewModel {
             }
             if let bt = meta["builtinTools"] as? [String: Any] {
                 btTime = bt["time"] as? Bool ?? true
+                btUserInput = bt["user_input"] as? Bool ?? true
                 btMemory = bt["memory"] as? Bool ?? true
                 btChats = bt["chats"] as? Bool ?? bt["chat_history"] as? Bool ?? true
                 btNotes = bt["notes"] as? Bool ?? true

@@ -142,8 +142,10 @@ struct AIModel: Codable, Identifiable, Hashable, Sendable {
     /// Whether the terminal capability is enabled for this model.
     /// Reads `capabilities["terminal"]` which is stored as a string `"true"/"false"`
     /// (capabilities dict uses `[String: String]` via compactMapValues).
+    /// Missing = enabled, matching the server (`capabilities.get('terminal', True)`)
+    /// and the web client (`capabilities?.terminal ?? true`).
     var supportsTerminal: Bool {
-        guard let val = capabilities?["terminal"] else { return false }
+        guard let val = capabilities?["terminal"] else { return true }
         return val == "true" || val == "1"
     }
 

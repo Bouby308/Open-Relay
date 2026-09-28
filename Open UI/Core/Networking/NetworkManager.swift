@@ -28,6 +28,58 @@ final class NetworkManager: NSObject, Sendable {
     private var _tokenExpiredFired = false
     var onTokenExpired: (() -> Void)?
 
+    // MARK: - Native SSO 401 recovery (opt-in)
+
+    /// Silent session-renewal hook, consulted when an authenticated request gets
+    /// a 401 — BEFORE the failure surfaces. Returns `true` when a fresh JWT was
+    /// installed in the Keychain; the request is then retried exactly once.
+    ///
+    /// Only registered for servers with native SSO enabled. When `nil` (every
+    /// other server), `performRequest` behaves exactly as it always has.
+    var onUnauthorizedRecover: (@MainActor @Sendable () async -> Bool)? {
+        get {
+            _recoverLock.lock()
+            defer { _recoverLock.unlock() }
+            return _onUnauthorizedRecover
+        }
+        set {
+            _recoverLock.lock()
+            _onUnauthorizedRecover = newValue
+            _recoverLock.unlock()
+        }
+    }
+
+    private let _recoverLock = NSLock()
+    private var _onUnauthorizedRecover: (@MainActor @Sendable () async -> Bool)?
+    /// In-flight renewal shared by concurrent 401s (single-flight).
+    private var _recoveryTask: Task<Bool, Never>?
+
+    /// Returns the shared in-flight renewal, starting one if needed.
+    /// Lock work stays in this synchronous helper (NSLock must not span `await`).
+    private func sharedRecoveryTask() -> Task<Bool, Never>? {
+        _recoverLock.lock()
+        defer { _recoverLock.unlock() }
+        if let existing = _recoveryTask { return existing }
+        guard let hook = _onUnauthorizedRecover else { return nil }
+        let task = Task<Bool, Never> { await hook() }
+        _recoveryTask = task
+        return task
+    }
+
+    private func finishRecovery(_ task: Task<Bool, Never>) {
+        _recoverLock.lock()
+        // Only clear the marker if it still refers to this round.
+        if _recoveryTask == task { _recoveryTask = nil }
+        _recoverLock.unlock()
+    }
+
+    private func attemptSilentRecovery() async -> Bool {
+        guard let task = sharedRecoveryTask() else { return false }
+        let recovered = await task.value
+        finishRecovery(task)
+        return recovered
+    }
+
     // MARK: - Initialisation
 
     init(serverConfig: ServerConfig, keychain: KeychainService = .shared) {
@@ -694,7 +746,22 @@ final class NetworkManager: NSObject, Sendable {
 
     private func performRequest(_ request: URLRequest) async throws -> (Data, URLResponse) {
         do {
-            return try await session.data(for: request)
+            let result = try await session.data(for: request)
+            // Native SSO only: an authenticated request that got a 401 gets ONE
+            // silent renewal attempt (shared across concurrent 401s) and is retried
+            // with the fresh token. `onUnauthorizedRecover` is nil for every server
+            // without native SSO, so this block is skipped entirely for them.
+            if let http = result.1 as? HTTPURLResponse, http.statusCode == 401,
+               onUnauthorizedRecover != nil,
+               request.value(forHTTPHeaderField: "Authorization") != nil,
+               await attemptSilentRecovery(),
+               let fresh = authToken {
+                var retry = request
+                retry.setValue("Bearer \(fresh)", forHTTPHeaderField: "Authorization")
+                logger.info("Native SSO: retrying request after silent session renewal")
+                return try await session.data(for: retry)
+            }
+            return result
         } catch {
             throw APIError.from(error)
         }
@@ -738,6 +805,20 @@ final class NetworkManager: NSObject, Sendable {
         }
 
         throw lastError ?? APIError.unknown(underlying: nil)
+    }
+
+    /// Downloads an explicitly opened file to disk without retaining its bytes in memory.
+    func downloadFile(path: String) async throws -> URL {
+        let request = try buildRequest(path: path)
+        let (url, response) = try await session.download(for: request)
+        do {
+            try validateHTTPResponse(response, data: Data())
+            try Task.checkCancellation()
+            return url
+        } catch {
+            try? FileManager.default.removeItem(at: url)
+            throw error
+        }
     }
 
     private func validateHTTPResponse(_ response: URLResponse, data: Data) throws {

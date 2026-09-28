@@ -27,6 +27,13 @@ final class APIClient: @unchecked Sendable {
         }
     }
 
+    /// Native-SSO silent renewal hook, forwarded to `NetworkManager`.
+    /// Set by `DependencyContainer` only for servers with native SSO enabled.
+    var onUnauthorizedRecover: (@MainActor @Sendable () async -> Bool)? {
+        get { network.onUnauthorizedRecover }
+        set { network.onUnauthorizedRecover = newValue }
+    }
+
     init(serverConfig: ServerConfig, keychain: KeychainService = .shared) {
         self.network = NetworkManager(serverConfig: serverConfig, keychain: keychain)
     }
@@ -787,33 +794,30 @@ final class APIClient: @unchecked Sendable {
     func cachedConversation(id: String) async -> (conversation: Conversation, isRecent: Bool, validatedAt: Date)? {
         let revision = await ConversationCache.shared.currentRevision()
         let scope = network.conversationCacheScope
-        guard let entry = await ConversationCache.shared.cached(scope: scope, id: id),
-              let conversation = try? await decodeConversation(entry.data),
-              scope == network.conversationCacheScope,
+        guard let cached = await ConversationCache.shared.cached(scope: scope, id: id) else { return nil }
+        let conversation = await decodeConversation(cached.response)
+        guard scope == network.conversationCacheScope,
               revision == (await ConversationCache.shared.currentRevision()) else { return nil }
-        return (conversation, entry.isRecent(), entry.validatedAt)
+        return (conversation, cached.entry.isRecent(), cached.entry.validatedAt)
     }
 
     func getConversation(id: String, preferRecent: Bool = false) async throws -> Conversation {
         let scope = network.conversationCacheScope
-        let data = try await ConversationCache.shared.load(scope: scope, id: id, preferRecent: preferRecent) { [self] etag in
+        let response = try await ConversationCache.shared.load(scope: scope, id: id, preferRecent: preferRecent) { [self] etag in
             let result = try await network.requestRaw(path: "/api/v1/chats/\(id)",
                 ifNoneMatch: etag, deduplicate: false)
             guard scope == (await network.conversationCacheScope) else { throw APIError.cancelled }
             return result
         }
-        let conversation = try await decodeConversation(data)
+        let conversation = await decodeConversation(response)
         guard scope == network.conversationCacheScope else { throw APIError.cancelled }
         return conversation
     }
 
-    private func decodeConversation(_ data: Data) async throws -> Conversation {
+    private func decodeConversation(_ response: ConversationCache.Response) async -> Conversation {
         // Parsing history and extracting inline images must stay off the main actor.
-        try await Task.detached(priority: .userInitiated) { [self] in
-            guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-                throw APIError.responseDecoding(underlying: CocoaError(.coderReadCorrupt), data: nil)
-            }
-            return self.parseFullConversation(json)
+        await Task.detached(priority: .userInitiated) { [self] in
+            self.parseFullConversation(response.json)
         }.value
     }
 
@@ -829,7 +833,8 @@ final class APIClient: @unchecked Sendable {
         history: MessageHistory,
         messages: [ChatMessage],
         chatParams: ChatAdvancedParams? = nil,
-        folderId: String? = nil
+        folderId: String? = nil,
+        chatFiles: [ChatMessageFile] = []
     ) async throws -> Conversation {
         // Build flat messages array
         let flatMessages = history.createMessagesList()
@@ -850,6 +855,7 @@ final class APIClient: @unchecked Sendable {
             if msg.role == .user, let m = model { dict["models"] = [m] }
             if let usage = msg.usage, !usage.isEmpty { dict["usage"] = usage }
             if !msg.followUps.isEmpty { dict["followUps"] = msg.followUps }
+            if !msg.files.isEmpty { dict["files"] = msg.files.map(\.serverDictionary) }
             return dict
         }
 
@@ -866,6 +872,7 @@ final class APIClient: @unchecked Sendable {
             "params": paramsDict,
             "history": history.toServerDict(),
             "messages": messagesArray,
+            "files": chatFiles.map(\.serverDictionary),
             "tags": [String](),
             "timestamp": Int(Date().timeIntervalSince1970 * 1000)
         ]
@@ -1092,14 +1099,16 @@ final class APIClient: @unchecked Sendable {
         model: String?,
         systemPrompt: String? = nil,
         chatParams: ChatAdvancedParams? = nil,
-        title: String? = nil
+        title: String? = nil,
+        chatFiles: [ChatMessageFile] = []
     ) async throws {
         let chatData = buildChatPayload(
             title: title ?? "",
             messages: messages,
             model: model,
             systemPrompt: systemPrompt,
-            chatParams: chatParams
+            chatParams: chatParams,
+            chatFiles: chatFiles
         )
         try await network.requestVoidJSON(
             path: "/api/v1/chats/\(id)",
@@ -1131,6 +1140,7 @@ final class APIClient: @unchecked Sendable {
                 "content": msg.content
             ]
             if let model = msg.model { dict["model"] = model }
+            if !msg.files.isEmpty { dict["files"] = msg.files.map(\.serverDictionary) }
             return dict
         }
 
@@ -1143,17 +1153,7 @@ final class APIClient: @unchecked Sendable {
         }
 
         // Serialize chat-level files (mirrors OWUI `chat.files` in the save payload)
-        let filesArray: [[String: Any]] = chatFiles.compactMap { file -> [String: Any]? in
-            guard let url = file.url else { return nil }
-            var dict: [String: Any] = [
-                "type": file.type ?? "file",
-                "id": url,
-                "url": url
-            ]
-            if let name = file.name { dict["name"] = name }
-            if let ct = file.contentType { dict["content_type"] = ct }
-            return dict
-        }
+        let filesArray = chatFiles.map(\.serverDictionary)
 
         var chat: [String: Any] = [
             "id": "",
@@ -1255,14 +1255,7 @@ final class APIClient: @unchecked Sendable {
     /// `POST /api/v1/chats/{id}` with body `{ "chat": { "files": [...] } }`
     @discardableResult
     func updateChatControls(id: String, files: [ChatMessageFile]) async throws -> Bool {
-        let filesArray: [[String: Any]] = files.compactMap { file -> [String: Any]? in
-            guard let url = file.url else { return nil }
-            var dict: [String: Any] = ["url": url]
-            if let name = file.name { dict["name"] = name }
-            if let type_ = file.type { dict["type"] = type_ }
-            if let contentType = file.contentType { dict["content_type"] = contentType }
-            return dict
-        }
+        let filesArray = files.map(\.serverDictionary)
         let body: [String: Any] = ["chat": ["files": filesArray]]
         _ = try await network.requestRaw(
             path: "/api/v1/chats/\(id)",
@@ -2374,6 +2367,17 @@ final class APIClient: @unchecked Sendable {
     func updateModelsConfig(_ payload: [String: Any]) async throws {
         let body = try JSONSerialization.data(withJSONObject: payload)
         _ = try await network.requestRaw(path: "/api/v1/configs/models", method: .post, body: body)
+    }
+
+    /// GET /api/v1/configs/models/defaults — admin-configured default model metadata
+    /// (`DEFAULT_MODEL_METADATA`). Available to any verified user, so the model editor
+    /// can seed new models with the admin's defaults exactly like the web UI does.
+    func getModelsDefaultMetadata() async throws -> [String: Any] {
+        let (data, _) = try await network.requestRaw(path: "/api/v1/configs/models/defaults")
+        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw APIError.responseDecoding(underlying: NSError(domain: "parse", code: -1), data: data)
+        }
+        return json["DEFAULT_MODEL_METADATA"] as? [String: Any] ?? [:]
     }
 
     /// GET /api/v1/configs/suggestions — prompt suggestions.
@@ -4255,14 +4259,7 @@ final class APIClient: @unchecked Sendable {
         var chatFiles: [ChatMessageFile] = []
         if let chat = json["chat"] as? [String: Any],
            let rawFiles = chat["files"] as? [[String: Any]] {
-            chatFiles = rawFiles.compactMap { fileDict in
-                ChatMessageFile(
-                    type: fileDict["type"] as? String,
-                    url: fileDict["url"] as? String ?? fileDict["id"] as? String,
-                    name: fileDict["name"] as? String,
-                    contentType: fileDict["content_type"] as? String
-                )
-            }
+            chatFiles = rawFiles.map(ChatMessageFile.init(serverDictionary:))
         }
 
         var conv = Conversation(
@@ -4428,14 +4425,7 @@ final class APIClient: @unchecked Sendable {
         var files: [ChatMessageFile] = []
         if let rawFiles = msg["files"] as? [[String: Any]] {
             for file in rawFiles {
-                let fileType = file["type"] as? String
-                let fileUrl = file["url"] as? String ?? file["id"] as? String
-                let fileName = file["name"] as? String
-                let contentType = file["content_type"] as? String
-                    ?? (file["meta"] as? [String: Any])?["content_type"] as? String
-                files.append(ChatMessageFile(
-                    type: fileType, url: fileUrl, name: fileName, contentType: contentType
-                ))
+                files.append(ChatMessageFile(serverDictionary: file))
             }
         }
 
@@ -4655,14 +4645,7 @@ final class APIClient: @unchecked Sendable {
         var files: [ChatMessageFile] = []
         if let rawFiles = msg["files"] as? [[String: Any]] {
             for file in rawFiles {
-                let fileType = file["type"] as? String
-                let fileUrl = file["url"] as? String ?? file["id"] as? String
-                let fileName = file["name"] as? String
-                let contentType = file["content_type"] as? String
-                    ?? (file["meta"] as? [String: Any])?["content_type"] as? String
-                files.append(ChatMessageFile(
-                    type: fileType, url: fileUrl, name: fileName, contentType: contentType
-                ))
+                files.append(ChatMessageFile(serverDictionary: file))
             }
         }
 
@@ -4734,7 +4717,8 @@ final class APIClient: @unchecked Sendable {
         messages: [ChatMessage],
         model: String?,
         systemPrompt: String?,
-        chatParams: ChatAdvancedParams? = nil
+        chatParams: ChatAdvancedParams? = nil,
+        chatFiles: [ChatMessageFile] = []
     ) -> [String: Any] {
         var messagesMap: [String: Any] = [:]
         var messagesArray: [[String: Any]] = []
@@ -4777,17 +4761,7 @@ final class APIClient: @unchecked Sendable {
             }
 
             if !msg.files.isEmpty {
-                let filesArray: [[String: Any]] = msg.files.compactMap { file -> [String: Any]? in
-                    guard let url = file.url else { return nil }
-                    var dict: [String: Any] = [
-                        "type": file.type ?? "file",
-                        "id": url,
-                        "url": url
-                    ]
-                    if let name = file.name { dict["name"] = name }
-                    if let ct = file.contentType { dict["content_type"] = ct }
-                    return dict
-                }
+                let filesArray = msg.files.map(\.serverDictionary)
                 if !filesArray.isEmpty { msgDict["files"] = filesArray }
             } else if !msg.attachmentIds.isEmpty {
                 let filesArray: [[String: Any]] = msg.attachmentIds.map { id in
@@ -4870,13 +4844,7 @@ final class APIClient: @unchecked Sendable {
                         siblingDict["done"] = true
                     }
                     if !version.files.isEmpty {
-                        let filesArr = version.files.compactMap { file -> [String: Any]? in
-                            guard let url = file.url else { return nil }
-                            var d: [String: Any] = ["type": file.type ?? "file", "id": url, "url": url]
-                            if let name = file.name { d["name"] = name }
-                            if let ct = file.contentType { d["content_type"] = ct }
-                            return d
-                        }
+                        let filesArr = version.files.map(\.serverDictionary)
                         if !filesArr.isEmpty { siblingDict["files"] = filesArr }
                     }
                     if !version.sources.isEmpty {
@@ -4943,6 +4911,7 @@ final class APIClient: @unchecked Sendable {
                 "currentId": (currentId as Any?) ?? NSNull()
             ],
             "messages": messagesArray,
+            "files": chatFiles.map(\.serverDictionary),
             "tags": [String](),
             "timestamp": Int(Date().timeIntervalSince1970 * 1000)
         ]

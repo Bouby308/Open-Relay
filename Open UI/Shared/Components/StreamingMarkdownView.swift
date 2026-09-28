@@ -134,15 +134,13 @@ struct StreamingMarkdownView: View {
         // The value matches ChatMessageBubble.assistantContent's maxContentWidth so the
         // two caps are in sync and neither exceeds the screen width.
         let maxContentWidth = UIScreen.main.bounds.width - (Spacing.screenPadding * 2)
-        let _ = maxContentWidth  // suppress unused-variable warning when not used in fast path
-        if content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+        if content.isBlank {
             EmptyView()
         } else {
-            // Always re-parse on every tick during streaming so VIZ segments
+            // Re-resolve on every update during streaming so VIZ segments
             // appear on the same frame the @@@VIZ-START marker arrives.
-            // resolveSegments() is cheap (a few .range(of:) calls on a short
-            // string — the big <details> blob is stripped upstream before it
-            // ever reaches StreamingMarkdownView).
+            // resolveSegments() is cheap: plain prose short-circuits, and the big
+            // <details> blob is stripped upstream before it reaches this view.
             let segments: [ContentSegment] = resolveSegments()
             if segments.isEmpty {
                 EmptyView()
@@ -218,6 +216,12 @@ struct StreamingMarkdownView: View {
     }
 
     private func resolveSegments() -> [ContentSegment] {
+        // Plain prose (the common case while streaming) has no image, fence or
+        // visualization syntax; every parser below would return one markdown
+        // segment. Skip the regexes and line splits run on each update.
+        if !Self.mayContainSpecialBlocks(content) {
+            return [.markdown(content, index: 0)]
+        }
         // When streaming, hide any Base64 data URI that hasn't fully arrived yet.
         // The raw base64 payload is stripped from display until the closing `)` lands
         // and `findMarkdownImages` can decode + render the complete image.
@@ -255,6 +259,20 @@ struct StreamingMarkdownView: View {
             // parseSpecialBlocks runs exactly once per message lifetime.
             return cachedParseSpecialBlocks(content, isStreaming: false)
         }
+    }
+
+    /// One allocation-free pass: true if `text` contains `![` (image), a backtick
+    /// pair (code fence) or `@@` (VIZ marker). False means the text is plain
+    /// Markdown that `parseSpecialBlocks` would return unchanged as one segment.
+    private static func mayContainSpecialBlocks(_ text: String) -> Bool {
+        var previous: UInt8 = 0
+        for byte in text.utf8 {
+            switch (previous, byte) {
+            case (0x21, 0x5B), (0x60, 0x60), (0x40, 0x40): return true // "![", "``", "@@"
+            default: previous = byte
+            }
+        }
+        return false
     }
 
     /// Returns cached parseSpecialBlocks result when content+isStreaming unchanged,
@@ -313,7 +331,7 @@ struct StreamingMarkdownView: View {
     private func segmentView(for segment: ContentSegment) -> some View {
         switch segment.kind {
         case .markdown(let text):
-            if !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            if !text.isBlank {
                 StableStreamingMarkdown(text: text, isStreaming: isStreaming, theme: cachedTheme)
             }
         case .chart(let code, let streaming):
@@ -960,10 +978,9 @@ struct MarkdownInlineImageView: View {
             // Download a UIImage copy in the background so save/share work without
             // needing to render the SwiftUI Image back to a bitmap.
             guard loadedRemoteImage == nil else { return }
-            guard let (data, _) = try? await URLSession.shared.data(from: imageURL) else { return }
-            if let img = UIImage(data: data) {
-                await MainActor.run { loadedRemoteImage = img }
-            }
+            let image = await ImageCacheService.shared.loadImage(from: imageURL)
+            guard !Task.isCancelled else { return }
+            loadedRemoteImage = image
         }
     }
 
@@ -1226,7 +1243,7 @@ struct MarkdownWithLoading: View {
 
     var body: some View {
         let text = content ?? ""
-        if isLoading && text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+        if isLoading && text.isBlank {
             HStack {
                 BlinkingCursorIndicator()
                 Spacer()
@@ -1293,26 +1310,26 @@ private struct StableStreamingMarkdown: View {
     var body: some View {
         let request = Request(text: text, isStreaming: isStreaming, theme: theme, reduceMotion: reduceMotion)
         let cached = isStreaming ? nil : MarkdownBlockRenderCache.shared.lookup(content: text, theme: theme)
+        let live = isStreaming || reveal.isAnimating
         Group {
-            if let visible = reveal.chunks ?? cached {
+            if let pieces = reveal.pieces(live: live, spacings: theme.spacings)
+                ?? cached.map({ StreamingTextReveal.wholePieces($0, spacings: theme.spacings) }) {
                 VStack(alignment: .leading, spacing: 0) {
-                    ForEach(visible.indices, id: \.self) { index in
-                        if visible[index].blocks.count == 1,
-                           case let .codeBlock(language, content) = visible[index].blocks[0] {
-                            // cmark adds a terminal newline even to partial lines.
-                            // Omit it so the native code view can append new tokens.
-                            let code = content.hasSuffix("\n") ? String(content.dropLast()) : content
-                            StreamingCodeBlockView(language: language ?? "", content: code,
-                                                   isStreaming: isStreaming || reveal.isAnimating, theme: theme)
-                        } else {
-                            MarkdownView(visible[index], theme: theme)
-                                .codeAutoScroll(isStreaming || reveal.isAnimating)
-                        }
+                    ForEach(pieces) { piece in
+                        pieceView(piece.content, live: live)
+                            .padding(.top, piece.topSpacing)
                     }
+                }
+            } else if isStreaming {
+                // First packet: keep the typing cursor on screen until the first
+                // parse lands, instead of an empty frame between cursor and text.
+                HStack(spacing: 0) {
+                    BlinkingCursorIndicator()
+                    Spacer()
                 }
             } else {
                 Color.clear
-                    .frame(height: isStreaming ? 0 : CGFloat(max(1, text.count / 55)) * theme.fonts.body.lineHeight)
+                    .frame(height: CGFloat(max(1, text.utf8.count / 55)) * theme.fonts.body.lineHeight)
                     .accessibilityHidden(true)
             }
         }
@@ -1322,7 +1339,7 @@ private struct StableStreamingMarkdown: View {
                 reveal.receive(cached, source: text, streaming: isStreaming, reduceMotion: reduceMotion)
                 return
             }
-            if isStreaming || reveal.chunks != nil {
+            if isStreaming || reveal.hasContent {
                 // The actor serializes parses; cancelled, superseded requests
                 // are skipped before parsing. No shared mutable detached parser.
                 let parsed = await parser.parse(text)
@@ -1342,35 +1359,144 @@ private struct StableStreamingMarkdown: View {
             }
         }
     }
+
+    @ViewBuilder
+    private func pieceView(_ content: MarkdownView.PreprocessedContent, live: Bool) -> some View {
+        if content.blocks.count == 1, case let .codeBlock(language, code) = content.blocks[0] {
+            // cmark adds a terminal newline even to partial lines.
+            // Omit it so the native code view can append new tokens.
+            let trimmed = code.hasSuffix("\n") ? String(code.dropLast()) : code
+            StreamingCodeBlockView(language: language ?? "", content: trimmed, isStreaming: live, theme: theme)
+        } else {
+            MarkdownView(content, theme: theme)
+                .codeAutoScroll(live)
+        }
+    }
 }
 
 /// Animation changes only a prefix of the already-parsed active chunk. Completed
 /// chunks keep their render objects; Markdown parsing is driven by server updates,
 /// never by the display clock. Non-text attachments are revealed atomically.
+///
+/// While a reply is live, the block being typed is split into its own view. Every
+/// revealed character then re-lays out and redraws one paragraph instead of the
+/// whole 1,800-character chunk, so the per-frame cost no longer grows with the
+/// chunk or the screen width. When the reply settles, the pieces merge back into
+/// the chunk; `blockGap` reproduces the paragraph spacing the merged text view
+/// applies between those two blocks, so the merge does not move anything.
 @MainActor @Observable
 final class StreamingTextReveal {
+    struct Piece: Identifiable {
+        let id: String
+        let content: MarkdownView.PreprocessedContent
+        let topSpacing: CGFloat
+    }
+
     private var target: [MarkdownView.PreprocessedContent]?
     @ObservationIgnored private var lengths: [Int] = []
+    /// Fully revealed leading blocks of the live chunk, kept stable between frames.
+    /// Holds the chunk itself (compared by identity) so a freed chunk's address
+    /// can never be mistaken for a new one.
+    @ObservationIgnored private var frozenCache: (chunk: MarkdownView.PreprocessedContent, count: Int,
+                                                  content: MarkdownView.PreprocessedContent)?
     private let progress = StreamingTypewriter()
     var isAnimating: Bool { progress.isAnimating }
+    /// Whether any parsed content has been received yet.
+    var hasContent: Bool { target != nil }
 
-    var chunks: [MarkdownView.PreprocessedContent]? {
+    /// Gap to place above chunk `index` so separately rendered chunks line up
+    /// exactly as one continuous text view would. Each chunk is its own text view,
+    /// and CoreText drops a paragraph's trailing spacing at a view's bottom edge, so
+    /// without this, paragraphs on either side of a chunk boundary touched.
+    static func chunkGap(before next: [MarkdownBlockNode], after previous: [MarkdownBlockNode],
+                         spacings: MarkdownTheme.Spacings) -> CGFloat {
+        guard let last = previous.last, let first = next.first else { return 0 }
+        // The splitter cuts an oversized paragraph after a space; the two halves are
+        // one paragraph, so only ordinary line spacing separates them.
+        if case let .paragraph(content) = last, case .paragraph = first,
+           case let .text(text)? = content.last, text.last?.isWhitespace == true {
+            return spacings.lineSpacing
+        }
+        return blockGap(after: last, before: first, spacings: spacings)
+    }
+
+    /// Finished content: one piece per chunk, exactly as the settled message renders.
+    static func wholePieces(_ chunks: [MarkdownView.PreprocessedContent],
+                            spacings: MarkdownTheme.Spacings) -> [Piece] {
+        chunks.enumerated().map { index, chunk in
+            Piece(id: "\(index)", content: chunk,
+                  topSpacing: index == 0 ? 0 : chunkGap(before: chunk.blocks, after: chunks[index - 1].blocks,
+                                                        spacings: spacings))
+        }
+    }
+
+    func pieces(live: Bool, spacings: MarkdownTheme.Spacings) -> [Piece]? {
         guard let target else { return nil }
         var remaining = progress.visibleCount
-        var visible: [MarkdownView.PreprocessedContent] = []
+        var visible: [(chunk: MarkdownView.PreprocessedContent, blocks: [MarkdownBlockNode]?)] = []
         for (index, chunk) in target.enumerated() {
             if remaining >= lengths[index] {
-                visible.append(chunk)
+                visible.append((chunk, nil))
                 remaining -= lengths[index]
             } else {
                 if remaining > 0 {
-                    visible.append(.init(blocks: RevealPrefix.blocks(chunk.blocks, budget: &remaining),
-                                         rendered: chunk.rendered, highlightMaps: chunk.highlightMaps))
+                    visible.append((chunk, RevealPrefix.blocks(chunk.blocks, budget: &remaining)))
                 }
                 break
             }
         }
-        return visible
+        var result: [Piece] = []
+        for (index, entry) in visible.enumerated() {
+            let blocks = entry.blocks ?? entry.chunk.blocks
+            let isLast = index == visible.count - 1
+            let chunkTop = index == 0 ? 0 : Self.chunkGap(before: blocks, after: visible[index - 1].chunk.blocks,
+                                                          spacings: spacings)
+            guard live, isLast, blocks.count >= 2 else {
+                let content = entry.blocks.map {
+                    MarkdownView.PreprocessedContent(blocks: $0, rendered: entry.chunk.rendered,
+                                                    highlightMaps: entry.chunk.highlightMaps)
+                } ?? entry.chunk
+                result.append(Piece(id: "\(index)", content: content, topSpacing: chunkTop))
+                continue
+            }
+            // Every block before the last visible one is complete and unchanged.
+            let frozenCount = blocks.count - 1
+            let frozen: MarkdownView.PreprocessedContent
+            if let cache = frozenCache, cache.chunk === entry.chunk, cache.count == frozenCount {
+                frozen = cache.content
+            } else {
+                frozen = .init(blocks: Array(entry.chunk.blocks.prefix(frozenCount)),
+                               rendered: entry.chunk.rendered, highlightMaps: entry.chunk.highlightMaps)
+                frozenCache = (entry.chunk, frozenCount, frozen)
+            }
+            result.append(Piece(id: "\(index)", content: frozen, topSpacing: chunkTop))
+            result.append(Piece(
+                id: "\(index)-live",
+                content: .init(blocks: [blocks[frozenCount]], rendered: entry.chunk.rendered,
+                               highlightMaps: entry.chunk.highlightMaps),
+                topSpacing: Self.blockGap(after: blocks[frozenCount - 1], before: blocks[frozenCount],
+                                          spacings: spacings)
+            ))
+        }
+        return result
+    }
+
+    /// The vertical gap one text view leaves between two consecutive blocks. It
+    /// matches MarkdownView's paragraph styles: the previous block's
+    /// paragraphSpacing plus its lineSpacing, plus the next block's
+    /// paragraphSpacingBefore. CoreText drops these at a text view's edges, so
+    /// split views must add the gap back to line up with the merged view.
+    static func blockGap(after previous: MarkdownBlockNode, before next: MarkdownBlockNode,
+                         spacings: MarkdownTheme.Spacings) -> CGFloat {
+        let after: CGFloat
+        switch previous {
+        case .heading: after = spacings.headingSpacing
+        case .thematicBreak: after = 0
+        default: after = spacings.paragraphSpacing
+        }
+        let before: CGFloat
+        if case .heading = next { before = spacings.headingSpacing } else { before = 0 }
+        return after + spacings.lineSpacing + before
     }
 
     func receive(_ next: [MarkdownView.PreprocessedContent], source: String,
@@ -1393,8 +1519,9 @@ final class StreamingTextReveal {
 /// always something left to type: the reveal flows continuously through gaps
 /// between packets instead of catching up, stopping and jumping at each one.
 /// The cushion is about half a second of text at the learned arrival rate; the
-/// reveal eases toward the live edge instead of halting, bursts are absorbed by a
-/// smooth catch-up, and the held-back tail drains quickly once the stream ends.
+/// reveal eases toward the live edge instead of halting, and bursts are absorbed
+/// by a smooth catch-up. A new reply types from its first character at a speed
+/// that already matches the backlog, so it neither crawls nor visibly speeds up.
 @MainActor @Observable
 final class StreamingTypewriter {
     private(set) var visibleCount = 0
@@ -1404,7 +1531,7 @@ final class StreamingTypewriter {
     @ObservationIgnored private var total = 0
     @ObservationIgnored private var isLive = false
     @ObservationIgnored private var speed = 0.0
-    @ObservationIgnored private var arrivalRate = 90.0
+    @ObservationIgnored private var arrivalRate = initialRate
     @ObservationIgnored private var lastArrival: Double?
     @ObservationIgnored private var meanInterval = 0.0
     @ObservationIgnored private var meanSize = 0.0
@@ -1412,6 +1539,8 @@ final class StreamingTypewriter {
     @ObservationIgnored private var link: CADisplayLink?
     var isAnimating: Bool { visibleCount < total }
 
+    /// Typical model output before the first interval has been measured.
+    private static let initialRate = 240.0
     /// Seconds of already-received text kept in reserve while streaming.
     private static let cushionSeconds = 0.45
     /// Reserve bounds, in characters.
@@ -1419,10 +1548,24 @@ final class StreamingTypewriter {
     private static let maxCushion = 240.0
     /// Backlog beyond the reserve is worked off over roughly this long.
     private static let catchUpSeconds = 0.9
-    /// Once the stream ends, the remaining tail drains over roughly this long.
-    private static let finishSeconds = 0.3
+    /// Once the stream ends, a large remaining backlog drains within about this
+    /// long; a normal cushion simply keeps typing at the learned rate.
+    private static let finishSeconds = 0.8
     /// Speed smoothing time constant, so rate changes never show as jumps.
     private static let easing = 0.12
+    /// A view that first sees more than this much text joined a reply already in
+    /// progress (opened mid-stream) and starts near the live edge instead of
+    /// retyping it. Shorter first packets are a new reply and type from the start.
+    private static let joinThreshold = 600
+
+    /// Answers reveal at the full ProMotion rate — smaller, more even steps — since
+    /// only their live block re-renders per step. Thinking text re-lays out its
+    /// whole block per step, so it stays at 60 Hz.
+    private let maxFrameRate: Float
+
+    init(maxFrameRate: Float = 120) {
+        self.maxFrameRate = maxFrameRate
+    }
 
     deinit { link?.invalidate() }
 
@@ -1441,7 +1584,7 @@ final class StreamingTypewriter {
         guard hasStreamed, !reduceMotion, append else {
             lastArrival = nil; meanInterval = 0; meanSize = 0
             arrivalSamples = 0
-            arrivalRate = 90; speed = 0
+            arrivalRate = Self.initialRate; speed = 0
             finish()
             return
         }
@@ -1462,11 +1605,8 @@ final class StreamingTypewriter {
             lastArrival = now
         }
         shown = min(shown, Double(total))
-        if shown == 0, total > 0 {
-            // Joining a reply already in progress (opening a chat mid-stream, or a
-            // continued message): start just short of the live edge instead of
-            // retyping everything. A brand-new reply starts at its first character.
-            shown = max(1, Double(total) - cushion)
+        if shown == 0, total > Self.joinThreshold {
+            shown = Double(total) - cushion
         }
         setVisible()
         if shown < Double(total) {
@@ -1474,6 +1614,18 @@ final class StreamingTypewriter {
         } else if !streaming {
             finish()
         }
+    }
+
+    /// The reveal speed the current backlog calls for.
+    private func targetSpeed(lead: Double) -> Double {
+        guard isLive else { return max(arrivalRate, lead / Self.finishSeconds) }
+        let reserve = cushion
+        // Beyond the reserve: arrival rate plus a gentle catch-up of the excess.
+        // Within it: slow in proportion to what is left, so a server pause reads
+        // as a smooth deceleration rather than a dead stop.
+        return lead > reserve
+            ? arrivalRate + (lead - reserve) / Self.catchUpSeconds
+            : arrivalRate * max(0.12, lead / reserve)
     }
 
     func advance(by seconds: Double) {
@@ -1486,18 +1638,7 @@ final class StreamingTypewriter {
             if isLive { stopLink() } else { finish() }
             return
         }
-        let target: Double
-        if isLive {
-            let reserve = cushion
-            // Beyond the reserve: arrival rate plus a gentle catch-up of the excess.
-            // Within it: slow in proportion to what is left, so a server pause reads
-            // as a smooth deceleration rather than a dead stop.
-            target = lead > reserve
-                ? arrivalRate + (lead - reserve) / Self.catchUpSeconds
-                : arrivalRate * max(0.12, lead / reserve)
-        } else {
-            target = max(arrivalRate, lead / Self.finishSeconds)
-        }
+        let target = targetSpeed(lead: lead)
         speed += (target - speed) * (1 - exp(-dt / Self.easing))
         shown = min(Double(total), shown + max(0, speed) * dt)
         setVisible()
@@ -1521,9 +1662,13 @@ final class StreamingTypewriter {
 
     private func startLinkIfNeeded() {
         guard link == nil else { return }
+        // Starting from rest: begin at the speed the backlog needs rather than
+        // easing up from zero, which reads as a slow start followed by a rush.
+        if speed <= 0 { speed = targetSpeed(lead: Double(total) - shown) }
         let clock = Clock(self)
         let displayLink = CADisplayLink(target: clock, selector: #selector(Clock.tick(_:)))
-        displayLink.preferredFrameRateRange = CAFrameRateRange(minimum: 30, maximum: 60, preferred: 60)
+        displayLink.preferredFrameRateRange = CAFrameRateRange(
+            minimum: min(60, maxFrameRate), maximum: maxFrameRate, preferred: maxFrameRate)
         displayLink.add(to: .main, forMode: .common)
         link = displayLink
     }

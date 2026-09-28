@@ -57,11 +57,20 @@ struct ModelEditorView: View {
     @State private var capWebSearch = true
     @State private var capImageGeneration = true
     @State private var capCodeInterpreter = true
-    @State private var capTerminal = false
-    @State private var capUsage = true
+    @State private var capTerminal = true
+    @State private var capUsage = false
     @State private var capCitations = true
     @State private var capStatusUpdates = true
+    @State private var capMemory = true
     @State private var capBuiltinTools = true
+
+    // MARK: - Default Terminal (meta.terminalId)
+
+    @State private var terminalId: String = ""
+    @State private var terminalServers: [TerminalServer] = []
+
+    /// Server's original meta (preserved on save so unmanaged keys aren't wiped).
+    @State private var originalMetaJSON: Data? = nil
 
     // MARK: - Default Features
 
@@ -72,6 +81,7 @@ struct ModelEditorView: View {
     // MARK: - Builtin Tools
 
     @State private var builtinTime = true
+    @State private var builtinUserInput = true
     @State private var builtinMemory = true
     @State private var builtinChats = true
     @State private var builtinNotes = true
@@ -318,10 +328,13 @@ struct ModelEditorView: View {
                         capImageGeneration: $capImageGeneration, capCodeInterpreter: $capCodeInterpreter,
                         capTerminal: $capTerminal,
                         capUsage: $capUsage, capCitations: $capCitations,
-                        capStatusUpdates: $capStatusUpdates, capBuiltinTools: $capBuiltinTools,
+                        capStatusUpdates: $capStatusUpdates, capMemory: $capMemory,
+                        capBuiltinTools: $capBuiltinTools,
+                        terminalId: $terminalId, terminalServers: terminalServers,
                         defaultWebSearch: $defaultWebSearch, defaultImageGen: $defaultImageGen,
                         defaultCodeInterpreter: $defaultCodeInterpreter,
-                        builtinTime: $builtinTime, builtinMemory: $builtinMemory,
+                        builtinTime: $builtinTime, builtinUserInput: $builtinUserInput,
+                        builtinMemory: $builtinMemory,
                         builtinChats: $builtinChats, builtinNotes: $builtinNotes,
                         builtinKnowledge: $builtinKnowledge, builtinFiles: $builtinFiles,
                         builtinChannels: $builtinChannels, builtinNotifications: $builtinNotifications,
@@ -408,9 +421,11 @@ struct ModelEditorView: View {
         .onAppear {
             populateIfEditing()
             Task {
+                await applyAdminDefaultsIfNew()
                 await manager?.fetchAllUsers()
                 await fetchAvailableModels()
                 await fetchToolsAndFunctions()
+                await fetchTerminalServers()
                 await resolveGroupNames()
             }
         }
@@ -1035,74 +1050,6 @@ struct ModelEditorView: View {
         }
     }
 
-    // MARK: - Capabilities Section
-
-    private var capabilitiesSection: some View {
-        VStack(alignment: .leading, spacing: Spacing.sm) {
-            sectionHeader("Capabilities")
-            fieldCard {
-                LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 0) {
-                    capCheckbox("Vision", systemImage: "eye", value: $capVision)
-                    capCheckbox("File Upload", systemImage: "doc.badge.plus", value: $capFileUpload)
-                    capCheckbox("File Context", systemImage: "doc.text.magnifyingglass", value: $capFileContext)
-                    capCheckbox("Web Search", systemImage: "magnifyingglass", value: $capWebSearch)
-                    capCheckbox("Image Generation", systemImage: "photo.badge.plus", value: $capImageGeneration)
-                    capCheckbox("Code Interpreter", systemImage: "chevron.left.forwardslash.chevron.right", value: $capCodeInterpreter)
-                    capCheckbox("Terminal", systemImage: "terminal", value: $capTerminal)
-                    capCheckbox("Usage", systemImage: "chart.bar", value: $capUsage)
-                    capCheckbox("Citations", systemImage: "quote.bubble", value: $capCitations)
-                    capCheckbox("Status Updates", systemImage: "info.circle", value: $capStatusUpdates)
-                    capCheckbox("Builtin Tools", systemImage: "wrench.and.screwdriver", value: $capBuiltinTools)
-                }
-                .padding(.vertical, 4)
-                .padding(.horizontal, 4)
-            }
-        }
-    }
-
-    // MARK: - Default Features Section
-
-    private var defaultFeaturesSection: some View {
-        VStack(alignment: .leading, spacing: Spacing.sm) {
-            sectionHeader("Default Features")
-            fieldCard {
-                HStack(spacing: 0) {
-                    capCheckbox("Web Search", systemImage: "magnifyingglass", value: $defaultWebSearch)
-                    capCheckbox("Image Generation", systemImage: "photo.badge.plus", value: $defaultImageGen)
-                    capCheckbox("Code Interpreter", systemImage: "chevron.left.forwardslash.chevron.right", value: $defaultCodeInterpreter)
-                }
-                .padding(.vertical, 4)
-                .padding(.horizontal, 4)
-            }
-        }
-    }
-
-    // MARK: - Builtin Tools Section
-
-    private var builtinToolsSection: some View {
-        VStack(alignment: .leading, spacing: Spacing.sm) {
-            sectionHeader("Builtin Tools")
-            fieldCard {
-                LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 0) {
-                    capCheckbox("Time & Calculation", systemImage: "clock", value: $builtinTime)
-                    capCheckbox("Memory", systemImage: "brain", value: $builtinMemory)
-                    capCheckbox("Chat History", systemImage: "bubble.left.and.bubble.right", value: $builtinChats)
-                    capCheckbox("Notes", systemImage: "note.text", value: $builtinNotes)
-                    capCheckbox("Knowledge Base", systemImage: "cylinder.split.1x2", value: $builtinKnowledge)
-                    capCheckbox("Channels", systemImage: "antenna.radiowaves.left.and.right", value: $builtinChannels)
-                    capCheckbox("Task Management", systemImage: "checklist", value: $builtinTaskManagement)
-                    capCheckbox("Automations", systemImage: "gearshape.2", value: $builtinAutomations)
-                    capCheckbox("Calendar", systemImage: "calendar", value: $builtinCalendar)
-                    capCheckbox("Web Search", systemImage: "magnifyingglass", value: $builtinWebSearch)
-                    capCheckbox("Image Generation", systemImage: "photo.badge.plus", value: $builtinImageGen)
-                    capCheckbox("Code Interpreter", systemImage: "chevron.left.forwardslash.chevron.right", value: $builtinCodeInterpreter)
-                }
-                .padding(.vertical, 4)
-                .padding(.horizontal, 4)
-            }
-        }
-    }
-
     // MARK: - TTS Voice Section
 
     private var ttsVoiceSection: some View {
@@ -1254,32 +1201,6 @@ struct ModelEditorView: View {
         .buttonStyle(.plain)
     }
 
-    // MARK: - Capability Checkbox
-
-    @ViewBuilder
-    private func capCheckbox(_ label: String, systemImage: String, value: Binding<Bool>) -> some View {
-        Button {
-            value.wrappedValue.toggle()
-            Haptics.play(.light)
-        } label: {
-            HStack(spacing: 6) {
-                Image(systemName: value.wrappedValue ? "checkmark.square.fill" : "square")
-                    .scaledFont(size: 16)
-                    .foregroundStyle(value.wrappedValue ? theme.brandPrimary : theme.textTertiary)
-                Text(label)
-                    .scaledFont(size: 13)
-                    .foregroundStyle(value.wrappedValue ? theme.textPrimary : theme.textSecondary)
-                    .lineLimit(2)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-            .padding(.horizontal, 8)
-            .padding(.vertical, 10)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-    }
-
     // MARK: - Helper Views
 
     @ViewBuilder
@@ -1351,12 +1272,16 @@ struct ModelEditorView: View {
         capTerminal = model.capTerminal
         capUsage = model.capUsage; capCitations = model.capCitations
         capStatusUpdates = model.capStatusUpdates; capBuiltinTools = model.capBuiltinTools
+        capMemory = model.capMemory
+        terminalId = model.terminalId ?? ""
+        originalMetaJSON = model.originalMetaJSON
 
         defaultWebSearch = model.defaultFeatureWebSearch
         defaultImageGen = model.defaultFeatureImageGen
         defaultCodeInterpreter = model.defaultFeatureCodeInterpreter
 
         builtinTime = model.builtinTime; builtinMemory = model.builtinMemory
+        builtinUserInput = model.builtinUserInput
         builtinChats = model.builtinChats; builtinNotes = model.builtinNotes
         builtinKnowledge = model.builtinKnowledge; builtinFiles = model.builtinFiles
         builtinChannels = model.builtinChannels; builtinNotifications = model.builtinNotifications
@@ -1442,6 +1367,53 @@ struct ModelEditorView: View {
     }
 
     // MARK: - Fetch Tools & Functions
+
+    // MARK: - Terminal Servers
+
+    /// Loads terminal servers for the "Terminal" default picker (mirrors web TerminalSelector).
+    private func fetchTerminalServers() async {
+        guard let api = dependencies.apiClient else { return }
+        terminalServers = (try? await api.listTerminalServers()) ?? []
+    }
+
+    // MARK: - Admin Defaults (new models)
+
+    /// For models that don't yet exist on the server (brand-new models, or base models
+    /// opened for customisation), seed capabilities / default features / builtin tools
+    /// from the admin's `DEFAULT_MODEL_METADATA` — exactly like the web ModelEditor.
+    /// Falls back to OpenWebUI's DEFAULT_CAPABILITIES when the call fails.
+    private func applyAdminDefaultsIfNew() async {
+        guard originalMetaJSON == nil, cloneSource == nil,
+              let api = dependencies.apiClient else { return }
+        let defaults = (try? await api.getModelsDefaultMetadata()) ?? [:]
+        // Bail if a server-backed model was populated while we were waiting.
+        guard originalMetaJSON == nil else { return }
+
+        let caps = defaults["capabilities"] as? [String: Any] ?? [:]
+        func cap(_ key: String, _ fallback: Bool) -> Bool { caps[key] as? Bool ?? fallback }
+        capVision = cap("vision", true); capFileUpload = cap("file_upload", true)
+        capFileContext = cap("file_context", true); capWebSearch = cap("web_search", true)
+        capImageGeneration = cap("image_generation", true); capCodeInterpreter = cap("code_interpreter", true)
+        capTerminal = cap("terminal", true); capUsage = cap("usage", false)
+        capCitations = cap("citations", true); capStatusUpdates = cap("status_updates", true)
+        capMemory = cap("memory", true); capBuiltinTools = cap("builtin_tools", true)
+
+        let defF = defaults["defaultFeatureIds"] as? [String] ?? []
+        defaultWebSearch = defF.contains("web_search")
+        defaultImageGen = defF.contains("image_generation")
+        defaultCodeInterpreter = defF.contains("code_interpreter")
+
+        let bt = defaults["builtinTools"] as? [String: Any] ?? [:]
+        func tool(_ key: String) -> Bool { bt[key] as? Bool ?? true }
+        builtinTime = tool("time"); builtinUserInput = tool("user_input"); builtinMemory = tool("memory")
+        builtinChats = tool("chats"); builtinNotes = tool("notes"); builtinKnowledge = tool("knowledge")
+        builtinFiles = tool("files"); builtinChannels = tool("channels")
+        builtinNotifications = tool("notifications")
+        builtinTaskManagement = bt["tasks"] as? Bool ?? bt["task_management"] as? Bool ?? true
+        builtinAutomations = tool("automations"); builtinCalendar = tool("calendar")
+        builtinSubagents = tool("subagents"); builtinWebSearch = tool("web_search")
+        builtinImageGen = tool("image_generation"); builtinCodeInterpreter = tool("code_interpreter")
+    }
 
     private func fetchToolsAndFunctions() async {
         guard let api = dependencies.apiClient else { return }
@@ -1566,9 +1538,12 @@ struct ModelEditorView: View {
             capVision: capVision, capFileUpload: capFileUpload, capFileContext: capFileContext,
             capWebSearch: capWebSearch, capImageGeneration: capImageGeneration, capCodeInterpreter: capCodeInterpreter,
             capTerminal: capTerminal,
-            capUsage: capUsage, capCitations: capCitations, capStatusUpdates: capStatusUpdates, capBuiltinTools: capBuiltinTools,
+            capUsage: capUsage, capCitations: capCitations, capStatusUpdates: capStatusUpdates,
+            capMemory: capMemory, capBuiltinTools: capBuiltinTools,
+            terminalId: terminalId.isEmpty ? nil : terminalId,
             defaultFeatureWebSearch: defaultWebSearch, defaultFeatureImageGen: defaultImageGen, defaultFeatureCodeInterpreter: defaultCodeInterpreter,
-            builtinTime: builtinTime, builtinMemory: builtinMemory, builtinChats: builtinChats,
+            builtinTime: builtinTime, builtinUserInput: builtinUserInput,
+            builtinMemory: builtinMemory, builtinChats: builtinChats,
             builtinNotes: builtinNotes, builtinKnowledge: builtinKnowledge, builtinFiles: builtinFiles,
             builtinChannels: builtinChannels, builtinNotifications: builtinNotifications,
             builtinTaskManagement: builtinTaskManagement, builtinAutomations: builtinAutomations, builtinCalendar: builtinCalendar,
@@ -1614,6 +1589,7 @@ struct ModelEditorView: View {
         detail.advNumGpu = advNumGpu
         detail.advKeepAlive = advKeepAlive
         detail.customParams = customParams.filter { !$0.key.isEmpty }
+        detail.originalMetaJSON = originalMetaJSON
         // Tools, Skills, Filters
         detail.toolIds = Array(selectedToolIds)
         // Filter IDs: exclude global filters (server applies them automatically).
@@ -2571,7 +2547,12 @@ struct ModelToolsAndCapabilitiesSection: View {
     @Binding var capUsage: Bool
     @Binding var capCitations: Bool
     @Binding var capStatusUpdates: Bool
+    @Binding var capMemory: Bool
     @Binding var capBuiltinTools: Bool
+
+    // Default Terminal
+    @Binding var terminalId: String
+    var terminalServers: [TerminalServer]
 
     // Default Features
     @Binding var defaultWebSearch: Bool
@@ -2580,6 +2561,7 @@ struct ModelToolsAndCapabilitiesSection: View {
 
     // Builtin Tools
     @Binding var builtinTime: Bool
+    @Binding var builtinUserInput: Bool
     @Binding var builtinMemory: Bool
     @Binding var builtinChats: Bool
     @Binding var builtinNotes: Bool
@@ -2602,9 +2584,20 @@ struct ModelToolsAndCapabilitiesSection: View {
             filtersSectionView
             actionFunctionsSectionView
             capabilitiesSectionView
-            defaultFeaturesSectionView
-            builtinToolsSectionView
+            // Matches web ModelEditor: Default Features only when at least one of
+            // web_search / image_generation / code_interpreter capability is on.
+            if capWebSearch || capImageGeneration || capCodeInterpreter {
+                defaultFeaturesSectionView
+            }
+            if capBuiltinTools {
+                builtinToolsSectionView
+            }
+            if capTerminal && !terminalServers.isEmpty {
+                terminalSectionView
+            }
         }
+        .animation(.easeInOut(duration: 0.2), value: capBuiltinTools)
+        .animation(.easeInOut(duration: 0.2), value: capTerminal)
     }
 
     // MARK: - Tools
@@ -2808,7 +2801,10 @@ struct ModelToolsAndCapabilitiesSection: View {
                 LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 0) {
                     capCheckbox("Vision", value: $capVision)
                     capCheckbox("File Upload", value: $capFileUpload)
-                    capCheckbox("File Context", value: $capFileContext)
+                    // Web UI hides File Context when File Upload is disabled.
+                    if capFileUpload {
+                        capCheckbox("File Context", value: $capFileContext)
+                    }
                     capCheckbox("Web Search", value: $capWebSearch)
                     capCheckbox("Image Generation", value: $capImageGeneration)
                     capCheckbox("Code Interpreter", value: $capCodeInterpreter)
@@ -2816,6 +2812,7 @@ struct ModelToolsAndCapabilitiesSection: View {
                     capCheckbox("Usage", value: $capUsage)
                     capCheckbox("Citations", value: $capCitations)
                     capCheckbox("Status Updates", value: $capStatusUpdates)
+                    capCheckbox("Memory", value: $capMemory)
                     capCheckbox("Builtin Tools", value: $capBuiltinTools)
                 }
                 .padding(.vertical, 4).padding(.horizontal, 4)
@@ -2830,13 +2827,71 @@ struct ModelToolsAndCapabilitiesSection: View {
             sectionHeader("Default Features")
             fieldCard {
                 HStack(spacing: 0) {
-                    capCheckbox("Web Search", value: $defaultWebSearch)
-                    capCheckbox("Image Generation", value: $defaultImageGen)
-                    capCheckbox("Code Interpreter", value: $defaultCodeInterpreter)
+                    // Only features whose capability is enabled (web availableFeatures).
+                    if capWebSearch { capCheckbox("Web Search", value: $defaultWebSearch) }
+                    if capImageGeneration { capCheckbox("Image Generation", value: $defaultImageGen) }
+                    if capCodeInterpreter { capCheckbox("Code Interpreter", value: $defaultCodeInterpreter) }
                 }
                 .padding(.vertical, 4).padding(.horizontal, 4)
             }
         }
+    }
+
+    // MARK: - Default Terminal
+
+    /// Mirrors web `TerminalSelector` — picks the terminal a new chat with this model
+    /// starts with (`meta.terminalId`). Only shown when the Terminal capability is on
+    /// and at least one terminal server is configured.
+    private var terminalSectionView: some View {
+        VStack(alignment: .leading, spacing: Spacing.sm) {
+            sectionHeader("Terminal")
+            fieldCard {
+                Menu {
+                    Button {
+                        terminalId = ""
+                        Haptics.play(.light)
+                    } label: {
+                        if terminalId.isEmpty { Label("None", systemImage: "checkmark") } else { Text("None") }
+                    }
+                    ForEach(terminalServers) { server in
+                        Button {
+                            terminalId = server.id
+                            Haptics.play(.light)
+                        } label: {
+                            if terminalId == server.id {
+                                Label(server.displayName, systemImage: "checkmark")
+                            } else {
+                                Text(server.displayName)
+                            }
+                        }
+                    }
+                } label: {
+                    HStack(spacing: Spacing.sm) {
+                        Image(systemName: "terminal")
+                            .scaledFont(size: 14)
+                            .foregroundStyle(theme.textSecondary)
+                        Text(selectedTerminalLabel)
+                            .scaledFont(size: 15)
+                            .foregroundStyle(terminalId.isEmpty ? theme.textTertiary : theme.textPrimary)
+                            .lineLimit(1)
+                        Spacer()
+                        Image(systemName: "chevron.up.chevron.down")
+                            .scaledFont(size: 12)
+                            .foregroundStyle(theme.textTertiary)
+                    }
+                    .padding(.horizontal, Spacing.md)
+                    .padding(.vertical, 12)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+            }
+        }
+    }
+
+    private var selectedTerminalLabel: String {
+        if terminalId.isEmpty { return String(localized: "None") }
+        // Keep showing the raw ID if the saved terminal no longer exists.
+        return terminalServers.first(where: { $0.id == terminalId })?.displayName ?? terminalId
     }
 
     // MARK: - Builtin Tools
@@ -2847,6 +2902,7 @@ struct ModelToolsAndCapabilitiesSection: View {
             fieldCard {
                 LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 0) {
                     capCheckbox("Time & Calculation", value: $builtinTime)
+                    capCheckbox("Ask User", value: $builtinUserInput)
                     capCheckbox("Memory", value: $builtinMemory)
                     capCheckbox("Chat History", value: $builtinChats)
                     capCheckbox("Notes", value: $builtinNotes)

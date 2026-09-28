@@ -21,6 +21,9 @@ struct AddServerSheet: View {
     @State private var allowSelfSigned: Bool = false
     @State private var customHeaderEntries: [CustomHeaderEntry] = []
     @State private var showAdvanced = false
+    @State private var nativeSSOEnabled = false
+    @State private var nativeSSOIssuer = ""
+    @State private var nativeSSOClientID = NativeSSOSettings.defaultClientID
 
     /// The URL the user was connected to before opening this sheet.
     /// Restored if the user cancels without completing the new connection.
@@ -85,6 +88,12 @@ struct AddServerSheet: View {
 
                                 // Custom Headers
                                 CustomHeadersEditor(entries: $customHeaderEntries)
+
+                                NativeSSOAdvancedFields(
+                                    isEnabled: $nativeSSOEnabled,
+                                    issuer: $nativeSSOIssuer,
+                                    clientID: $nativeSSOClientID
+                                )
                             }
                             .padding(.top, Spacing.md)
                         } label: {
@@ -204,6 +213,9 @@ struct AddServerSheet: View {
         viewModel.apiKey = apiKey
         viewModel.allowSelfSignedCerts = allowSelfSigned
         viewModel.customHeaderEntries = customHeaderEntries
+        viewModel.nativeSSOEnabled = nativeSSOEnabled
+        viewModel.nativeSSOIssuer = nativeSSOIssuer
+        viewModel.nativeSSOClientID = nativeSSOClientID
         viewModel.errorMessage = nil
         Task { await viewModel.connect() }
     }
@@ -217,6 +229,15 @@ struct AddServerSheet: View {
         viewModel.apiKey = previousApiKey
         viewModel.allowSelfSignedCerts = previousAllowSelfSigned
         viewModel.customHeaderEntries = previousCustomHeaderEntries
+        resetNativeSSOForm()
         onDismiss()
+    }
+
+    /// The native-SSO connect fields are per-connection input — clear them so
+    /// they never carry over to a later, unrelated connect.
+    private func resetNativeSSOForm() {
+        viewModel.nativeSSOEnabled = false
+        viewModel.nativeSSOIssuer = ""
+        viewModel.nativeSSOClientID = NativeSSOSettings.defaultClientID
     }
 }

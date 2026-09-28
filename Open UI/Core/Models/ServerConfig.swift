@@ -56,6 +56,11 @@ struct ServerConfig: Codable, Identifiable, Hashable, Sendable {
     /// Leave nil or empty to disable the feature entirely.
     var switchStatusURL: String?
 
+    /// Opt-in native SSO (system browser + Open WebUI token exchange) for the
+    /// generic OIDC provider. `nil` = off — the embedded sign-in is used, exactly
+    /// as before. Never applies to Google / Microsoft / GitHub / Feishu.
+    var nativeSSO: NativeSSOSettings?
+
     /// API key — stored in Keychain, NOT serialised to UserDefaults.
     /// Populated transiently at runtime via ``KeychainService``.
     var apiKey: String?
@@ -96,6 +101,7 @@ struct ServerConfig: Codable, Identifiable, Hashable, Sendable {
         case lastUserName, lastUserEmail, lastUserProfileImageURL, lastAuthType, hasActiveSession
         case savedAccounts, activeAccountId
         case switchStatusURL
+        case nativeSSO
     }
 
     /// Custom decoder so existing saved configs (without the new metadata fields)
@@ -125,6 +131,7 @@ struct ServerConfig: Codable, Identifiable, Hashable, Sendable {
         savedAccounts = (try? c.decode([SavedAccount].self, forKey: .savedAccounts)) ?? []
         activeAccountId = try? c.decode(String.self, forKey: .activeAccountId)
         switchStatusURL = try? c.decode(String.self, forKey: .switchStatusURL)
+        nativeSSO = try? c.decode(NativeSSOSettings.self, forKey: .nativeSSO)
         apiKey = nil // always nil from storage; loaded from Keychain at runtime
     }
 
@@ -151,7 +158,8 @@ struct ServerConfig: Codable, Identifiable, Hashable, Sendable {
         hasActiveSession: Bool = false,
         savedAccounts: [SavedAccount] = [],
         activeAccountId: String? = nil,
-        switchStatusURL: String? = nil
+        switchStatusURL: String? = nil,
+        nativeSSO: NativeSSOSettings? = nil
     ) {
         self.id = id
         self.name = name
@@ -176,6 +184,7 @@ struct ServerConfig: Codable, Identifiable, Hashable, Sendable {
         self.savedAccounts = savedAccounts
         self.activeAccountId = activeAccountId
         self.switchStatusURL = switchStatusURL
+        self.nativeSSO = nativeSSO
     }
 
     /// Whether the persisted `cf_clearance` cookie is still valid (not expired).

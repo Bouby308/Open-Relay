@@ -676,16 +676,18 @@ struct AdminModelsGlobalSettingsSheet: View {
         viewModel.capVision = true; viewModel.capFileUpload = true
         viewModel.capFileContext = true; viewModel.capWebSearch = true
         viewModel.capImageGeneration = true; viewModel.capCodeInterpreter = true
-        viewModel.capTerminal = false; viewModel.capUsage = false
+        viewModel.capTerminal = true; viewModel.capUsage = false
         viewModel.capCitations = true; viewModel.capStatusUpdates = true
-        viewModel.capBuiltinTools = true
+        viewModel.capMemory = true; viewModel.capBuiltinTools = true
         viewModel.defWebSearch = true; viewModel.defImageGeneration = true
         viewModel.defCodeInterpreter = false
-        viewModel.btTime = true; viewModel.btMemory = true; viewModel.btChats = true
+        viewModel.btTime = true; viewModel.btUserInput = true
+        viewModel.btMemory = true; viewModel.btChats = true
         viewModel.btNotes = true; viewModel.btKnowledge = true; viewModel.btChannels = true
         viewModel.btWebSearch = true; viewModel.btImageGeneration = true
         viewModel.btCodeInterpreter = true; viewModel.btTaskManagement = true
         viewModel.btAutomations = true; viewModel.btCalendar = true
+        viewModel.btFiles = true; viewModel.btNotifications = true; viewModel.btSubagents = true
         viewModel.streamChat = nil; viewModel.streamDeltaChunkSize = nil
         viewModel.functionCalling = nil; viewModel.reasoningTags = nil
         viewModel.paramTemperature = nil; viewModel.paramSeed = nil
@@ -930,33 +932,40 @@ struct AdminModelsGlobalSettingsSheet: View {
 
                     capabilityGrid
 
-                    Text("Default Features")
-                        .scaledFont(size: 12, weight: .semibold)
-                        .foregroundStyle(theme.textTertiary)
-                        .textCase(.uppercase)
-                        .padding(.horizontal, Spacing.screenPadding)
-                        .padding(.top, Spacing.xs)
+                    if viewModel.capWebSearch || viewModel.capImageGeneration || viewModel.capCodeInterpreter {
+                        Text("Default Features")
+                            .scaledFont(size: 12, weight: .semibold)
+                            .foregroundStyle(theme.textTertiary)
+                            .textCase(.uppercase)
+                            .padding(.horizontal, Spacing.screenPadding)
+                            .padding(.top, Spacing.xs)
 
-                    defaultFeaturesRow
+                        defaultFeaturesRow
+                    }
 
-                    Text("Builtin Tools")
-                        .scaledFont(size: 12, weight: .semibold)
-                        .foregroundStyle(theme.textTertiary)
-                        .textCase(.uppercase)
-                        .padding(.horizontal, Spacing.screenPadding)
-                        .padding(.top, Spacing.xs)
+                    if viewModel.capBuiltinTools {
+                        Text("Builtin Tools")
+                            .scaledFont(size: 12, weight: .semibold)
+                            .foregroundStyle(theme.textTertiary)
+                            .textCase(.uppercase)
+                            .padding(.horizontal, Spacing.screenPadding)
+                            .padding(.top, Spacing.xs)
 
-                    builtinToolsGrid
+                        builtinToolsGrid
+                    }
                 }
             }
         }
     }
 
     private var capabilityGrid: some View {
-        let items: [(String, Binding<Bool>)] = [
+        var items: [(String, Binding<Bool>)] = [
             ("Vision", $viewModel.capVision),
-            ("File Upload", $viewModel.capFileUpload),
-            ("File Context", $viewModel.capFileContext),
+            ("File Upload", $viewModel.capFileUpload)
+        ]
+        // Web UI hides File Context when File Upload is disabled.
+        if viewModel.capFileUpload { items.append(("File Context", $viewModel.capFileContext)) }
+        items += [
             ("Web Search", $viewModel.capWebSearch),
             ("Image Generation", $viewModel.capImageGeneration),
             ("Code Interpreter", $viewModel.capCodeInterpreter),
@@ -964,23 +973,24 @@ struct AdminModelsGlobalSettingsSheet: View {
             ("Usage", $viewModel.capUsage),
             ("Citations", $viewModel.capCitations),
             ("Status Updates", $viewModel.capStatusUpdates),
+            ("Memory", $viewModel.capMemory),
             ("Builtin Tools", $viewModel.capBuiltinTools)
         ]
         return capCheckboxGrid(items: items)
     }
 
     private var defaultFeaturesRow: some View {
-        let items: [(String, Binding<Bool>)] = [
-            ("Web Search", $viewModel.defWebSearch),
-            ("Image Generation", $viewModel.defImageGeneration),
-            ("Code Interpreter", $viewModel.defCodeInterpreter)
-        ]
+        var items: [(String, Binding<Bool>)] = []
+        if viewModel.capWebSearch { items.append(("Web Search", $viewModel.defWebSearch)) }
+        if viewModel.capImageGeneration { items.append(("Image Generation", $viewModel.defImageGeneration)) }
+        if viewModel.capCodeInterpreter { items.append(("Code Interpreter", $viewModel.defCodeInterpreter)) }
         return capCheckboxGrid(items: items)
     }
 
     private var builtinToolsGrid: some View {
         let items: [(String, Binding<Bool>)] = [
             ("Time & Calculation", $viewModel.btTime),
+            ("Ask User", $viewModel.btUserInput),
             ("Memory", $viewModel.btMemory),
             ("Chat History", $viewModel.btChats),
             ("Notes", $viewModel.btNotes),

@@ -25,8 +25,8 @@ private let vizLog = Logger(subsystem: "com.openui", category: "VizPipeline")
 /// a background priority queue for cache misses.
 ///
 /// ## Memory
-/// `NSCache` automatically evicts entries under memory pressure, so we never need
-/// to size this manually. Each entry is ~few KB (the parsed segment graph).
+/// Advisory entry and byte-cost limits reduce retention of long streaming
+/// snapshots. `NSCache` may also evict entries under memory pressure.
 actor MessageParseCache {
     static let shared = MessageParseCache()
 
@@ -51,6 +51,8 @@ actor MessageParseCache {
     init() {
         // Allow ~200 entries (typical chat has far fewer assistant messages).
         cache.countLimit = 200
+        // Long streaming snapshots also need a byte budget, not just an entry count.
+        cache.totalCostLimit = 16 * 1024 * 1024
     }
 
     // MARK: - Actor-isolated interface
@@ -97,7 +99,7 @@ actor MessageParseCache {
         }
         let result = ToolCallParser.parseOrdered(content)
         let entry = Entry(result: result, byteCount: content.utf8.count, content: content)
-        cache.setObject(EntryBox(entry), forKey: key as NSString)
+        cache.setObject(EntryBox(entry), forKey: key as NSString, cost: entry.byteCount * 2)
         return result
     }
 
@@ -113,7 +115,7 @@ actor MessageParseCache {
             }
             let result = ToolCallParser.parseOrdered(content)
             let entry = Entry(result: result, byteCount: content.utf8.count, content: content)
-            cache.setObject(EntryBox(entry), forKey: key as NSString)
+            cache.setObject(EntryBox(entry), forKey: key as NSString, cost: entry.byteCount * 2)
             // Yield to the cooperative thread pool every 4 items so the actor
             // doesn't monopolise a thread and starve the main-thread render loop.
             if i % 4 == 3 { await Task.yield() }
@@ -151,6 +153,7 @@ struct ToolCallData: Identifiable {
     /// Rich UI HTML embeds returned by the tool. Each string is a full HTML
     /// document to be rendered inline in the chat as an interactive webview.
     let embeds: [String]
+    var terminalFile: TerminalFileAttachment? = nil
 
     /// A display-friendly name (replaces underscores with spaces).
     var displayName: String {
@@ -265,12 +268,15 @@ enum ToolCallParser {
         return rx
     }
 
-    /// Quickly reject absent tags via NSString (avoids case-folding every Character
+    /// Quickly reject absent tags via a cached literal regex (avoids scanning every Character
     /// in a long response), but preserve Swift's grapheme-boundary behavior when
-    /// the UTF-16 search finds a possible match (e.g. combining marks).
-    private nonisolated static func containsTag(_ tag: String, in text: String) -> Bool {
-        guard (text as NSString).range(of: tag, options: .caseInsensitive).location != NSNotFound else { return false }
-        return text.range(of: tag, options: .caseInsensitive) != nil
+    /// the regex finds a possible match (e.g. combining marks).
+    private nonisolated static func containsTag(_ tag: String, in text: String,
+                                               options: String.CompareOptions = .caseInsensitive) -> Bool {
+        guard let regex = cachedRegex(NSRegularExpression.escapedPattern(for: tag),
+                                      options: options.contains(.caseInsensitive) ? .caseInsensitive : []),
+              regex.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)) != nil else { return false }
+        return text.range(of: tag, options: options) != nil
     }
 
     /// Result of parsing assistant content.
@@ -377,12 +383,12 @@ enum ToolCallParser {
 
             let block = match.block
 
-            if block.contains("type=\"tool_calls\"") || block.contains("type='tool_calls'") {
+            if containsTag("type=\"tool_calls\"", in: block, options: []) || containsTag("type='tool_calls'", in: block, options: []) {
                 if let toolCall = parseToolCallBlock(block) {
                     segments.append(.toolCall(toolCall))
                     allToolCalls.append(toolCall)
                 }
-            } else if block.contains("type=\"reasoning\"") || block.contains("type='reasoning'") {
+            } else if containsTag("type=\"reasoning\"", in: block, options: []) || containsTag("type='reasoning'", in: block, options: []) {
                 if let parsed = parseReasoningBlock(block) {
                     segments.append(.reasoning(parsed.data))
                     // Spillover: content that was inside the <details> block AFTER
@@ -754,7 +760,9 @@ enum ToolCallParser {
             result: decodeHTMLEntities(result),
             isDone: isDone,
             status: status,
-            embeds: embeds
+            embeds: embeds,
+            terminalFile: isDone && name == "display_file"
+                ? TerminalFileAttachment(result: decodeHTMLEntities(result), arguments: decodeHTMLEntities(arguments)) : nil
         )
     }
 
@@ -847,13 +855,13 @@ enum ToolCallParser {
 
         // ── Phase 1: Convert raw model reasoning tags ──
         for pair in defaultReasoningTagPairs {
-            guard result.contains(pair.open) else { continue }
+            guard containsTag(pair.open, in: result, options: []) else { continue }
             result = convertReasoningTag(pair, in: result)
         }
         // Keep the existing second-pass ordering for mixed-case nested input.
         for pair in defaultReasoningTagPairs {
             guard !pair.open.hasPrefix("<|"), !pair.open.hasPrefix("◁"),
-                  containsTag(pair.open, in: result), !result.contains(pair.open) else { continue }
+                  containsTag(pair.open, in: result), !containsTag(pair.open, in: result, options: []) else { continue }
             result = convertReasoningTag(pair, in: result)
         }
 
@@ -1076,7 +1084,7 @@ enum ToolCallParser {
         // that might not have been caught above
         let additionalOrphanClosers = ["◁/think▷", "<|end_of_thought|>"]
         for closer in additionalOrphanClosers {
-            if result.contains(closer) {
+            if containsTag(closer, in: result, options: []) {
                 result = result.replacingOccurrences(of: closer, with: "")
             }
         }
@@ -1139,7 +1147,7 @@ enum ToolCallParser {
 
     /// Decodes common HTML entities in attribute values.
     private nonisolated static func decodeHTMLEntities(_ string: String?) -> String? {
-        guard let string, !string.isEmpty else { return string }
+        guard let string, string.utf8.contains(0x26) else { return string }
         return string
             .replacingOccurrences(of: "&quot;", with: "\"")
             .replacingOccurrences(of: "&amp;", with: "&")
@@ -2668,7 +2676,7 @@ struct ReasoningView: View {
     let reasoning: ReasoningData
     let isStreaming: Bool
     @State private var isExpanded: Bool
-    @State private var progress = StreamingTypewriter()
+    @State private var progress = StreamingTypewriter(maxFrameRate: 60)
     @Environment(\.theme) private var theme
     @Environment(\.accessibilityScale) private var accessibilityScale
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -2817,6 +2825,9 @@ struct AssistantMessageContent: View {
     var serverBaseURL: String? = nil
     /// APIClient for rendering inline images via AuthenticatedImageView.
     var apiClient: APIClient? = nil
+    var terminalSessionId: String? = nil
+    var terminalMessageId: String = ""
+    var liveTerminalFiles: [TerminalFileAttachment] = []
 
     @State private var resolvedResult: ToolCallParser.OrderedParseResult?
     @State private var resolvedContent = ""
@@ -2926,7 +2937,8 @@ struct AssistantMessageContent: View {
                                 result: tc.result,
                                 isDone: tc.isDone,
                                 status: tc.status,
-                                embeds: messageEmbeds
+                                embeds: messageEmbeds,
+                                terminalFile: tc.terminalFile
                             ))
                             mutableGroups[i] = .toolCalls(items)
                             return mutableGroups
@@ -2979,7 +2991,7 @@ struct AssistantMessageContent: View {
                         // MarkdownView renders images as plain text links — we need
                         // to intercept server file URLs and render them as actual images.
                         let imageSegments = Self.splitInlineImages(effectiveStr)
-                        if !effectiveStr.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        if !effectiveStr.isBlank {
                         if imageSegments.count <= 1 {
                             // No inline images — render normally
                             MarkdownWithLoading(
@@ -2992,7 +3004,7 @@ struct AssistantMessageContent: View {
                                 switch seg {
                                 case .text(let text):
                                     let isLast = isLastText && segIdx == imageSegments.count - 1
-                                    if !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                                    if !text.isBlank {
                                         MarkdownWithLoading(
                                             content: text,
                                             isLoading: isLast
@@ -3053,6 +3065,14 @@ struct AssistantMessageContent: View {
                             Spacer()
                         }
                     }
+                }
+            }
+            if let apiClient {
+                ForEach(TerminalFileAttachment.merged(
+                    ordered.allToolCalls.compactMap(\.terminalFile) + liveTerminalFiles,
+                    sessionId: terminalSessionId
+                )) { file in
+                    TerminalFileAttachmentView(file: file, messageId: terminalMessageId, apiClient: apiClient)
                 }
             }
         }
@@ -3197,6 +3217,9 @@ struct AssistantMessageContent: View {
     /// Returns a single `.text` segment if no server images are found, so the
     /// caller can short-circuit and render normally.
     static func splitInlineImages(_ text: String) -> [InlineImageSegment] {
+        // Every match contains this path; skip the regex (run on each streaming
+        // update) when it cannot match.
+        guard text.contains("/api/v1/files/") else { return [.text(text)] }
         // Match ![alt text](url) where url contains /api/v1/files/{uuid}/content
         // The URL may be relative (/api/...) or absolute (https://host/api/...)
         let pattern = #"!\[([^\]]*)\]\(((?:https?://[^\s\)]+)?/api/v1/files/([a-f0-9\-]{36})/content)\)"#

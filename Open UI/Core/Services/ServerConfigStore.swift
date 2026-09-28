@@ -55,6 +55,9 @@ final class ServerConfigStore {
             // Overlay optional fields if supplied
             if config.apiKey != nil { updated.apiKey = config.apiKey }
             if config.switchStatusURL != nil { updated.switchStatusURL = config.switchStatusURL }
+            // Native SSO is opt-in: only overlay when the connect form supplied it,
+            // so reconnecting never silently turns an existing setup off.
+            if config.nativeSSO != nil { updated.nativeSSO = config.nativeSSO }
             servers[index] = updated
         } else {
             var newConfig = config
@@ -79,6 +82,7 @@ final class ServerConfigStore {
         guard let config = servers.first(where: { $0.id == id }) else { return }
         KeychainService.shared.deleteToken(forServer: config.url)
         KeychainService.shared.deleteToken(forServer: "cached_user_\(config.url)")
+        NativeSSOSettings.deleteRefreshTokens(for: config)
         servers.removeAll(where: { $0.id == id })
         saveServers()
     }
@@ -88,6 +92,7 @@ final class ServerConfigStore {
         for server in servers {
             KeychainService.shared.deleteToken(forServer: server.url)
             KeychainService.shared.deleteToken(forServer: "cached_user_\(server.url)")
+            NativeSSOSettings.deleteRefreshTokens(for: server)
         }
         servers.removeAll()
         saveServers()
@@ -172,6 +177,10 @@ final class ServerConfigStore {
             KeychainService.shared.deleteToken(forServer: servers[index].url, userId: account.userId)
             // Delete the account-scoped cached user from Keychain
             KeychainService.shared.deleteToken(forServer: "cached_user_\(servers[index].url)::\(account.userId)")
+            // Delete the account's native-SSO refresh token (no-op if it has none)
+            KeychainService.shared.deleteToken(
+                forServer: NativeSSOSettings.refreshTokenKey(serverURL: servers[index].url, userId: account.userId)
+            )
         }
         servers[index].savedAccounts.removeAll { $0.id == accountId }
         // If we removed the active account, clear the active pointer

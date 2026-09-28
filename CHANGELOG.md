@@ -1,5 +1,33 @@
 # Changelog
 
+## v6.0 — September 28, 2026
+
+### What's New
+- Introducing Apple Watch companion app — talk to your assistant without lifting your phone directly from your watch! Read and reply to your chats and channels, Ask with Siri ("Ask Open Relay…"), the Action button or Control Center, add Talk or your latest chat to your watch face and Smart Stack, get notified when a reply is ready, and hand off any chat to your iPhone. Check status in Settings → Apple Watch.
+- Sign in with passkeys through the system browser on self-hosted identity providers like Keycloak or Authentik (optional, under Advanced; requires server setup).
+- Reply to chat and channel notifications right from the notification, on iPhone or Apple Watch.
+- Files shown by terminal tools (videos, audio, images, documents) now appear as cards you can play, open, or save — nothing downloads until you tap.
+- Search your files and knowledge bases on the server when attaching, browse documents inside a knowledge base, and choose Focused Retrieval or Entire Document per attachment (with a default in Settings → Chat Behavior).
+- Added a Files filter to Library Search — find uploaded files by name and text inside Knowledge documents, then preview, save, or share them.
+
+### Improvements
+- Smoother, lighter chats: less CPU while showing thinking, lower memory use in long conversations, faster chat loading, and images that download once and are reused.
+- The Models section in the sidebar can now be collapsed like the other sections, and remembers your choice.
+- Replies now stream in as a smooth, steady flow on iPhone and iPad — no slow start, no bursts of text, and the chat glides along with new text instead of jumping line by line. Scrolling through chats is also smoother on 120Hz screens.
+
+### Bug Fixes
+- Fixed the model editor (Workspace and Admin) missing options that Open WebUI has: a Terminal picker to choose which terminal new chats start with, the Memory capability, and the Ask User built-in tool. Sections now show or hide based on the capabilities you've turned on, just like the web.
+- Fixed saving a model from the app erasing settings made on the web (translations, default terminal and more), and the model's TTS voice not being saved in a way the server could use.
+- Fixed the "auto-scroll while streaming" setting being ignored — replies no longer follow to the bottom when it's turned off.
+- Fixed paragraphs in long replies sometimes running together with no space between them.
+- Fixed a glitchy animation when tapping a suggested follow-up or sending a new message.
+- Fixed a large blank space below finished replies in longer chats.
+- Fixed the read-aloud player covering the model selector — it now sits below the chat header.
+- Fixed the sidebar buttons sitting lower than the chat toolbar buttons.
+- Fixed long dictations showing the start of the text instead of where you left off.
+- Fixed the @, #, / and $ pickers sometimes staying open after typing a space.
+- Fixed attached files and knowledge being forgotten or coming back after removal in follow-up messages, and folder knowledge not being used.
+
 ## v5.9 — September 26, 2026
 
 ### What's New

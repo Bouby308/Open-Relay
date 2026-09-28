@@ -289,6 +289,12 @@ struct ServerConnectionView: View {
 
                                 // Custom Headers
                                 CustomHeadersEditor(entries: $viewModel.customHeaderEntries)
+
+                                NativeSSOAdvancedFields(
+                                    isEnabled: $viewModel.nativeSSOEnabled,
+                                    issuer: $viewModel.nativeSSOIssuer,
+                                    clientID: $viewModel.nativeSSOClientID
+                                )
                             }
                             .padding(.top, Spacing.md)
                         } label: {

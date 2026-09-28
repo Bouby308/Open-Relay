@@ -37,6 +37,8 @@ final class NotificationService: NSObject, @unchecked Sendable {
 
     /// Action to open a channel from a notification.
     static let openChannelAction = "OPEN_CHANNEL"
+    /// Text-input "Reply" on finished-reply and channel notifications.
+    static let replyAction = "REPLY"
 
     // MARK: - State
 
@@ -105,9 +107,19 @@ final class NotificationService: NSObject, @unchecked Sendable {
             options: [.foreground]
         )
 
+        // "Reply" — type or dictate an answer right from the notification
+        // (also shows on Apple Watch). Sent in the background.
+        let replyAction = UNTextInputNotificationAction(
+            identifier: Self.replyAction,
+            title: "Reply",
+            options: [],
+            textInputButtonTitle: "Send",
+            textInputPlaceholder: "Message"
+        )
+
         let generationCategory = UNNotificationCategory(
             identifier: Self.generationCompleteCategory,
-            actions: [openAction],
+            actions: [replyAction, openAction],
             intentIdentifiers: [],
             options: []
         )
@@ -121,7 +133,7 @@ final class NotificationService: NSObject, @unchecked Sendable {
 
         let channelCategory = UNNotificationCategory(
             identifier: Self.channelMessageCategory,
-            actions: [openChannelAction],
+            actions: [replyAction, openChannelAction],
             intentIdentifiers: [],
             options: []
         )
@@ -581,6 +593,17 @@ extension NotificationService: UNUserNotificationCenterDelegate {
         let conversationId = response.notification.request.content.userInfo["conversationId"] as? String
         let channelId = response.notification.request.content.userInfo["channelId"] as? String
         let category = response.notification.request.content.categoryIdentifier
+        let replyText = (response as? UNTextInputNotificationResponse)?.userText
+
+        // Quick reply: send in the background, keep the system alive until done.
+        if actionId == Self.replyAction, let replyText {
+            Task { @MainActor in
+                await WatchRelayService.shared.sendNotificationReply(
+                    replyText, conversationId: conversationId, channelId: channelId)
+                completionHandler()
+            }
+            return
+        }
 
         Task { @MainActor in
             // Clear badge when user taps a notification — they're now looking at the app

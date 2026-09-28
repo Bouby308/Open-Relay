@@ -407,6 +407,8 @@ final class AppDependencyContainer: ServiceContainer {
         // This avoids creating a second AuthViewModel (which would discard
         // the first one's optimistic auth state).
         authViewModel.dependencies = self
+        // The Apple Watch relay reads auth state from here (read-only).
+        WatchRelayService.shared.dependencies = self
         // Models load on-demand when first needed — no startup preloading
         startConnectionMonitor()
     }
@@ -538,6 +540,18 @@ final class AppDependencyContainer: ServiceContainer {
                 guard let self else { return }
                 guard self.authViewModel.phase == .authenticated else { return }
                 await self.authViewModel.validateSessionInBackground()
+            }
+        }
+
+        // Native SSO (opt-in): silently renew an expired session before a 401
+        // surfaces. Only wired for servers with native SSO enabled — every other
+        // server keeps the hook nil, so its request path is unchanged. Inside,
+        // renewal is limited to the active account's own refresh token, so
+        // password / LDAP / embedded-SSO accounts return false immediately.
+        if config.nativeSSO != nil {
+            apiClient?.onUnauthorizedRecover = { [weak self] in
+                guard let self else { return false }
+                return await self.authViewModel.recoverSessionFrom401()
             }
         }
 

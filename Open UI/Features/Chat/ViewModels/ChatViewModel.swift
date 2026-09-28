@@ -97,6 +97,9 @@ final class ChatViewModel {
     /// system prompt (OpenWebUI `VOICE_MODE_PROMPT_TEMPLATE`).
     /// Set by `VoiceCallViewModel.configure()` and reset in `endCall()`.
     var isVoiceMode: Bool = false
+    /// Set for turns started from the Apple Watch: the watch shows its own
+    /// "reply ready" notification, so the iPhone doesn't post a duplicate.
+    var suppressCompletionNotification: Bool = false
     var isLoadingConversation: Bool = false
     var isLoadingModels: Bool = false
     /// Tasks managed by the model's built-in task tools (create_tasks / update_task).
@@ -132,7 +135,15 @@ final class ChatViewModel {
     /// `ChatDetailView` observes this via `.onChange` and sets `isEditFieldFocused`.
     /// Reset to `false` immediately after focus is granted.
     var shouldFocusInput: Bool = false
-    var attachments: [ChatAttachment] = []
+    var attachments: [ChatAttachment] = [] {
+        didSet {
+            if let mode = activeChatStore?.cachedUserDefaultParams?.defaultUploadContext {
+                for index in attachments.indices where attachments[index].uploadContext == nil {
+                    attachments[index].uploadContext = mode
+                }
+            }
+        }
+    }
     var webSearchEnabled: Bool = false {
         didSet {
             guard !suppressBuiltinFeatureTracking else { return }
@@ -238,19 +249,26 @@ final class ChatViewModel {
     /// Set during `syncUIWithModelDefaults()` and `restoreBuiltinFeatureState()`
     /// so those internal resets aren't misinterpreted as explicit user overrides.
     private var suppressBuiltinFeatureTracking: Bool = false
-    var selectedKnowledgeItems: [KnowledgeItem] = []
-    var knowledgeItems: [KnowledgeItem] = []
+    var selectedKnowledgeItems: [KnowledgeItem] = [] {
+        didSet {
+            if let mode = activeChatStore?.cachedUserDefaultParams?.defaultUploadContext {
+                for index in selectedKnowledgeItems.indices where selectedKnowledgeItems[index].context == nil {
+                    selectedKnowledgeItems[index].context = mode
+                }
+            }
+        }
+    }
     /// Reference chat conversations selected for context in the next message.
     var selectedReferenceChats: [ReferenceChatItem] = []
     /// Notes selected as context for the next message (injected as inline text, not file refs).
     var selectedNotes: [Note] = []
-    /// IDs of context items that the user has explicitly removed via the Controls panel.
-    /// `collectHistoryFileRefs` skips any stored file whose ID is in this set so the item
-    /// is not re-injected into future RAG requests even though it still lives in history.
-    var removedContextIds: Set<String> = []
-    /// Top-level files attached to this conversation (mirrors OWUI `chat.files`).
-    /// Loaded from `conversation.files` on open; persisted back via `syncConversationHistory`.
-    var chatFiles: [ChatMessageFile] = []
+    /// The saved chat-level list is the source of truth, including an empty list.
+    var chatFiles: [ChatMessageFile] {
+        get { conversation?.files ?? [] }
+        set { conversation?.files = newValue }
+    }
+    @ObservationIgnored private var contextSaveTask: Task<Void, Never>?
+    private(set) var isSavingContext = false
     var isLoadingTools: Bool = false
     /// True once loadTools() has completed at least one fetch.
     /// Distinguishes "never fetched yet" (false) from "fetched and tool is gone" (true).
@@ -261,11 +279,14 @@ final class ChatViewModel {
     var terminalEnabled: Bool = false
     /// The currently selected terminal server (auto-selects first if only one).
     var selectedTerminalServer: TerminalServer?
+    /// Model-configured default terminal (`meta.terminalId`) waiting for the
+    /// terminal server list to load before it can be selected.
+    @ObservationIgnored private var pendingModelDefaultTerminalId: String?
+    var terminalDisplayFiles: [String: [TerminalFileAttachment]] = [:]
     /// True if the currently selected model has the terminal capability enabled.
     var isTerminalCapableForSelectedModel: Bool {
         selectedModel?.supportsTerminal ?? false
     }
-    var isLoadingKnowledge: Bool = false
     var isShowingKnowledgePicker: Bool = false
     var knowledgeSearchQuery: String = ""
 
@@ -482,6 +503,8 @@ final class ChatViewModel {
     }
 
     private func syncToServerViaTree() async {
+        await contextSaveTask?.value
+        chatFiles = AttachmentContext.active(chatFiles, in: conversation?.messages ?? [])
         // Ensure tree nodes have up-to-date content from the flat messages list before
         // syncing to the server. Tree nodes are created with empty content at send/edit time
         // and streaming content only flows into conversation.messages — without this step,
@@ -495,7 +518,7 @@ final class ChatViewModel {
             // Tree not populated — fall back to flat-list sync
             try? await manager.syncConversationMessages(
                 id: chatId, messages: conversation?.messages ?? [], model: modelId,
-                title: conversation?.title, chatParams: conversation?.chatParams)
+                title: conversation?.title, chatParams: conversation?.chatParams, chatFiles: chatFiles)
             return
         }
 
@@ -513,6 +536,14 @@ final class ChatViewModel {
     var selectedModel: AIModel? {
         guard let id = selectedModelId else { return nil }
         return availableModels.first { $0.id == id }
+    }
+
+    var attachmentUsage: AttachmentUsage {
+        let model = mentionedModelId.flatMap { id in availableModels.first { $0.id == id } } ?? selectedModel
+        let calling = model?.functionCallingMode == "native" ? "native"
+            : (conversation?.chatParams ?? pendingChatParams)?.functionCalling
+                ?? activeChatStore?.cachedUserDefaultParams?.functionCalling ?? model?.functionCallingMode
+        return AttachmentUsage(capabilities: model?.capabilities, builtinTools: model?.builtinTools ?? [:], functionCalling: calling)
     }
 
     var canSend: Bool {
@@ -1067,6 +1098,7 @@ final class ChatViewModel {
             tasks = fetched.tasks
             // Populate top-level chat files (mirrors OWUI `chatFiles = chat?.files ?? []`)
             chatFiles = fetched.files
+            backfillLegacyChatContextIfNeeded()
             // Always adopt the last-used model for existing chats.
             // Priority: last assistant message's model (the actual model used
             // most recently) > conversation-level model > fallback.
@@ -1184,6 +1216,7 @@ final class ChatViewModel {
                         && serverConversation.title != conversation?.title {
                         conversation?.title = serverConversation.title
                     }
+                    if !isStreaming && !isSavingContext { chatFiles = serverConversation.files }
                     logger.debug("Server sync: no changes detected, skipping")
                     return
                 }
@@ -1280,6 +1313,7 @@ final class ChatViewModel {
     /// when returning from background, because SwiftUI's identity tracking
     /// (via `.id(message.id)`) remains stable throughout the update.
     private func adoptServerMessages(serverConversation: Conversation) {
+        if !isStreaming && !isSavingContext { chatFiles = serverConversation.files }
         guard conversation != nil else {
             // No local conversation yet — just assign directly
             conversation = serverConversation
@@ -1893,6 +1927,28 @@ final class ChatViewModel {
         } catch {
             logger.debug("Terminal servers fetch failed: \(error.localizedDescription)")
         }
+        applyPendingModelDefaultTerminal()
+    }
+
+    /// Model-configured default terminal (`info.meta.terminalId`), if the model's
+    /// terminal capability is enabled.
+    private func modelDefaultTerminalId(for model: AIModel) -> String? {
+        guard model.supportsTerminal,
+              let info = model.rawModelItem?["info"] as? [String: Any],
+              let meta = info["meta"] as? [String: Any],
+              let tid = meta["terminalId"] as? String, !tid.isEmpty else { return nil }
+        return tid
+    }
+
+    /// Selects and enables the model's default terminal once it's known to exist.
+    /// No-op when there's no pending request or the terminal isn't available.
+    private func applyPendingModelDefaultTerminal() {
+        guard let tid = pendingModelDefaultTerminalId,
+              !availableTerminalServers.isEmpty else { return }
+        pendingModelDefaultTerminalId = nil
+        guard let server = availableTerminalServers.first(where: { $0.id == tid }) else { return }
+        selectedTerminalServer = server
+        terminalEnabled = true
     }
 
     /// Toggles the terminal on/off. When turning on, auto-selects the first
@@ -2025,66 +2081,13 @@ final class ChatViewModel {
 
     // MARK: - Knowledge
 
-    /// Timestamp of the last knowledge fetch — used for stale-while-revalidate.
-    private var lastKnowledgeFetchTime: Date = .distantPast
-
-    /// Fetches knowledge bases and user files for the `#` picker.
-    ///
-    /// Uses a **stale-while-revalidate** strategy:
-    /// - If cache exists, shows it instantly and refreshes in the background.
-    /// - If no cache, shows a loading state while fetching.
-    /// - Cache is refreshed every time the picker opens (async).
-    func loadKnowledgeItems() {
-        // If we already have cached items, show them immediately
-        // and refresh in the background (stale-while-revalidate)
-        if !knowledgeItems.isEmpty {
-            // Background refresh — no loading indicator
-            Task { await fetchKnowledgeItemsFromServer() }
-            return
-        }
-
-        // No cache — show loading state
-        isLoadingKnowledge = true
-        Task {
-            await fetchKnowledgeItemsFromServer()
-            isLoadingKnowledge = false
-        }
-    }
-
-    /// Fetches folders + knowledge bases + knowledge files from the server
-    /// and updates the cache. All 3 APIs are called concurrently.
-    private func fetchKnowledgeItemsFromServer() async {
-        guard let manager else { return }
-
-        // Fetch all 3 sources concurrently — each is independent and
-        // a single failure shouldn't prevent the others from showing.
-        async let foldersReq: [KnowledgeItem] = {
-            (try? await manager.fetchFolderItems()) ?? []
-        }()
-        async let collectionsReq: [KnowledgeItem] = {
-            (try? await manager.fetchKnowledgeItems()) ?? []
-        }()
-        async let filesReq: [KnowledgeItem] = {
-            (try? await manager.fetchKnowledgeFileItems()) ?? []
-        }()
-
-        let (folders, collections, files) = await (foldersReq, collectionsReq, filesReq)
-
-        // Only update if we got at least something
-        let combined = folders + collections + files
-        if !combined.isEmpty || knowledgeItems.isEmpty {
-            knowledgeItems = combined
-        }
-        lastKnowledgeFetchTime = Date()
-    }
-
     /// Called when a knowledge item is selected from the `#` picker.
     ///
     /// Adds the item to the selected list (if not already there),
     /// removes the `#query` from the input text, and dismisses the picker.
     func selectKnowledgeItem(_ item: KnowledgeItem) {
         // Avoid duplicates
-        guard !selectedKnowledgeItems.contains(where: { $0.id == item.id }) else {
+        guard !selectedKnowledgeItems.contains(where: { $0.id == item.id && $0.type == item.type }) else {
             dismissKnowledgePicker()
             return
         }
@@ -2155,33 +2158,67 @@ final class ChatViewModel {
 
     // MARK: - Context Item Removal (Controls Panel)
 
-    /// Removes a knowledge item from the active context.
-    /// Adds the item's ID to `removedContextIds` so `collectHistoryFileRefs` skips
-    /// it in future RAG requests, preventing ghost-re-injection from history nodes.
     func removeKnowledgeItem(_ item: KnowledgeItem) {
-        selectedKnowledgeItems.removeAll { $0.id == item.id }
-        removedContextIds.insert(item.id)
+        selectedKnowledgeItems.removeAll { $0.identity == item.identity }
     }
 
-    /// Removes a reference chat from the active context.
-    /// Adds the chat's ID to `removedContextIds` so it is not re-injected from history.
     func removeReferenceChat(_ item: ReferenceChatItem) {
         selectedReferenceChats.removeAll { $0.id == item.id }
-        removedContextIds.insert(item.id)
     }
 
-    /// Removes a top-level chat file from this conversation and persists the removal to the server.
-    /// Adds the file ID to `removedContextIds` so it is not re-injected from history refs.
-    func removeFile(_ file: ChatMessageFile) {
-        chatFiles.removeAll { $0.url == file.url }
-        if let fileId = file.url {
-            removedContextIds.insert(fileId)
+    /// Chats created by earlier app versions never populated `chat.files`; their
+    /// context lived only on user messages. Seed it once per chat so follow-ups keep
+    /// that context, then treat the saved list as authoritative (later removals stick).
+    private static let backfilledContextChatsKey = "backfilledChatContextIds"
+
+    private func backfillLegacyChatContextIfNeeded() {
+        guard chatFiles.isEmpty, !isTemporaryChat, !isSavingContext,
+              let chatId = conversationId ?? conversation?.id, let manager else { return }
+        let defaults = UserDefaults.standard
+        var done = Set(defaults.stringArray(forKey: Self.backfilledContextChatsKey) ?? [])
+        guard !done.contains(chatId) else { return }
+        let legacy = AttachmentContext.adding(
+            (conversation?.messages ?? []).filter { $0.role == .user }.flatMap(\.files), to: [])
+        guard !legacy.isEmpty else {
+            done.insert(chatId)
+            defaults.set(Array(done), forKey: Self.backfilledContextChatsKey)
+            return
         }
-        guard let chatId = conversationId ?? conversation?.id,
-              let manager else { return }
+        chatFiles = legacy
+        isSavingContext = true
+        contextSaveTask = Task {
+            do {
+                try await manager.apiClient.updateChatControls(id: chatId, files: legacy)
+                var saved = Set(UserDefaults.standard.stringArray(forKey: Self.backfilledContextChatsKey) ?? [])
+                saved.insert(chatId)
+                UserDefaults.standard.set(Array(saved), forKey: Self.backfilledContextChatsKey)
+            } catch {
+                logger.warning("Context backfill failed for \(chatId): \(error.localizedDescription)")
+            }
+            isSavingContext = false
+        }
+    }
+
+    /// Removing context leaves its historical message attachment intact.
+    func removeFile(_ file: ChatMessageFile) {
+        guard !isSavingContext else { return }
+        chatFiles.removeAll { $0.identity == file.identity }
+        guard let chatId = conversationId ?? conversation?.id, let manager,
+              !isTemporaryChat else { return }
         let currentFiles = chatFiles
-        Task {
-            try? await manager.apiClient.updateChatControls(id: chatId, files: currentFiles)
+        isSavingContext = true
+        contextSaveTask = Task {
+            do {
+                try await manager.apiClient.updateChatControls(id: chatId, files: currentFiles)
+            } catch {
+                if conversation?.id == chatId {
+                    if !chatFiles.contains(where: { $0.identity == file.identity }) {
+                        chatFiles.append(file)
+                    }
+                    errorMessage = "Could not save attachment removal. Please try again."
+                }
+            }
+            isSavingContext = false
         }
     }
 
@@ -2394,54 +2431,6 @@ final class ChatViewModel {
         skillSearchQuery = ""
     }
 
-    /// Restores `selectedKnowledgeItems` from the conversation's user messages.
-    ///
-    /// When loading an existing conversation, scans user messages for files
-    /// with `type == "collection"`, `"folder"`, or knowledge `"file"` entries
-    /// and rebuilds the knowledge chips so they persist across navigation.
-    private func restoreKnowledgeItemsFromConversation() {
-        guard let conversation, selectedKnowledgeItems.isEmpty else { return }
-
-        // Collect unique knowledge files from the most recent user message
-        // that has them. Knowledge files are stored with type "collection"/"folder"/"file".
-        let knowledgeTypes: Set<String> = ["collection", "folder"]
-        var restored: [KnowledgeItem] = []
-        var seenIds = Set<String>()
-
-        // Scan from newest to oldest — find the first user message with knowledge files
-        for message in conversation.messages.reversed() where message.role == .user {
-            let knowledgeFiles = message.files.filter { f in
-                guard let type = f.type else { return false }
-                return knowledgeTypes.contains(type)
-            }
-            if !knowledgeFiles.isEmpty {
-                for file in knowledgeFiles {
-                    guard let id = file.url, !seenIds.contains(id) else { continue }
-                    seenIds.insert(id)
-                    let knowledgeType: KnowledgeItem.KnowledgeType
-                    switch file.type {
-                    case "folder": knowledgeType = .folder
-                    case "collection": knowledgeType = .collection
-                    default: knowledgeType = .file
-                    }
-                    restored.append(KnowledgeItem(
-                        id: id,
-                        name: file.name ?? id,
-                        description: nil,
-                        type: knowledgeType,
-                        fileCount: nil
-                    ))
-                }
-                break // Only restore from the most recent user message
-            }
-        }
-
-        if !restored.isEmpty {
-            selectedKnowledgeItems = restored
-            logger.info("Restored \(restored.count) knowledge item(s) from conversation history")
-        }
-    }
-
     // MARK: - Passive Socket Listener (Cross-Client Stream Observation)
     private func startPassiveSocketListener() {
         // Only for existing conversations with a known ID
@@ -2477,6 +2466,9 @@ final class ChatViewModel {
 
         // --- Metadata events: ALWAYS process (title, tags, follow-ups) ---
         switch type {
+        case "terminal:display_file":
+            receiveTerminalFile(payload, messageId: messageId, chatId: event["chat_id"] as? String, serverId: nil)
+            return
         case "chat:title":
             var newTitle: String?
             if let titleStr = data["data"] as? String, !titleStr.isEmpty {
@@ -3107,7 +3099,8 @@ final class ChatViewModel {
                 history: conversation.history,
                 messages: conversation.messages,
                 chatParams: conversation.chatParams,
-                folderId: folderContextId
+                folderId: folderContextId,
+                chatFiles: conversation.files
             )
             // Swap the local ID for the server-assigned one — in-place, no reload.
             self.conversation?.id = created.id
@@ -3194,7 +3187,7 @@ final class ChatViewModel {
 
         // Capture and clear knowledge items — they attach to this message only.
         // The server handles RAG retrieval per-message from the files array.
-        let currentKnowledgeItems = selectedKnowledgeItems
+        var currentKnowledgeItems = selectedKnowledgeItems
         selectedKnowledgeItems = []
         // Capture and clear reference chats — they attach to this message only.
         let currentReferenceChats = selectedReferenceChats
@@ -3209,10 +3202,19 @@ final class ChatViewModel {
         selectedSkillIds = []
 
         let currentText = text
-        let currentAttachments = processedAttachments
+        var currentAttachments = processedAttachments
         inputText = ""
         attachments = []
         errorMessage = nil
+
+        await userDefaultParamsTask?.value
+        let defaultContext = activeChatStore?.cachedUserDefaultParams?.defaultUploadContext ?? "focused"
+        for index in currentAttachments.indices where currentAttachments[index].uploadContext == nil {
+            currentAttachments[index].uploadContext = defaultContext
+        }
+        for index in currentKnowledgeItems.indices where currentKnowledgeItems[index].context == nil {
+            currentKnowledgeItems[index].context = defaultContext
+        }
 
         // Build file references from pre-uploaded attachments.
         // Files are uploaded at attach time (uploadAttachmentImmediately),
@@ -3294,40 +3296,11 @@ final class ChatViewModel {
 
         // Create user message - store file IDs (not base64) matching Flutter behavior
         let uploadedAttachmentIds = fileRefs.compactMap { $0["id"] as? String }
-        var messageFiles: [ChatMessageFile] = fileRefs.map { ref in
-            // Derive content_type from filename so the Open WebUI web client
-            // knows to append `/content` to the file URL. Without content_type,
-            // the web client constructs `/files/{id}` (returns JSON metadata)
-            // instead of `/files/{id}/content` (returns actual file bytes).
-            // This affects images (broken thumbnails), PDFs, docs, and all files.
-            let name = ref["name"] as? String
-            let contentType: String? = mimeType(for: name ?? "file")
-            return ChatMessageFile(
-                type: ref["type"] as? String,
-                url: ref["id"] as? String,  // Store file ID, not base64
-                name: name,
-                contentType: contentType
-            )
-        }
-        // Also store knowledge items (collection/folder/file) on the user message
-        // so they persist in conversation history and appear on reload.
-        for knowledgeItem in currentKnowledgeItems {
-            messageFiles.append(ChatMessageFile(
-                type: knowledgeItem.type.rawValue,
-                url: knowledgeItem.id,
-                name: knowledgeItem.name,
-                contentType: nil
-            ))
-        }
-        // Store note refs on the user message so they appear as pills in the chat bubble.
-        for note in currentNotes {
-            let noteTitle = note.title.isEmpty ? "Untitled" : note.title
-            messageFiles.append(ChatMessageFile(
-                type: "note",
-                url: note.id,
-                name: noteTitle,
-                contentType: nil
-            ))
+        var messageFiles = fileRefs.map(ChatMessageFile.init(serverDictionary:))
+        messageFiles += currentKnowledgeItems.map { ChatMessageFile(serverDictionary: $0.toChatFileRef()) }
+        messageFiles += currentReferenceChats.map { ChatMessageFile(serverDictionary: $0.toChatFileRef()) }
+        messageFiles += currentNotes.map {
+            ChatMessageFile(type: "note", url: $0.id, name: $0.title.isEmpty ? "Untitled" : $0.title)
         }
         let userMessage = ChatMessage(
             role: .user,
@@ -3371,6 +3344,8 @@ final class ChatViewModel {
         } else {
             conversation?.messages.append(userMessage)
         }
+
+        chatFiles = AttachmentContext.adding(messageFiles, to: chatFiles)
 
         // Assistant placeholder
         let assistantMessageId = UUID().uuidString
@@ -3535,22 +3510,7 @@ final class ChatViewModel {
                 // show the previous attachments as its own attachment pills.
                 let currentMsgFileRefs = allFileRefs
 
-                // Also include file refs from ALL prior user messages so the server
-                // continues RAG retrieval for documents attached in earlier turns.
-                // This mirrors the OpenWebUI web client which always sends the full
-                // accumulated file list — without this, the AI "forgets" attachments
-                // after the first reply.
-                // NOTE: History refs go into request.files only, NOT into userMsgDict["files"].
-                let historyFileRefs = await self.collectHistoryFileRefs(excludingId: userMessage.id)
-                var allFileRefsForRAG = allFileRefs
-                for ref in historyFileRefs {
-                    guard let refId = ref["id"] as? String else { continue }
-                    if !allFileRefsForRAG.contains(where: { ($0["id"] as? String) == refId }) {
-                        allFileRefsForRAG.append(ref)
-                    }
-                }
-
-                if !allFileRefsForRAG.isEmpty { request.files = allFileRefsForRAG }
+                request.files = await self.contextFileRefs(currentFiles: messageFiles)
 
                 // Build the user_message node required by updated OpenWebUI servers.
                 // Without this, the server doesn't link the user message into the history
@@ -4091,45 +4051,8 @@ final class ChatViewModel {
                 ]
                 request.userMessage = userMsgDict
 
-                // Re-include files (notes, knowledge, uploaded files) from the original user node,
-                // plus files from ALL other user messages so the server keeps RAG active.
-                let capturedNotesManager = self.notesManager
-                var fileRefs: [[String: Any]] = []
-                for storedFile in capturedUserNode.files {
-                    guard let fileId = storedFile.url else { continue }
-                    if storedFile.type == "note" {
-                        var ref: [String: Any] = [
-                            "type": "note",
-                            "id": fileId,
-                            "name": storedFile.name ?? "Note",
-                            "status": "processed"
-                        ]
-                        if let note = await capturedNotesManager?.fetchNote(id: fileId) {
-                            ref["data"] = ["content": ["md": note.content]]
-                        }
-                        fileRefs.append(ref)
-                    } else if storedFile.type == "collection" {
-                        fileRefs.append([
-                            "type": "collection",
-                            "id": fileId,
-                            "name": storedFile.name ?? fileId
-                        ])
-                    } else {
-                        var ref: [String: Any] = ["type": storedFile.type ?? "file", "id": fileId]
-                        if let name = storedFile.name { ref["name"] = name }
-                        if let ct = storedFile.contentType { ref["content_type"] = ct }
-                        fileRefs.append(ref)
-                    }
-                }
-                // Merge in file refs from all other user messages (deduped by id).
-                let historyFileRefsRegen = await self.collectHistoryFileRefs(excludingId: capturedUserNode.id)
-                for ref in historyFileRefsRegen {
-                    guard let refId = ref["id"] as? String else { continue }
-                    if !fileRefs.contains(where: { ($0["id"] as? String) == refId }) {
-                        fileRefs.append(ref)
-                    }
-                }
-                if !fileRefs.isEmpty { request.files = fileRefs }
+                request.userMessage?["files"] = capturedUserNode.files.map(\.serverDictionary)
+                request.files = await self.contextFileRefs(currentFiles: capturedUserNode.files)
 
                 // Populate all common request fields
                 await self.populateCommonRequestFields(&request)
@@ -4490,6 +4413,7 @@ final class ChatViewModel {
     /// metadata on inactive-branch nodes with stale/empty flat-list data,
     /// which can cause the server to reorder childrenIds.
     private func syncCurrentIdToServer() async {
+        await contextSaveTask?.value
         guard let chatId = conversationId ?? conversation?.id, let manager else { return }
         let modelId = selectedModelId ?? conversation?.model ?? ""
 
@@ -4503,7 +4427,8 @@ final class ChatViewModel {
             model: modelId,
             systemPrompt: conv.systemPrompt,
             chatParams: conv.chatParams,
-            title: conv.title
+            title: conv.title,
+            chatFiles: conv.files
         )
     }
 
@@ -4598,46 +4523,9 @@ final class ChatViewModel {
                 ]
                 request.userMessage = editUserMsgDict
 
-                // Re-include files (notes, knowledge, uploaded files) from the original user node,
-                // plus files from ALL other user messages so the server keeps RAG active.
-                let editNotesManager = self.notesManager
                 let editUserFiles = self.conversation?.history.nodes[lastUser.id]?.files ?? lastUser.files
-                var editFileRefs: [[String: Any]] = []
-                for storedFile in editUserFiles {
-                    guard let fileId = storedFile.url else { continue }
-                    if storedFile.type == "note" {
-                        var ref: [String: Any] = [
-                            "type": "note",
-                            "id": fileId,
-                            "name": storedFile.name ?? "Note",
-                            "status": "processed"
-                        ]
-                        if let note = await editNotesManager?.fetchNote(id: fileId) {
-                            ref["data"] = ["content": ["md": note.content]]
-                        }
-                        editFileRefs.append(ref)
-                    } else if storedFile.type == "collection" {
-                        editFileRefs.append([
-                            "type": "collection",
-                            "id": fileId,
-                            "name": storedFile.name ?? fileId
-                        ])
-                    } else {
-                        var ref: [String: Any] = ["type": storedFile.type ?? "file", "id": fileId]
-                        if let name = storedFile.name { ref["name"] = name }
-                        if let ct = storedFile.contentType { ref["content_type"] = ct }
-                        editFileRefs.append(ref)
-                    }
-                }
-                // Merge in file refs from all other user messages (deduped by id).
-                let historyFileRefsEdit = await self.collectHistoryFileRefs(excludingId: lastUser.id)
-                for ref in historyFileRefsEdit {
-                    guard let refId = ref["id"] as? String else { continue }
-                    if !editFileRefs.contains(where: { ($0["id"] as? String) == refId }) {
-                        editFileRefs.append(ref)
-                    }
-                }
-                if !editFileRefs.isEmpty { request.files = editFileRefs }
+                request.userMessage?["files"] = editUserFiles.map(\.serverDictionary)
+                request.files = await self.contextFileRefs(currentFiles: editUserFiles)
 
                 // Populate all common request fields (model metadata, features, params,
                 // system variables, tool IDs, terminal, background tasks, etc.)
@@ -4773,6 +4661,7 @@ final class ChatViewModel {
         // delivering each token as fast as Swift's task scheduler allows.
         let msgId = assistantMessageId
         let updateSessionId = streamingSessionId
+        let terminalServerId = terminalEnabled ? selectedTerminalServer?.id : nil
         acc.onUpdate = { [weak self] content in
             // Guard: if streaming already finished (done:true processed),
             // ignore late-arriving accumulated content dispatches.
@@ -4818,6 +4707,11 @@ final class ChatViewModel {
             }
             // For all other event types, dispatch to main actor normally
             Task { @MainActor in
+                if type == "terminal:display_file" {
+                    self.receiveTerminalFile(data["data"] as? [String: Any], messageId: assistantMessageId,
+                                             chatId: effectiveChatId, serverId: terminalServerId)
+                    return
+                }
                 self.handleChatEvent(
                     event, ack: ack, assistantMessageId: assistantMessageId,
                     modelId: modelId, socketSessionId: socketSessionId,
@@ -4842,6 +4736,22 @@ final class ChatViewModel {
                 self.handleChannelEvent(event, assistantMessageId: assistantMessageId, acc: acc)
             }
         }
+    }
+
+    private func receiveTerminalFile(_ payload: [String: Any]?, messageId: String?, chatId: String?, serverId: String?) {
+        guard let payload, let messageId, let chatId,
+              chatId == (conversationId ?? conversation?.id),
+              conversation?.messages.contains(where: { $0.id == messageId && $0.role == .assistant }) == true,
+              let file = TerminalFileAttachment(event: payload, serverId: serverId, sessionId: chatId) else { return }
+        let key = chatId + "\0" + messageId
+        terminalDisplayFiles[key] = TerminalFileAttachment.merged(
+            (terminalDisplayFiles[key] ?? []) + [file], sessionId: chatId
+        )
+    }
+
+    func terminalFiles(for messageId: String) -> [TerminalFileAttachment] {
+        guard let chatId = conversationId ?? conversation?.id else { return [] }
+        return terminalDisplayFiles[chatId + "\0" + messageId] ?? []
     }
 
     private func handleChatEvent(
@@ -5849,6 +5759,7 @@ final class ChatViewModel {
             && !NotificationService.shared.bypassActiveConversationSuppression {
             return
         }
+        if suppressCompletionNotification { return }
 
         // Schedule the notification. The UNUserNotificationCenterDelegate
         // (willPresent) handles foreground suppression — if the user is viewing
@@ -6348,6 +6259,12 @@ final class ChatViewModel {
         codeInterpreterEnabled = defaults.contains("code_interpreter") && isTruthy("code_interpreter")
         suppressBuiltinFeatureTracking = false
 
+        // Default terminal (meta.terminalId) — mirrors web setDefaults(): select the
+        // model's terminal only if it actually exists. Servers load asynchronously, so
+        // stash the request and apply it now or once loadTerminalServers() finishes.
+        pendingModelDefaultTerminalId = modelDefaultTerminalId(for: model)
+        applyPendingModelDefaultTerminal()
+
         // Memory is an account-level preference stored server-side (ui.memory).
         // Fetch it once for all models (not just memory-capable ones) so the
         // value is cached for when a capable model is selected later.
@@ -6483,6 +6400,12 @@ final class ChatViewModel {
         do {
             let params = try await apiClient.fetchUserDefaultParams()
             activeChatStore?.cachedUserDefaultParams = params
+            for index in attachments.indices where attachments[index].uploadContext == nil {
+                attachments[index].uploadContext = params.defaultUploadContext
+            }
+            for index in selectedKnowledgeItems.indices where selectedKnowledgeItems[index].context == nil {
+                selectedKnowledgeItems[index].context = params.defaultUploadContext
+            }
             logger.debug("User default params fetched from server (hasOverride=\(params.hasAnyOverride))")
             // Re-run restoreToolApprovalMode so the server-stored tool_approval_mode
             // takes effect immediately if no per-conversation override is set.
@@ -6784,77 +6707,19 @@ final class ChatViewModel {
         return msgs
     }
 
-    /// Builds a deduplicated list of file reference dicts from ALL user messages in the
-    /// current conversation's history tree, optionally excluding a specific message ID.
-    ///
-    /// This ensures the server always has all previously-uploaded file references so it
-    /// continues RAG retrieval for documents attached in earlier turns of the conversation.
-    ///
-    /// - Parameter excludingId: A user message ID to skip (e.g. the current message whose
-    ///   files are already included via the live fileRefs/allFileRefs array). Pass `nil`
-    ///   to include every user message.
-    private func collectHistoryFileRefs(excludingId: String?) async -> [[String: Any]] {
-        guard let conv = conversation else { return [] }
-
-        // Gather files only from user messages on the ACTIVE branch (flat list).
-        // Using all tree nodes would include sibling/version nodes from inactive
-        // branches — e.g. the old user node after an edit with an attachment
-        // removed — causing the removed file to be re-added to the request.
-        var allStoredFiles: [ChatMessageFile] = []
-        let activeMsgIds = Set(conv.messages.map { $0.id })
-        let userNodes: [HistoryNode]
-        if conv.history.isPopulated {
-            userNodes = conv.history.nodes.values
-                .filter { $0.role == .user && $0.id != excludingId && activeMsgIds.contains($0.id) }
-                .sorted { $0.timestamp < $1.timestamp }
-        } else {
-            // Fallback: use flat messages array
-            userNodes = conv.messages
-                .filter { $0.role == .user && $0.id != excludingId }
-                .map { msg in
-                    HistoryNode(id: msg.id, role: msg.role, content: msg.content,
-                                timestamp: msg.timestamp, files: msg.files)
-                }
-        }
-        for node in userNodes {
-            allStoredFiles.append(contentsOf: node.files)
-        }
-
-        guard !allStoredFiles.isEmpty else { return [] }
-
-        var seenIds = Set<String>()
+    /// Only persisted, active-branch context is carried to subsequent requests.
+    private func contextFileRefs(currentFiles: [ChatMessageFile]) async -> [[String: Any]] {
+        let files = AttachmentContext.active(chatFiles, in: conversation?.messages ?? [])
+            + currentFiles.filter { !$0.isContext }
         var refs: [[String: Any]] = []
-        for storedFile in allStoredFiles {
-            guard let fileId = storedFile.url else { continue }
-            guard !seenIds.contains(fileId) else { continue }
-            // Skip IDs that the user explicitly removed via the Controls panel.
-            // This prevents ghost re-injection from history nodes.
-            guard !removedContextIds.contains(fileId) else { continue }
-            seenIds.insert(fileId)
-
-            if storedFile.type == "note" {
-                var ref: [String: Any] = [
-                    "type": "note",
-                    "id": fileId,
-                    "name": storedFile.name ?? "Note",
-                    "status": "processed"
-                ]
-                if let note = await notesManager?.fetchNote(id: fileId) {
-                    ref["data"] = ["content": ["md": note.content]]
-                }
-                refs.append(ref)
-            } else if storedFile.type == "collection" {
-                refs.append([
-                    "type": "collection",
-                    "id": fileId,
-                    "name": storedFile.name ?? fileId
-                ])
-            } else {
-                var ref: [String: Any] = ["type": storedFile.type ?? "file", "id": fileId, "url": fileId]
-                if let name = storedFile.name { ref["name"] = name }
-                if let ct = storedFile.contentType { ref["content_type"] = ct }
-                refs.append(ref)
+        for file in files {
+            var ref = file.serverDictionary
+            if file.type == "note", let id = file.referenceID,
+               let note = await notesManager?.fetchNote(id: id) {
+                ref["status"] = "processed"
+                ref["data"] = ["content": ["md": note.content]]
             }
+            refs.append(ref)
         }
         return refs
     }
@@ -6930,10 +6795,7 @@ final class ChatViewModel {
                 ]
 
                 if !nonImageFiles.isEmpty {
-                    msgDict["files"] = nonImageFiles.compactMap { f -> [String: Any]? in
-                        guard let id = f.url else { return nil }
-                        return ["type": "file", "id": id, "url": id]
-                    }
+                    msgDict["files"] = nonImageFiles.map(\.serverDictionary)
                 }
 
                 apiMessages.append(msgDict)
@@ -6944,10 +6806,7 @@ final class ChatViewModel {
                 ]
 
                 if !message.files.isEmpty {
-                    msgDict["files"] = message.files.compactMap { f -> [String: Any]? in
-                        guard let id = f.url else { return nil }
-                        return ["type": f.type ?? "file", "id": id, "url": id]
-                    }
+                    msgDict["files"] = message.files.map(\.serverDictionary)
                 } else if !message.attachmentIds.isEmpty {
                     msgDict["files"] = message.attachmentIds.map { id -> [String: Any] in
                         ["type": "file", "id": id, "url": id]
@@ -7359,8 +7218,10 @@ final class ChatViewModel {
         // Gate on a 100-char delta to avoid the O(n) string scan on every token.
         // The function also guards internally (only fires when the magic keywords are present),
         // so normal messages pay only the cheap length comparison.
-        if content.count - lastTaskExtractionLength >= 100 {
-            lastTaskExtractionLength = content.count
+        // utf8.count is O(1) for native strings; `count` walks every character.
+        let contentLength = content.utf8.count
+        if contentLength - lastTaskExtractionLength >= 100 {
+            lastTaskExtractionLength = contentLength
             extractAndApplyTasksFromContent(content)
         }
 
@@ -8038,6 +7899,8 @@ final class ContentAccumulator: @unchecked Sendable {
     /// When true, a Task is already queued and will read the latest content
     /// when it executes — no need to create another one.
     private nonisolated(unsafe) var _pendingUpdate: Bool = false
+    /// Bumped on every mutation so an off-lock rebuild can tell whether it is stale.
+    private nonisolated(unsafe) var revision: UInt64 = 0
 
     /// Callback invoked on the main actor with the latest accumulated
     /// content. Set by the view model when socket handlers are registered.
@@ -8060,7 +7923,8 @@ final class ContentAccumulator: @unchecked Sendable {
         return currentContent()
     }
 
-    /// Called under the lock; reconstruct at delivery, not on every token.
+    /// Called under the lock. `mutate` normally rebuilds structured content on the
+    /// socket thread first; this is only a fallback for a read racing that rebuild.
     nonisolated private func currentContent() -> String {
         if outputDirty, let output {
             _content = outputPrefix + (MessageHistory.reconstructContentFromOutput(output) ?? "")
@@ -8155,6 +8019,29 @@ final class ContentAccumulator: @unchecked Sendable {
     nonisolated private func mutate(_ change: () -> Void) {
         lock.lock()
         change()
+        // Structured (output-array) replies are rebuilt HERE, on the socket's
+        // background thread, not when the main actor collects the update. The
+        // rebuild walks every output item and HTML-encodes tool payloads, which
+        // is too heavy for the main thread while it animates the reply. The work
+        // runs outside the lock so the main actor never waits on it; `revision`
+        // discards a result that a newer mutation has already superseded.
+        let pendingOutput = outputDirty ? output : nil
+        let prefix = outputPrefix
+        revision &+= 1
+        let rebuildRevision = revision
+        lock.unlock()
+
+        if let pendingOutput {
+            let rebuilt = prefix + (MessageHistory.reconstructContentFromOutput(pendingOutput) ?? "")
+            lock.lock()
+            if revision == rebuildRevision {
+                _content = rebuilt
+                outputDirty = false
+            }
+            lock.unlock()
+        }
+
+        lock.lock()
         let needsDispatch = !_pendingUpdate
         if needsDispatch { _pendingUpdate = true }
         let callback = _onUpdate

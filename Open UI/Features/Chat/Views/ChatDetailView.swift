@@ -7,6 +7,15 @@ import MarkdownView
 import Litext
 import os.log
 
+// A hidden navigation bar gets native status blur only on iOS 27 with an iOS 27 SDK build.
+private let hasNativeStatusBlur: Bool = {
+    guard #available(iOS 27.0, *),
+          let sdk = Bundle.main.object(forInfoDictionaryKey: "DTSDKName") as? String,
+          let major = Int(sdk.drop(while: { !$0.isNumber }).prefix(while: \.isNumber))
+    else { return false }
+    return major >= 27
+}()
+
 // MARK: - Scroll Geometry Snapshot
 //
 // A single atomic snapshot of the scroll view's geometry, captured inside
@@ -35,18 +44,20 @@ private final class PumpRef {
     /// Armed before every programmatic scrollTo() call so reflow-induced offset
     /// changes (FAB scroll, stream start, pagination) never trigger the nav bar.
     var programmaticScrollUntil: Date = .distantPast
+    /// While the sent-message glide is running, nothing else may scroll: the
+    /// stream-start snap, the follower and the height correction would each cut
+    /// the spring off mid-flight.
+    var sendGlideUntil: Date = .distantPast
+    /// Eases the viewport toward the live bottom while a reply streams.
+    let follower = BottomFollower()
     /// Current scroll offset Y — tracked at 120Hz but stored here (not @State) so that
     /// writing it never triggers a SwiftUI body re-evaluation. Read at tap-time by FAB.
     var currentScrollOffsetY: CGFloat = 0
-    /// Timestamp when streaming last transitioned from active → idle.
-    /// Used to extend the scroll pump's active window for a brief grace period after
-    /// isStreaming flips to false, so the final drain burst is tracked all the way down.
-    var streamingEndedAt: Date = .distantPast
     /// Timestamp of the last time scroll content height increased.
     /// Updated every time contentHeight grows inside onScrollGeometryChange.
-    /// The pump uses this to stay alive as long as content is still being rendered,
-    /// regardless of whether isStreaming is true — fixes the early-stop bug where
-    /// the pipeline's fast-drain burst arrives after isStreaming flips to false.
+    /// The follower uses this to stay alive as long as content is still being
+    /// rendered, so the typewriter's final characters after the stream ends are
+    /// followed all the way down.
     var lastContentGrowthAt: Date = .distantPast
     /// Guards against re-entrant upward pagination: set to true when an upward
     /// expand Task has been dispatched, cleared when that Task completes.
@@ -69,6 +80,64 @@ private final class PumpRef {
     /// the safe-area inset, which shifts the scroll offset once — that layout shift must
     /// not be read as user travel and bounce the bar straight back.
     var navBarCooldownUntil: Date = .distantPast
+}
+
+// MARK: - Bottom Follower
+
+/// Keeps the live end of a streaming reply in view by gliding, not jumping.
+///
+/// The previous pump snapped to the bottom whenever content grew, so every new
+/// line moved the page in one step. This closes the gap a fraction per display
+/// frame (an ease-out of about 0.1s) and stops as soon as it has caught up, so it
+/// only runs while there is distance to cover. It writes the UIKit offset
+/// directly: a SwiftUI `ScrollPosition` change per frame would re-evaluate the
+/// whole chat view. It never fights the user — any touch or momentum stops it,
+/// and the caller only starts it when every existing auto-follow guard passes.
+@MainActor
+private final class BottomFollower: NSObject {
+    weak var scrollView: UIScrollView?
+    /// Called on every step so the geometry observer treats the motion as programmatic.
+    var onStep: (() -> Void)?
+    private var link: CADisplayLink?
+    private var previous: CFTimeInterval?
+
+    /// Seconds for the glide to cover ~63% of the remaining distance.
+    private static let timeConstant = 0.1
+
+    /// Whether a UIKit scroll view is attached; callers fall back to snapping.
+    var isAvailable: Bool { scrollView != nil }
+
+    func follow() {
+        guard link == nil, scrollView != nil else { return }
+        let displayLink = CADisplayLink(target: self, selector: #selector(tick(_:)))
+        displayLink.preferredFrameRateRange = CAFrameRateRange(minimum: 60, maximum: 120, preferred: 120)
+        displayLink.add(to: .main, forMode: .common)
+        link = displayLink
+        previous = nil
+    }
+
+    func stop() {
+        link?.invalidate()
+        link = nil
+        previous = nil
+    }
+
+    @objc private func tick(_ link: CADisplayLink) {
+        guard let scrollView, !scrollView.isTracking, !scrollView.isDragging,
+              !scrollView.isDecelerating else { stop(); return }
+        let inset = scrollView.adjustedContentInset
+        let bottom = max(-inset.top, scrollView.contentSize.height - scrollView.bounds.height + inset.bottom)
+        let gap = bottom - scrollView.contentOffset.y
+        // Content shrank or we arrived: never scroll upward, just stop.
+        guard gap > 0.5 else { stop(); return }
+        let dt = min(previous.map { link.timestamp - $0 } ?? (link.targetTimestamp - link.timestamp), 0.05)
+        previous = link.timestamp
+        let step = gap * (1 - exp(-dt / Self.timeConstant))
+        onStep?()
+        // Finish exactly on the edge once the remainder is under half a point.
+        let next = gap - step < 0.5 ? bottom : scrollView.contentOffset.y + step
+        scrollView.contentOffset = CGPoint(x: scrollView.contentOffset.x, y: next)
+    }
 }
 
 // MARK: - Chat Detail View
@@ -118,6 +187,12 @@ struct ChatDetailView: View {
     /// from the very first frame (avoids the top→centre jump when a new
     /// ChatDetailView is instantiated and the async measurement hasn't fired yet).
     @State private var viewState_containerHeight: CGFloat = UIScreen.main.bounds.height
+    /// True once a response has streamed while this chat is on screen. Keeps the
+    /// last turn's viewport-height reservation after the stream ends, so a reply the
+    /// user just watched doesn't jump when the reserved writing space would vanish.
+    /// Starts false on every new ChatDetailView instance (each chat has a unique .id),
+    /// so reopened chats render completed turns at their natural height.
+    @State private var hasStreamedThisSession = false
     // currentScrollOffsetY and topmostVisibleMessageId are stored in _pumpRef (PumpRef class)
     // to avoid @State observation overhead — writing them on every 120Hz scroll frame was
     // causing the entire view body to re-evaluate, causing low-FPS scrolling. They are read
@@ -470,40 +545,7 @@ struct ChatDetailView: View {
                             .opacity.combined(with: .offset(y: -20))
                         )
                 }
-            }
-        }
-        // Read-aloud player — floats as a self-sizing pill in the top area
-        .overlay(alignment: .top) {
-            let ttsPlayer = dependencies.textToSpeechService.readAloudPlayer
-            let showAnyPlayer = ttsPlayer.isVisible
-                || speakingMessageId != nil
-                || ttsGeneratingMessageId != nil
-            if showAnyPlayer {
-                ReadAloudPlayerBar(
-                    player: ttsPlayer.isVisible ? ttsPlayer : nil,
-                    readFromHere: { text in
-                        guard let messageID = ttsPlayer.messageID else { return }
-                        dependencies.textToSpeechService.speakMessage(
-                            text, messageID: messageID,
-                            title: ttsPlayer.title,
-                            serverSplitOn: dependencies.authViewModel.backendConfig?.audio?.tts?.splitOn)
-                    },
-                    isGenerating: ttsGeneratingMessageId != nil && speakingMessageId == nil,
-                    isPlaying: speakingMessageId != nil || ttsPlayer.isPlaying,
-                    onStop: {
-                        dependencies.textToSpeechService.stop()
-                        speakingMessageId = nil
-                        ttsGeneratingMessageId = nil
-                    },
-                    isUserScrolling: isFingerDriving
-                )
-                .padding(.top, 8)
-                .transition(.asymmetric(
-                    insertion: .opacity.combined(with: .scale(scale: 0.9, anchor: .top)),
-                    removal: .opacity.combined(with: .scale(scale: 0.9, anchor: .top))
-                ))
-                .animation(.spring(response: 0.35, dampingFraction: 0.8), value: showAnyPlayer)
-                .allowsHitTesting(true)
+                readAloudPlayerBar
             }
         }
         .chatChromeBar(edge: .bottom) {
@@ -526,13 +568,13 @@ struct ChatDetailView: View {
                     .padding(.bottom, (verticalSizeClass == .compact && viewModel.terminalEnabled && viewModel.selectedTerminalServer != nil) ? keyboard.height : 0)
             }
         }
-        // Status-bar safe-area backdrop stays visible independently of the floating controls.
-        // On iOS 26+ we use glassEffect(.clear) so text scrolling behind the status icons
-        // stays readable as a soft blur (PR #248). On older iOS, ultraThinMaterial fallback.
+        // Keep the explicit backdrop unless this build supports native status-area blur.
         .overlay {
             GeometryReader { geometry in
                 Group {
-                    if #available(iOS 26.0, *) {
+                    if hasNativeStatusBlur {
+                        EmptyView()
+                    } else if #available(iOS 26.0, *) {
                         Color.clear
                             // Keep the glass rim outside the visible status-area band.
                             .glassEffect(.clear, in: Rectangle().inset(by: -geometry.safeAreaInsets.top))
@@ -944,6 +986,42 @@ struct ChatDetailView: View {
 
     // MARK: - Custom top bar
 
+    private var showsReadAloudPlayer: Bool {
+        dependencies.textToSpeechService.readAloudPlayer.isVisible
+            || speakingMessageId != nil
+            || ttsGeneratingMessageId != nil
+    }
+
+    @ViewBuilder
+    private var readAloudPlayerBar: some View {
+        let ttsPlayer = dependencies.textToSpeechService.readAloudPlayer
+        if showsReadAloudPlayer {
+            ReadAloudPlayerBar(
+                player: ttsPlayer.isVisible ? ttsPlayer : nil,
+                readFromHere: { text in
+                    guard let messageID = ttsPlayer.messageID else { return }
+                    dependencies.textToSpeechService.speakMessage(
+                        text, messageID: messageID,
+                        title: ttsPlayer.title,
+                        serverSplitOn: dependencies.authViewModel.backendConfig?.audio?.tts?.splitOn)
+                },
+                isGenerating: ttsGeneratingMessageId != nil && speakingMessageId == nil,
+                isPlaying: speakingMessageId != nil || ttsPlayer.isPlaying,
+                onStop: {
+                    dependencies.textToSpeechService.stop()
+                    speakingMessageId = nil
+                    ttsGeneratingMessageId = nil
+                },
+                isUserScrolling: isFingerDriving
+            )
+            .foregroundStyle(theme.textPrimary)
+            .padding(.horizontal, Spacing.sm)
+            .padding(.bottom, 8)
+            .transition(.opacity.combined(with: .scale(scale: 0.9, anchor: .top)))
+            .animation(.spring(response: 0.35, dampingFraction: 0.8), value: showsReadAloudPlayer)
+        }
+    }
+
     private var customTopBar: some View {
         HStack(spacing: Spacing.sm) {
             // Leading: hamburger — large circle pill matching image 2
@@ -1185,8 +1263,7 @@ struct ChatDetailView: View {
             if vm.isShowingKnowledgePicker {
                 KnowledgePickerView(
                     query: vm.knowledgeSearchQuery,
-                    items: vm.knowledgeItems,
-                    isLoading: vm.isLoadingKnowledge,
+                    apiClient: dependencies.apiClient,
                     keyboardHeight: keyboard.height,
                     onSelect: { item in
                         viewModel.selectKnowledgeItem(item)
@@ -1337,6 +1414,7 @@ struct ChatDetailView: View {
             ChatInputField(
                 text: $vm.inputText,
                 attachments: $vm.attachments,
+                attachmentUsage: vm.attachmentUsage,
                 placeholder: placeholderText,
                 isKeyboardVisible: keyboard.isVisible,
                 isEnabled: !vm.isStreaming || vm.enableMessageQueue,
@@ -1409,7 +1487,6 @@ struct ChatDetailView: View {
                             withAnimation(.easeOut(duration: 0.2)) {
                                 viewModel.isShowingKnowledgePicker = true
                             }
-                            viewModel.loadKnowledgeItems()
                         }
                     }
                 },
@@ -1669,10 +1746,20 @@ struct ChatDetailView: View {
             // reset the window to show the latest messages so they're visible.
             // Skip bulk loads (old == 0) — those start paginated at 5.
             if new > old && old > 0 {
+                let wasPinnedToLatest = windowEnd == nil
                 // Pin window to the end (latest messages)
                 windowEnd = nil
-                // Grow the window to include the new messages, capped at maxWindowSize
-                windowSize = min(max(windowSize, maxWindowSize), new)
+                if wasPinnedToLatest {
+                    // Grow by exactly the new messages so every row already on screen
+                    // stays mounted. Jumping straight to maxWindowSize mounted up to a
+                    // dozen heavy older rows in the same frame as the send glide.
+                    // Allow a small overflow instead of dropping rows from the top,
+                    // which would shift the page right before the glide.
+                    windowSize = min(windowSize + (new - old), maxWindowSize + 4, new)
+                } else {
+                    // Returning from an older window: show the latest messages.
+                    windowSize = min(max(windowSize, 8), new)
+                }
             }
 
             guard new > old else { return }
@@ -1709,6 +1796,14 @@ struct ChatDetailView: View {
                 }
             } else if keyboard.isVisible {
                 // Keyboard dismiss changes the layout significantly — always scroll here.
+                let isSend = lastMessage?.role == .user
+                    || (new - old >= 2 && viewModel.messages.dropLast().last?.role == .user)
+                if isSend {
+                    // A send: reserve the reply's writing space now, so the page
+                    // height does not jump when streaming starts mid-glide.
+                    hasStreamedThisSession = true
+                    _pumpRef.sendGlideUntil = Date().addingTimeInterval(0.95)
+                }
                 UIApplication.shared.sendAction(
                     #selector(UIResponder.resignFirstResponder),
                     to: nil, from: nil, for: nil)
@@ -1734,6 +1829,12 @@ struct ChatDetailView: View {
                 // first so the in-flight offset changes don't misfire the nav-bar /
                 // breakout observer while the spring is running.
                 _pumpRef.programmaticScrollUntil = Date().addingTimeInterval(0.7)
+                // Reserve the reply's writing space immediately. Streaming starts a
+                // moment later (after the request is built), and turning the
+                // reservation on then grew the page by up to a screen mid-glide.
+                hasStreamedThisSession = true
+                // The glide is the only scroll until it lands: 80ms settle + spring.
+                _pumpRef.sendGlideUntil = Date().addingTimeInterval(0.6)
                 Task { @MainActor in
                     // 80ms settle: gives the layout engine one pass to measure the
                     // new bubble + empty assistant placeholder before the spring fires.
@@ -1745,25 +1846,23 @@ struct ChatDetailView: View {
             }
             // else: assistant addition already at bottom — programmatic scroll handles it.
         }
-        // Streaming start/end: manage auto-scroll state.
-        // When streaming STARTS with streamingAutoScroll enabled, re-engage and jump to bottom.
+        // Streaming start: manage auto-scroll state.
+        // When streaming STARTS with streamingAutoScroll enabled, re-engage auto-follow.
         // When streaming ENDS: the unified render path (IsolatedAssistantMessage) no longer
-        // performs any structural view swap — AssistantMessageContent is always child-0 of
-        // the same VStack, so there is no height-rounding artifact at stream end.
-        // We simply restore the scroll position for users who were scrolled up.
+        // performs any structural view swap, and the follower tracks the typewriter's
+        // last characters via lastContentGrowthAt — nothing to do here.
         .onChange(of: viewModel.isStreaming) { oldStreaming, newStreaming in
+            if newStreaming { hasStreamedThisSession = true }
             if newStreaming && streamingAutoScroll {
                 // Stream started — re-engage auto-scroll.
-                // Use an instant snap (no withAnimation) so there is no in-flight
-                // Core Animation competing with the user's touch when they try to
-                // scroll up during streaming. The sent-message spring fired ~100ms
-                // earlier has already glided the question to the top; at this point
-                // the response placeholder is just appearing so the scroll distance
-                // is negligible and the instant jump is invisible.
                 isScrolledUp = false
                 isUserDriving = false
-                _pumpRef.programmaticScrollUntil = Date().addingTimeInterval(0.4)
-                scrollPosition.scrollTo(edge: .bottom)
+                // When the sent-message glide is still running it already ends at
+                // the bottom; an instant snap here would cut it off mid-flight.
+                if Date() >= _pumpRef.sendGlideUntil {
+                    _pumpRef.programmaticScrollUntil = Date().addingTimeInterval(0.4)
+                    scrollPosition.scrollTo(edge: .bottom)
+                }
             }
             if newStreaming && navBarHidden {
                 // Always show the nav bar (hamburger menu) when streaming starts.
@@ -1773,15 +1872,6 @@ struct ChatDetailView: View {
                 // the menu for the entire stream. Force it visible here so the
                 // hamburger, model selector, and trailing controls stay reachable.
                 withAnimation(.easeOut(duration: 0.25)) { navBarHidden = false }
-            }
-            if !newStreaming && oldStreaming {
-                // Stream just ended — record the timestamp so the scroll pump can
-                // continue tracking the final drain burst for a short grace period.
-                // Without this, the pipeline's fast-drain mode (~100ms) can dump the
-                // remaining chars after isStreaming flips to false, and the pump's
-                // viewModel.isStreaming guard would then block it from following the
-                // resulting content-height growth — causing a visible content pop.
-                _pumpRef.streamingEndedAt = Date()
             }
         }
         // Resume auto-scroll: when the user taps the FAB (isScrolledUp → false)
@@ -1862,13 +1952,20 @@ struct ChatDetailView: View {
         }
         .scrollContentBackground(.hidden)
         .scrollClipDisabled()
-        .background(ScrollViewHorizontalLock())
+        .background(ScrollViewHorizontalLock(onAttach: { [pump = _pumpRef] scrollView in
+            pump.follower.scrollView = scrollView
+            pump.follower.onStep = { [weak pump] in
+                pump?.programmaticScrollUntil = Date().addingTimeInterval(0.06)
+            }
+        }))
         .scrollIndicators(.hidden)
         .scrollDismissesKeyboard(editingMessageId != nil ? .never : (viewModel.isStreaming ? .immediately : .interactively))
         .scrollPosition($scrollPosition)
         .onScrollPhaseChange { _, newPhase in
             if newPhase == .interacting {
                 userMessageJumpIndex = nil
+                // A touch always wins over the auto-follow glide.
+                _pumpRef.follower.stop()
             }
             // isUserDriving: yield the streaming pump to BOTH finger touch AND inertia/deceleration.
             // This prevents the pump from fighting the user during a flick-scroll.
@@ -2013,7 +2110,8 @@ struct ChatDetailView: View {
                !isScrolledUp,
                !isUserDriving,
                !viewModel.isStreaming,
-               userMessageJumpIndex == nil {
+               userMessageJumpIndex == nil,
+               Date() >= _pumpRef.sendGlideUntil {
                 scrollPosition.scrollTo(edge: .bottom)
             }
 
@@ -2234,19 +2332,27 @@ struct ChatDetailView: View {
                 }
             }
 
-            // ── Streaming auto-follow pump ──
-            // Rate-limited instant snap — keeps viewport glued to the live tail during streaming.
-            // Guards: not user-driving, not manually scrolled up, not paginating.
+            // ── Streaming auto-follow ──
+            // Glides the viewport to the live tail while a reply is being revealed.
+            // Guards: auto-scroll enabled, not user-driving, not coasting, not
+            // manually scrolled up, not paginating, and not during the send glide.
             let distFromBottom = max(0, contentHeight - containerHeight - newOffset.y)
             let driftedFar = distFromBottom > 4
             let stillRendering = Date().timeIntervalSince(_pumpRef.lastContentGrowthAt) < 0.1
             let recentlyStreaming = viewModel.isStreaming || stillRendering
-            if driftedFar && recentlyStreaming && !isUserDriving && !isDecelerating && !isScrolledUp && !isLoadingMoreMessages {
-                let now = Date()
-                guard now.timeIntervalSince(_pumpRef.lastScrollTime) >= 0.016 else { return }
-                _pumpRef.lastScrollTime = now
-                _pumpRef.programmaticScrollUntil = now.addingTimeInterval(0.06)
-                scrollPosition.scrollTo(edge: .bottom)
+            if driftedFar && recentlyStreaming && streamingAutoScroll && !isUserDriving && !isDecelerating
+                && !isScrolledUp && !isLoadingMoreMessages && Date() >= _pumpRef.sendGlideUntil {
+                if _pumpRef.follower.isAvailable {
+                    _pumpRef.programmaticScrollUntil = Date().addingTimeInterval(0.06)
+                    _pumpRef.follower.follow()
+                } else {
+                    // Scroll view not attached yet: fall back to the rate-limited snap.
+                    let now = Date()
+                    guard now.timeIntervalSince(_pumpRef.lastScrollTime) >= 0.016 else { return }
+                    _pumpRef.lastScrollTime = now
+                    _pumpRef.programmaticScrollUntil = now.addingTimeInterval(0.06)
+                    scrollPosition.scrollTo(edge: .bottom)
+                }
             }
         }
     }
@@ -2427,16 +2533,15 @@ struct ChatDetailView: View {
 
     // MARK: - Messages List
 
-    /// Splits messages into two groups around the last conversation turn.
+    /// Groups the visible messages into conversation turns (a user message plus
+    /// the replies after it), each rendered in one stable container.
     ///
-    /// The **last turn** is defined as the last user message plus any
-    /// assistant/system messages that follow it. This group is wrapped in a
-    /// `VStack` with `minHeight: viewportHeight, alignment: .top` — the
-    /// ChatGPT-style trick that makes scroll-to-bottom place the user's
-    /// sent message near the **top** of the viewport, with the AI response
-    /// streaming in below it.
-    ///
-    /// All earlier messages render at their natural height.
+    /// The **last turn** gets a viewport minimum height while a response streams
+    /// (and for the rest of that on-screen session), so the sent message stays
+    /// near the top as the response grows without jumping when it finishes.
+    /// Completed turns in a freshly opened chat use their natural height, so no
+    /// empty space is left below the reply. All earlier turns render at their
+    /// natural height.
     private var messagesList: some View {
         let allMessages = viewModel.messages
         let total = allMessages.count
@@ -2466,14 +2571,31 @@ struct ChatDetailView: View {
             Task { @MainActor in cachedIndexMap = freshMap }
         }
 
-        // Split point: index of the last user message *within the visible slice*.
-        // Everything from here to the end is the "last turn".
-        // If there are no user messages, splitAt == count → no split, all normal.
-        let lastUserIdx = messages.lastIndex(where: { $0.role == .user })
-        let splitAt = lastUserIdx ?? messages.count
+        // Group the slice into turns: each user message starts a turn that holds it
+        // and the replies after it. A turn is keyed by its first message, so when a
+        // new message is sent the previous turn stays the SAME view — only its
+        // reserved height changes. (Splitting "older rows" from "last turn" into two
+        // containers moved the previous reply between them on every send, which
+        // rebuilt its Markdown views mid-glide.)
+        var turns: [(id: String, messages: [ChatMessage])] = []
+        for message in messages {
+            if message.role == .user || turns.isEmpty {
+                turns.append((message.id, [message]))
+            } else {
+                turns[turns.count - 1].messages.append(message)
+            }
+        }
+        let lastTurnId = turns.last?.id
+        // Only a turn that starts with a user message is a real "last turn".
+        let lastTurnIsUserTurn = turns.last?.messages.first?.role == .user
 
-        // Only apply minHeight trick when the window includes the actual last message
+        // Reserve writing space only for the actual last turn, never an older window.
         let windowIncludesEnd = (windowEnd == nil || clampedEnd >= total)
+        let reservedHeight: CGFloat? = {
+            guard windowIncludesEnd, lastTurnIsUserTurn,
+                  viewModel.isStreaming || hasStreamedThisSession else { return nil }
+            return max(viewState_containerHeight, 0)
+        }()
 
         return Group {
             // ── "Loading more" indicator at the top ──
@@ -2485,43 +2607,19 @@ struct ChatDetailView: View {
                     .id("pagination-spinner-top")
             }
 
-            // ── Messages before the last turn (natural height) ──
-            ForEach(Array(messages.prefix(splitAt))) { message in
-                let index = indexMap[message.id] ?? 0
-                messageRow(message: message, index: index)
-                    .id(message.id)
-                    .transition(.opacity)
-            }
-            .animation(.easeInOut(duration: 0.2), value: messages.prefix(splitAt).map(\.id))
-
-            // ── Last turn (user msg + assistant reply) with minHeight ──
-            if splitAt < messages.count {
+            ForEach(turns, id: \.id) { turn in
                 VStack(spacing: 0) {
-                    ForEach(Array(messages.suffix(from: splitAt))) { message in
+                    ForEach(turn.messages) { message in
                         let index = indexMap[message.id] ?? 0
                         messageRow(message: message, index: index)
                             .id(message.id)
-                            .transition(.opacity)
                     }
                 }
-                // Only apply the ChatGPT-style minHeight trick when the total content
-                // actually overflows the viewport. For short conversations that fit
-                // entirely on screen the trick is counter-productive: it inflates the
-                // content height to ~2× the viewport, causing defaultScrollAnchor(.bottom)
-                // to position the view at the bottom of the empty padding — pushing the
-                // real messages above the visible area and triggering a false
-                // "scrolled up" state that shows the ↓ FAB unnecessarily.
-                .frame(minHeight: {
-                    guard windowIncludesEnd else { return nil }
-                    let naturalContentHeight = viewState_contentHeight
-                    let containerHeight = viewState_containerHeight
-                    // Suppress minHeight when content already fits within the viewport,
-                    // BUT keep it active during streaming so the pump can pin correctly.
-                    // Use a small tolerance (8pt) to avoid edge cases where content is
-                    // measured as just barely overflowing due to sub-pixel rounding.
-                    guard naturalContentHeight > containerHeight + 8 || viewModel.isStreaming else { return nil }
-                    return max(containerHeight, 0)
-                }(), alignment: .top)
+                // Reserve writing space only on the last turn, and only while streaming
+                // or after a stream in this on-screen session (so the finished reply
+                // doesn't jump). Completed turns in a freshly opened chat use their
+                // natural height, leaving no blank area below finished replies.
+                .frame(minHeight: turn.id == lastTurnId ? reservedHeight : nil, alignment: .top)
             }
 
             // ── "Loading newer" indicator at the bottom ──
@@ -2710,8 +2808,12 @@ struct ChatDetailView: View {
             }
 
             // ── Follow-up suggestions (last assistant message only) ──
+            // Animate in when a reply finishes, but vanish instantly once the reply is
+            // no longer the latest: collapsing them with a spring changed the page
+            // height in the middle of the send glide.
             let displayFollowUps: [String] = suggestionsEnabled ? message.followUps : []
-            AnimatedPresence(visible: isLastAssistant && !message.isStreaming && !displayFollowUps.isEmpty) {
+            AnimatedPresence(visible: isLastAssistant && !message.isStreaming && !displayFollowUps.isEmpty,
+                             skipAnimation: !isLastAssistant) {
                 if isLastAssistant && !message.isStreaming && !displayFollowUps.isEmpty {
                     followUpSuggestions(displayFollowUps)
                         .padding(.horizontal, Spacing.screenPadding)
@@ -2881,7 +2983,9 @@ struct ChatDetailView: View {
                 contentOverride: assistantContentOverride[message.id],
                 serverBaseURL: viewModel.serverBaseURL,
                 authToken: viewModel.serverAuthToken,
-                apiClient: dependencies.apiClient
+                apiClient: dependencies.apiClient,
+                terminalSessionId: viewModel.conversationId ?? viewModel.conversation?.id,
+                liveTerminalFiles: viewModel.terminalFiles(for: message.id)
             )
         }
     }
@@ -4428,8 +4532,10 @@ struct ChatDetailView: View {
                     isScrolledUp = false
                     isUserDriving = false
                     _pumpRef.programmaticScrollUntil = Date().addingTimeInterval(0.4)
-                    viewModel.inputText = suggestion
-                    Task { await viewModel.sendMessage() }
+                    // Send the suggestion directly: routing it through the composer
+                    // filled and resized the input field for a frame before sending.
+                    viewModel.inputText = ""
+                    Task { await viewModel.sendMessage(directText: suggestion) }
                     Haptics.play(.light)
                 } label: {
                     HStack(spacing: Spacing.sm) {
@@ -4611,6 +4717,9 @@ struct ChatDetailView: View {
         NotificationService.shared.activeConversationId =
             viewModel.conversationId ?? viewModel.conversation?.id
         await viewModel.load()
+        // Joining a chat that is already streaming: onChange(of: isStreaming) won't
+        // fire for the initial value, so opt into the reserved writing space here.
+        if viewModel.isStreaming { hasStreamedThisSession = true }
         // After messages load, pin the window to the latest messages.
         let loadedCount = viewModel.messages.count
         if loadedCount > 0 {
@@ -5705,13 +5814,6 @@ private struct IsolatedStreamingStatus: View {
 /// **After:** Only this small struct re-evaluates per token. All other
 /// message views, the toolbar, input field, and scroll infrastructure
 /// remain completely inert during streaming.
-///
-/// ## Fixed-Height Streaming Container (VStack Re-layout Fix)
-/// During active streaming, the content is wrapped in a fixed-height
-/// (400pt) container with internal scrolling. This prevents the parent
-/// VStack from re-measuring ALL sibling message rows when the streaming
-/// content grows in height. When streaming completes, the fixed height
-/// is removed and full content renders at its natural height.
 private struct IsolatedAssistantMessage: View {
     let streamingStore: StreamingContentStore
     let message: ChatMessage
@@ -5723,6 +5825,8 @@ private struct IsolatedAssistantMessage: View {
     var authToken: String? = nil
     /// APIClient for rendering inline images via AuthenticatedImageView.
     var apiClient: APIClient? = nil
+    var terminalSessionId: String? = nil
+    var liveTerminalFiles: [TerminalFileAttachment] = []
 
     @AppStorage("renderAssistantMarkdown") private var renderAssistantMarkdown: Bool = true
 
@@ -5763,7 +5867,7 @@ private struct IsolatedAssistantMessage: View {
         // render path when the user navigates away and back mid-stream.
         let effectiveIsStreaming = isActivelyStreaming
 
-        if effectiveIsStreaming && rawContent.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+        if effectiveIsStreaming && liveTerminalFiles.isEmpty && rawContent.isBlank {
             // Wrap in HStack+Spacer to pin the indicator to the leading edge.
             // Without this, the infinity-width assistant content frame can
             // misplace or stretch the fixed view.
@@ -5785,7 +5889,10 @@ private struct IsolatedAssistantMessage: View {
                     messageEmbeds: message.embeds,
                     authToken: authToken,
                     serverBaseURL: serverBaseURL,
-                    apiClient: apiClient
+                    apiClient: apiClient,
+                    terminalSessionId: terminalSessionId,
+                    terminalMessageId: message.id,
+                    liveTerminalFiles: liveTerminalFiles
                 )
                 .transaction { $0.animation = nil }
             } else {
@@ -6268,6 +6375,9 @@ struct ShareSheetView: UIViewControllerRepresentable {
 /// as static configuration, and uses a pan gesture recognizer delegate to
 /// prevent horizontal pan recognition entirely.
 private struct ScrollViewHorizontalLock: UIViewRepresentable {
+    /// Receives the enclosing scroll view once it has been found.
+    var onAttach: ((UIScrollView) -> Void)? = nil
+
     func makeCoordinator() -> Coordinator {
         Coordinator()
     }
@@ -6276,6 +6386,7 @@ private struct ScrollViewHorizontalLock: UIViewRepresentable {
         let view = UIView(frame: .zero)
         view.isHidden = true
         view.isUserInteractionEnabled = false
+        context.coordinator.onAttach = onAttach
         DispatchQueue.main.async {
             context.coordinator.attach(to: view)
         }
@@ -6305,6 +6416,7 @@ private struct ScrollViewHorizontalLock: UIViewRepresentable {
         /// Bug 14: set to true synchronously in updateUIView before the async
         /// dispatch so a concurrent updateUIView cannot schedule a second attach().
         var isAttachPending: Bool = false
+        var onAttach: ((UIScrollView) -> Void)?
 
         func attach(to view: UIView) {
             isAttachPending = false
@@ -6313,6 +6425,7 @@ private struct ScrollViewHorizontalLock: UIViewRepresentable {
             while let sv = current {
                 if let scrollView = sv as? UIScrollView {
                     observedScrollView = scrollView
+                    onAttach?(scrollView)
 
                     // Static configuration
                     scrollView.alwaysBounceHorizontal = false
@@ -6482,7 +6595,15 @@ private struct ChatChromeBarModifier<Bar: View>: ViewModifier {
     let bar: Bar
 
     func body(content: Content) -> some View {
-        if #available(iOS 26.0, *) {
+        if #available(iOS 27.0, *), hasNativeStatusBlur {
+            if edge == .top {
+                // Reserve toolbar space without extending the status-area blur behind it.
+                content.safeAreaInset(edge: edge, spacing: 0) { bar }
+            } else {
+                content.safeAreaBar(edge: edge, spacing: 0) { bar }
+                    .scrollEdgeEffectHidden(true, for: .bottom)
+            }
+        } else if #available(iOS 26.0, *) {
             // The custom status-bar glass handles the top blur, so hide the native
             // scroll-edge effect on both edges (avoids a double blur).
             content.safeAreaBar(edge: edge, spacing: 0) { bar }

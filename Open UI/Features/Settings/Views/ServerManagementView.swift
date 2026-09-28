@@ -9,6 +9,9 @@ struct ServerManagementView: View {
     @State private var editingSelfSigned: Bool = false
     @State private var editingSwitchStatusURL: String = ""
     @State private var editingHeaderEntries: [CustomHeaderEntry] = []
+    @State private var editingNativeSSOEnabled = false
+    @State private var editingNativeSSOIssuer = ""
+    @State private var editingNativeSSOClientID = NativeSSOSettings.defaultClientID
     @State private var isEditing: Bool = false
     @State private var showDeleteConfirmation = false
     @State private var serverHealthy: Bool?
@@ -508,6 +511,9 @@ struct ServerManagementView: View {
             .map { CustomHeaderEntry(id: UUID().uuidString, key: $0.key, value: $0.value) }
             .sorted { $0.key < $1.key }
         editingSwitchStatusURL = activeServer?.switchStatusURL ?? ""
+        editingNativeSSOEnabled = activeServer?.nativeSSO != nil
+        editingNativeSSOIssuer = activeServer?.nativeSSO?.issuerURL ?? ""
+        editingNativeSSOClientID = activeServer?.nativeSSO?.clientID ?? NativeSSOSettings.defaultClientID
         isEditing = true
     }
 
@@ -552,6 +558,12 @@ struct ServerManagementView: View {
                     Text("Optional. If set, Open UI will poll this URL while a request is pending and show a banner like \"Loading qwen3-35b ~42s left\". Leave blank to disable. Useful for SGLang or similar proxies that hot-swap models.")
                         .font(.caption)
                 }
+
+                NativeSSOFormSection(
+                    isEnabled: $editingNativeSSOEnabled,
+                    issuer: $editingNativeSSOIssuer,
+                    clientID: $editingNativeSSOClientID
+                )
             }
             .navigationTitle("Edit Server")
             .navigationBarTitleDisplayMode(.inline)
@@ -589,6 +601,28 @@ struct ServerManagementView: View {
 
         let trimmedSwitchURL = editingSwitchStatusURL.trimmingCharacters(in: .whitespaces)
         config.switchStatusURL = trimmedSwitchURL.isEmpty ? nil : trimmedSwitchURL
+
+        let previousNativeSSO = config.nativeSSO
+        config.nativeSSO = NativeSSOSettings.from(
+            enabled: editingNativeSSOEnabled,
+            issuer: editingNativeSSOIssuer,
+            clientID: editingNativeSSOClientID
+        )
+        // Turning it off, or pointing at a different client or identity provider,
+        // invalidates the stored refresh tokens — drop them. (A blank issuer that
+        // was auto-detected isn't a change; blank means "use the detected one".)
+        if let previous = previousNativeSSO {
+            let updated = config.nativeSSO
+            let issuerChanged = updated.map { !$0.trimmedIssuer.isEmpty && $0.trimmedIssuer != previous.trimmedIssuer } ?? true
+            let clientChanged = updated.map { $0.trimmedClientID != previous.trimmedClientID } ?? true
+            if updated == nil || issuerChanged || clientChanged {
+                NativeSSOSettings.deleteRefreshTokens(for: config)
+            }
+            // Keep the detected issuer when the field was left blank.
+            if updated?.trimmedIssuer.isEmpty == true {
+                config.nativeSSO?.issuerURL = previous.issuerURL
+            }
+        }
 
         dependencies.serverConfigStore.updateServer(config)
         dependencies.refreshServices()

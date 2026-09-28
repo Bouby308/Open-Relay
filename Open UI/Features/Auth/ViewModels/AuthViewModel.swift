@@ -57,6 +57,10 @@ final class AuthViewModel {
     var profileImageVersion: Int = 0
     var phase: AuthPhase = .serverConnection
     var allowSelfSignedCerts: Bool = false
+    /// Advanced connect option: sign in via system browser (generic OIDC only).
+    var nativeSSOEnabled: Bool = false
+    var nativeSSOIssuer: String = ""
+    var nativeSSOClientID: String = NativeSSOSettings.defaultClientID
     var hasShownOnboarding: Bool = false
 
     /// Set to true to present the Cloudflare Browser Integrity Check WebView sheet.
@@ -430,6 +434,17 @@ final class AuthViewModel {
 
         backendConfig = config_result
         logger.info("📋 [connect] backendConfig set — name='\(config_result.name ?? "nil")', version='\(config_result.version ?? "nil")', features_nil=\(config_result.features == nil), isSignupEnabled=\(self.isSignupEnabled), isLoginEnabled=\(self.isLoginEnabled), oauthProviders=\(config_result.oauthProviders?.enabledProviders.joined(separator: ",") ?? "none"), isValidOpenWebUI=\(config_result.isValidOpenWebUI)")
+        // Opt-in native SSO from the Advanced section. Only applied when the
+        // toggle is on; addServer() keeps any existing setup when it is off.
+        activeConfig.nativeSSO = NativeSSOSettings.from(
+            enabled: nativeSSOEnabled,
+            issuer: nativeSSOIssuer,
+            clientID: nativeSSOClientID
+        )
+        // Per-connection input — never let it carry over to a later connect.
+        nativeSSOEnabled = false
+        nativeSSOIssuer = ""
+        nativeSSOClientID = NativeSSOSettings.defaultClientID
         // Upsert the new server. For multi-server scenarios the new server
         // must be made active explicitly — addServer() only auto-activates
         // the very first server in an empty list.
@@ -721,6 +736,150 @@ final class AuthViewModel {
         isLoggingIn = false
     }
 
+    // MARK: - Native SSO (opt-in, generic OIDC only)
+
+    /// Retained only while a native flow is in flight so its browser session
+    /// isn't deallocated mid-flow.
+    private var nativeAuthenticator: NativeOIDCAuthenticator?
+    /// Single-flight guard for silent renewal (401s, restore, refresh timer).
+    private var nativeRenewTask: Task<Bool, Never>?
+    /// Error from the system-browser flow, shown on the sign-in method screen.
+    /// Kept separate from `errorMessage` so that screen is unchanged for others.
+    var nativeSSOError: String?
+
+    /// Whether tapping `provider` should use the system-browser flow.
+    ///
+    /// Strictly limited to the generic OIDC provider on a server where the admin
+    /// opted in. Google, Microsoft, GitHub and Feishu can never take this path.
+    func usesNativeSSO(for provider: String) -> Bool {
+        provider.lowercased() == NativeSSOSettings.providerKey
+            && serverConfigStore.activeServer?.nativeSSO != nil
+    }
+
+    /// Signs in through the system browser (passkeys / Safari SSO at the IdP),
+    /// then completes login with the Open WebUI JWT from the token exchange.
+    func startNativeSSOSignIn() async {
+        guard !isLoggingIn else { return }
+        guard let server = serverConfigStore.activeServer,
+              let settings = server.nativeSSO,
+              let client = dependencies?.apiClient else {
+            nativeSSOError = "Sign-in via system browser isn't set up for this server."
+            return
+        }
+
+        errorMessage = nil
+        nativeSSOError = nil
+        isLoggingIn = true
+        let authenticator = NativeOIDCAuthenticator(server: server, client: client)
+        nativeAuthenticator = authenticator
+        defer { nativeAuthenticator = nil }
+
+        do {
+            // Resolve the issuer: saved value, or auto-detect (and remember it).
+            var issuer = settings.trimmedIssuer
+            if issuer.isEmpty {
+                guard let detected = await authenticator.detectIssuer() else {
+                    throw NativeOIDCAuthError.issuerNotFound
+                }
+                issuer = detected
+                var updated = server
+                updated.nativeSSO?.issuerURL = detected
+                serverConfigStore.updateServer(updated)
+            }
+
+            let session = try await authenticator.signIn(issuerURL: issuer, clientID: settings.trimmedClientID)
+            isLoggingIn = false
+            await loginWithSSOToken(session.jwt)
+            // loginWithSSOToken reports failures via errorMessage — surface them here.
+            if phase != .authenticated && phase != .pendingApproval, let message = errorMessage {
+                nativeSSOError = message
+            }
+
+            // Persist the refresh token only once we know which account it
+            // belongs to — scoped per user so it can never renew another account.
+            if let userId = currentUser?.id, phase == .authenticated {
+                let key = NativeSSOSettings.refreshTokenKey(serverURL: server.url, userId: userId)
+                if let refreshToken = session.refreshToken {
+                    KeychainService.shared.saveToken(refreshToken, forServer: key)
+                } else {
+                    KeychainService.shared.deleteToken(forServer: key)
+                }
+            }
+        } catch {
+            isLoggingIn = false
+            if case NativeOIDCAuthError.cancelled = error {
+                logger.info("Native SSO: cancelled by user")
+            } else {
+                logger.error("Native SSO: sign-in failed: \(error.localizedDescription)")
+                nativeSSOError = error.localizedDescription
+            }
+        }
+    }
+
+    /// Networking-layer entry point (401 on an authenticated request).
+    /// Only reachable on servers with native SSO enabled. Covers mid-session
+    /// requests, the refresh timer, background validation and launch-time
+    /// session restore — all of which go through the same request path.
+    func recoverSessionFrom401() async -> Bool {
+        guard phase == .authenticated || phase == .restoringSession else { return false }
+        return await renewNativeSSOSession()
+    }
+
+    /// Silently renews the ACTIVE account's session using its own stored IdP
+    /// refresh token. Returns false immediately for any account without one
+    /// (password, LDAP, embedded SSO, API key) — their behaviour is unchanged.
+    /// Concurrent callers share one renewal round-trip.
+    func renewNativeSSOSession() async -> Bool {
+        if let inFlight = nativeRenewTask { return await inFlight.value }
+        let task = Task<Bool, Never> { [weak self] in
+            await self?.performNativeSSORenewal() ?? false
+        }
+        nativeRenewTask = task
+        let result = await task.value
+        nativeRenewTask = nil
+        return result
+    }
+
+    private func performNativeSSORenewal() async -> Bool {
+        guard let server = serverConfigStore.activeServer,
+              let settings = server.nativeSSO,
+              !settings.trimmedIssuer.isEmpty,
+              let account = serverConfigStore.activeAccount,
+              let client = dependencies?.apiClient else { return false }
+
+        let key = NativeSSOSettings.refreshTokenKey(serverURL: server.url, userId: account.userId)
+        guard let refreshToken = KeychainService.shared.getToken(forServer: key) else { return false }
+
+        let authenticator = NativeOIDCAuthenticator(server: server, client: client)
+        do {
+            let session = try await authenticator.renew(
+                issuerURL: settings.trimmedIssuer,
+                clientID: settings.trimmedClientID,
+                refreshToken: refreshToken
+            )
+            // Never install a session that belongs to a different account.
+            if let renewedUser = session.userId, renewedUser != account.userId {
+                logger.error("Native SSO: renewed session belongs to a different account — discarding")
+                return false
+            }
+            if let rotated = session.refreshToken {
+                KeychainService.shared.saveToken(rotated, forServer: key)
+            }
+            client.updateAuthToken(session.jwt)
+            KeychainService.shared.saveToken(session.jwt, forServer: server.url, userId: account.userId)
+            connectSocketWithToken()
+            logger.info("Native SSO: session renewed silently")
+            return true
+        } catch {
+            if let authError = error as? NativeOIDCAuthError, authError.isRefreshTokenRejected {
+                // Expired / revoked at the IdP — drop it so we go straight to sign-in next time.
+                KeychainService.shared.deleteToken(forServer: key)
+            }
+            logger.warning("Native SSO: silent renewal failed: \(error.localizedDescription)")
+            return false
+        }
+    }
+
     // MARK: - Session Restore
 
     /// Restores session from a stored token in the Keychain.
@@ -825,6 +984,15 @@ final class AuthViewModel {
     /// Signs out the current user and clears auth state.
     func signOut() async {
         stopTokenRefreshTimer()
+
+        // Drop the signed-out account's native-SSO refresh token FIRST, so nothing
+        // below (e.g. a 401 from logout) can silently rebuild the session.
+        // No-op for accounts that don't use native SSO.
+        if let server = serverConfigStore.activeServer, let account = serverConfigStore.activeAccount {
+            KeychainService.shared.deleteToken(
+                forServer: NativeSSOSettings.refreshTokenKey(serverURL: server.url, userId: account.userId)
+            )
+        }
 
         if let client = dependencies?.apiClient {
             try? await client.logout()
@@ -931,6 +1099,7 @@ final class AuthViewModel {
     /// Navigates to a specific auth phase.
     func goToPhase(_ newPhase: AuthPhase) {
         errorMessage = nil
+        nativeSSOError = nil
         phase = newPhase
     }
 
