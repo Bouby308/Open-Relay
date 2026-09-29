@@ -20,6 +20,7 @@
 - See which ports are running in your terminal and preview them in the app or open them in Safari.
 - Commands the model runs now appear as live tabs next to your shell, with running and exit status.
 - Upload whole folders and photos to the terminal, and download any folder as a ZIP.
+- Connect tools that need sign-in right from the tools menu — tools that aren't connected now show Connect, and your message waits until they are (or you choose to continue without them).
 
 ### Improvements
 - Channel members list now searches the server, loads more as you scroll, shows roles and statuses, and lets group managers add or remove members.
@@ -37,6 +38,7 @@
 - The file browser now opens in the same folder the model is working in and keeps it in sync, and refreshes by itself when the model writes files or runs commands.
 - When the model shows you a file, the terminal panel now opens it for you.
 - File errors now show as a quick banner instead of replacing the whole file list, and uploads and downloads show progress.
+- Toolbar and close buttons across the app now use consistent native icons.
 
 ### Bug Fixes
 - Fixed @mentions and user pickers (sharing, access, new DMs, channel members) only showing the first 30 users — they now include everyone on your server.
@@ -71,7 +73,8 @@
 - Fixed the file browser failing to open on servers whose home folder isn't /home/user.
 - Fixed the shell not reconnecting when returning to the app with the terminal collapsed.
 - Fixed downloaded terminal files with the same name overwriting each other.
-
+- Fixed read-only shared notes offering editing that the server then rejected — they now show as Read Only.
+- Fixed tools that need sign-in looking enabled even when they weren't connected.
 
 ## Previous Builds
 

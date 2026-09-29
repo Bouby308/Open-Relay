@@ -326,6 +326,9 @@ final class ChatViewModel {
     @ObservationIgnored private var contextSaveTask: Task<Void, Never>?
     private(set) var isSavingContext = false
     var isLoadingTools: Bool = false
+    var toolConnectionRequested: ToolItem?
+    private var isCheckingToolConnections = false
+    private var toolCheckContext = UUID()
     /// True once loadTools() has completed at least one fetch.
     /// Distinguishes "never fetched yet" (false) from "fetched and tool is gone" (true).
     var toolsHaveLoaded: Bool = false
@@ -2079,8 +2082,10 @@ final class ChatViewModel {
     }
 
     func loadTools() async {
-        guard let manager else { return }
+        guard let manager, !isLoadingTools else { return }
+        let scope = manager.apiClient.network.conversationCacheScope
         isLoadingTools = true
+        defer { isLoadingTools = false }
         do {
             var allItems = try await manager.fetchTools()
 
@@ -2131,7 +2136,7 @@ final class ChatViewModel {
                 logger.debug("Failed to fetch functions for valves: \(error.localizedDescription)")
             }
 
-            if !allItems.isEmpty {
+            if scope == manager.apiClient.network.conversationCacheScope {
                 availableTools = allItems
                 syncToolSelectionWithDefaults()
                 // Prune selectedToolIds of orphaned IDs (tools that no longer exist on server).
@@ -2139,31 +2144,61 @@ final class ChatViewModel {
                 //   selectedToolIds = selectedToolIds.filter(id => Object.keys(tools).includes(id))
                 let knownIds = Set(allItems.map { $0.id })
                 selectedToolIds = selectedToolIds.filter { knownIds.contains($0) }
-                isLoadingTools = false
                 toolsHaveLoaded = true
                 return
             }
         } catch {
             logger.warning("Failed to fetch tools: \(error.localizedDescription)")
         }
-        var seen = Set<String>()
-        var items: [ToolItem] = []
-        for model in availableModels {
-            for toolId in model.toolIds where !seen.contains(toolId) {
-                seen.insert(toolId)
-                items.append(ToolItem(
-                    id: toolId,
-                    name: toolId.replacingOccurrences(of: "_", with: " ").capitalized,
-                    description: nil
-                ))
-            }
+        // Keep the last server state on failure; invented fallback tools would
+        // incorrectly turn an unknown OAuth state into an authenticated one.
+    }
+
+    private func checkToolConnections() async -> Bool {
+        guard !isCheckingToolConnections else { return false }
+        guard let manager else { return false }
+        isCheckingToolConnections = true
+        defer { isCheckingToolConnections = false }
+        let scope = manager.apiClient.network.conversationCacheScope
+        let context = toolCheckContext
+        let chatId = conversationId ?? conversation?.id
+        let branchId = conversation?.history.currentId
+        let draft = inputText
+        let files = attachments.map(\.id)
+        let model = selectedModelId
+        let mentioned = mentionedModelId
+        let isCurrent = {
+            !Task.isCancelled && scope == manager.apiClient.network.conversationCacheScope
+                && context == self.toolCheckContext && chatId == (self.conversationId ?? self.conversation?.id)
+                && branchId == self.conversation?.history.currentId && draft == self.inputText
+                && files == self.attachments.map(\.id) && model == self.selectedModelId
+                && mentioned == self.mentionedModelId
         }
-        availableTools = items
-        syncToolSelectionWithDefaults()
-        let knownFallbackIds = Set(items.map { $0.id })
-        selectedToolIds = selectedToolIds.filter { knownFallbackIds.contains($0) }
-        isLoadingTools = false
-        toolsHaveLoaded = true
+        // Model defaults were already refreshed by authorizeWebSearch(), which
+        // every send path calls first, so newly assigned tools are included here.
+        let selection = selectedToolIds
+        let ids = selection.subtracting(availableTools.filter(\.isFunctionTool).map(\.id))
+        guard !ids.isEmpty else { return true }
+        do {
+            let tools = try await manager.fetchTools()
+            guard isCurrent(), selection == selectedToolIds else { return false }
+            for id in ids.sorted() {
+                guard let tool = tools.first(where: { $0.id == id }) else {
+                    errorMessage = "A selected tool is unavailable. Open Attachments & tools to update your selection."
+                    return false
+                }
+                if let index = availableTools.firstIndex(where: { $0.id == id }) { availableTools[index] = tool }
+                else { availableTools.append(tool) }
+                if !tool.isAuthenticated {
+                    toolConnectionRequested = tool
+                    return false
+                }
+            }
+            return true
+        } catch {
+            if isCurrent() { errorMessage = "Couldn’t check tool connections. Your draft is unchanged. Try again." }
+            return false
+        }
     }
 
     /// Adds globally-enabled tools (server `is_active`) and model-assigned
@@ -3168,6 +3203,8 @@ final class ChatViewModel {
     // MARK: - New Conversation
 
     func startNewConversation() {
+        toolCheckContext = UUID()
+        toolConnectionRequested = nil
         conversation = nil
         pendingChatVariables = [:]
         chatVariableForm = nil
@@ -3250,6 +3287,8 @@ final class ChatViewModel {
         let text = (directText ?? inputText).trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty || !attachments.isEmpty else { return }
         guard await authorizeWebSearch() else { return }
+        // Selected OAuth tools must be connected before the draft is consumed.
+        guard await checkToolConnections() else { return }
 
         // If message queue is enabled and we're currently streaming, enqueue the text
         // (only text messages can be queued — attachments are sent normally when not streaming)
@@ -3907,6 +3946,7 @@ final class ChatViewModel {
         guard !isStreaming || isExternallyStreaming else { return }
         guard let lastAssistant = conversation?.messages.last(where: { $0.role == .assistant }) else { return }
         guard await authorizeWebSearch() else { return }
+        guard await checkToolConnections() else { return }
         let assistantId = lastAssistant.id
         let existingContent = lastAssistant.content
 
@@ -4052,6 +4092,7 @@ final class ChatViewModel {
         guard !isStreaming || isExternallyStreaming else { return }
         guard conversation != nil else { return }
         guard await authorizeWebSearch() else { return }
+        guard await checkToolConnections() else { return }
 
         // Cancel any in-flight completion task from the previous stream.
         // Without this, sendMessage's completionTask continues running its
@@ -4285,6 +4326,7 @@ final class ChatViewModel {
         guard !isStreaming || isExternallyStreaming else { return }
         guard conversation != nil else { return }
         guard await authorizeWebSearch() else { return }
+        guard await checkToolConnections() else { return }
 
         // ── Tree-first edit (replicates OpenWebUI exactly) ─────────────────
         // 1. Look up the old user node in the history tree.
@@ -6211,9 +6253,11 @@ final class ChatViewModel {
 
     private func refreshSelectedModelMetadata() async {
         guard let modelId = selectedModelId, let manager else { return }
+        let scope = manager.apiClient.network.conversationCacheScope
+        let context = toolCheckContext
+        let chatId = conversationId ?? conversation?.id
         do {
             if var fullModel = try await manager.apiClient.fetchModelConfig(modelId: modelId) {
-                lastModelMetadataRefreshTime = Date()
                 // Preserve pipe fields from the list endpoint — the single-model endpoint
                 // (/api/v1/models/model) returns workspace-model schema which lacks
                 // pipe/filters fields. Overwriting them would destroy isPipeModel=true,
@@ -6229,6 +6273,10 @@ final class ChatViewModel {
                 }
                 // Resolve actions and filters from IDs + global functions (fresh every time).
                 await resolveModelFunctions(&fullModel)
+                guard scope == manager.apiClient.network.conversationCacheScope,
+                      context == toolCheckContext, chatId == (conversationId ?? conversation?.id),
+                      modelId == selectedModelId, !Task.isCancelled else { return }
+                lastModelMetadataRefreshTime = Date()
                 if let idx = availableModels.firstIndex(where: { $0.id == modelId }) {
                     availableModels[idx] = fullModel
                 }
