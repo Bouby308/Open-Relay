@@ -4,7 +4,7 @@
 
 # Open Relay
 
-**The best native iOS & iPadOS client for [Open WebUI](https://openwebui.com)**
+**The best native iOS/iPadOS & Watch client for [Open WebUI](https://openwebui.com)**
 
 *Chat with any AI model on your self-hosted server — beautifully.*
 
