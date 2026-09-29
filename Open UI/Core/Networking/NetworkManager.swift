@@ -8,7 +8,7 @@ final class NetworkManager: NSObject, Sendable {
     private let logger = Logger(subsystem: "com.openui", category: "Network")
 
     let session: URLSession
-    private let certificateDelegate: CertificateTrustDelegate?
+    private let certificateDelegate: CertificateTrustDelegate
 
     var baseURL: URL? { serverConfig.apiBaseURL }
 
@@ -169,18 +169,16 @@ final class NetworkManager: NSObject, Sendable {
         }
         configuration.httpAdditionalHeaders = headers
 
-        if serverConfig.allowSelfSignedCertificates {
-            let delegate = CertificateTrustDelegate(serverConfig: serverConfig)
-            self.certificateDelegate = delegate
-            self.session = URLSession(
-                configuration: configuration,
-                delegate: delegate,
-                delegateQueue: nil
-            )
-        } else {
-            self.certificateDelegate = nil
-            self.session = URLSession(configuration: configuration)
-        }
+        // Always attach the TLS delegate: it handles self-signed trust (opt-in) and
+        // presents an imported client certificate for mTLS-protected servers.
+        // Challenges it doesn't handle fall through to default system behaviour.
+        let delegate = CertificateTrustDelegate(serverConfig: serverConfig)
+        self.certificateDelegate = delegate
+        self.session = URLSession(
+            configuration: configuration,
+            delegate: delegate,
+            delegateQueue: nil
+        )
 
         super.init()
     }
@@ -604,18 +602,19 @@ final class NetworkManager: NSObject, Sendable {
         }
         config.httpAdditionalHeaders = headers
 
-        let newSession: URLSession
-        if serverConfig.allowSelfSignedCertificates, let delegate = certificateDelegate {
-            newSession = URLSession(configuration: config, delegate: delegate, delegateQueue: nil)
-        } else {
-            newSession = URLSession(configuration: config)
-        }
+        let newSession = URLSession(configuration: config, delegate: certificateDelegate, delegateQueue: nil)
         _streamingSessionBacking = newSession
         return newSession
     }
 
     private func makeStreamingSession() -> URLSession {
         _streamingSession
+    }
+
+    /// Creates a one-off session with the server's TLS handling (self-signed trust +
+    /// mTLS client certificate). Callers own the session and must invalidate it.
+    func makeSession(configuration: URLSessionConfiguration) -> URLSession {
+        URLSession(configuration: configuration, delegate: certificateDelegate, delegateQueue: nil)
     }
 
     // MARK: - Multipart Form Data Upload
@@ -856,6 +855,11 @@ final class NetworkManager: NSObject, Sendable {
             return .tokenExpired
         }
 
+        // mTLS proxy (e.g. Nginx `ssl_verify_client on`) rejected the request because
+        // no / an untrusted client certificate was presented.
+        if TLSChallengeHandler.isClientCertificateRejectionPage(statusCode: statusCode, body: data) {
+            return .sslError(underlying: URLError(.clientCertificateRequired))
+        }
         var message: String?
         if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
             message = json["detail"] as? String
@@ -902,7 +906,8 @@ actor GETDeduplicator {
 
 // MARK: - Certificate Trust Delegate
 
-/// SSL delegate for self-signed certificate support. Extracted so `session` can be a `let`.
+/// TLS delegate for the server's sessions — self-signed trust (opt-in) and mTLS
+/// client certificates. Extracted so `session` can be a `let`.
 private final class CertificateTrustDelegate: NSObject, URLSessionDelegate, Sendable {
     let serverConfig: ServerConfig
 
@@ -916,28 +921,7 @@ private final class CertificateTrustDelegate: NSObject, URLSessionDelegate, Send
         didReceive challenge: URLAuthenticationChallenge,
         completionHandler: @escaping @Sendable (URLSession.AuthChallengeDisposition, URLCredential?) -> Void
     ) {
-        guard serverConfig.allowSelfSignedCertificates,
-              challenge.protectionSpace.authenticationMethod == NSURLAuthenticationMethodServerTrust,
-              let serverTrust = challenge.protectionSpace.serverTrust
-        else {
-            completionHandler(.performDefaultHandling, nil)
-            return
-        }
-
-        guard let baseURL = URL(string: serverConfig.url),
-              challenge.protectionSpace.host.lowercased() == baseURL.host?.lowercased()
-        else {
-            completionHandler(.performDefaultHandling, nil)
-            return
-        }
-
-        if let configPort = baseURL.port,
-           challenge.protectionSpace.port != configPort {
-            completionHandler(.performDefaultHandling, nil)
-            return
-        }
-
-        let credential = URLCredential(trust: serverTrust)
-        completionHandler(.useCredential, credential)
+        let (disposition, credential) = TLSChallengeHandler.resolve(challenge, serverConfig: serverConfig)
+        completionHandler(disposition, credential)
     }
 }

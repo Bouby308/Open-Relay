@@ -263,6 +263,13 @@ extension ActionJSExecutor: WKScriptMessageHandler {
 // MARK: - WKNavigationDelegate
 
 extension ActionJSExecutor: WKNavigationDelegate {
+    /// Presents the imported mTLS client certificate for the server origin.
+    func webView(
+        _ webView: WKWebView,
+        respondTo challenge: URLAuthenticationChallenge
+    ) async -> (URLSession.AuthChallengeDisposition, URLCredential?) {
+        TLSChallengeHandler.resolveClientCertificateOnly(challenge)
+    }
     nonisolated func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
         Task { @MainActor [weak self] in
             self?.logger.error("❌ [ActionJS] navigation failed: \(error.localizedDescription, privacy: .public)")

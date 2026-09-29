@@ -14,6 +14,7 @@ import os.log
 struct ChannelDetailView: View {
     @Environment(AppDependencyContainer.self) private var dependencies
     @Environment(\.theme) private var theme
+    @Environment(\.isEnabled) private var isEnabled
     @Environment(\.dismiss) private var dismiss
     
     @State private var viewModel: ChannelViewModel
@@ -514,6 +515,7 @@ struct ChannelDetailView: View {
             Text(operationErrorMessage)
         }
         .onReceive(NotificationCenter.default.publisher(for: .markdownLinkTapped)) { notification in
+            guard isEnabled else { return }
             guard let url = notification.userInfo?["url"] as? URL else { return }
             if url.scheme == "openui-channel", let channelId = url.host {
                 NotificationCenter.default.post(name: .navigateToChannel, object: channelId)
@@ -1131,19 +1133,6 @@ struct ChannelDetailView: View {
         return !Calendar.current.isDate(current, inSameDayAs: previous)
     }
     
-    // MARK: - Bubble Colors
-
-    private var receivedBubbleBackground: Color {
-        theme.isDark ? Color.white.opacity(0.13) : Color.black.opacity(0.06)
-    }
-
-    private var receivedBubbleBorder: Color {
-        theme.isDark ? Color.white.opacity(0.06) : Color.black.opacity(0.04)
-    }
-
-    private var sentBubbleBackground: Color { theme.brandPrimary }
-    private var sentBubbleBorder: Color { theme.brandPrimary }
-
     // MARK: - Message Row
 
     private let avatarSize: CGFloat = 28
@@ -1160,8 +1149,6 @@ struct ChannelDetailView: View {
         let isModel = viewModel.isModelMessage(message)
         let resolvedName = viewModel.resolvedSenderName(for: message)
         let showTail = (position == .last || position == .single)
-        let bubbleBg = isCurrentUser ? sentBubbleBackground : receivedBubbleBackground
-        let bubbleBd = isCurrentUser ? sentBubbleBorder : receivedBubbleBorder
         let bubbleAlignment: HorizontalAlignment = isCurrentUser ? .trailing : .leading
         let frameAlignment: Alignment = isCurrentUser ? .trailing : .leading
         

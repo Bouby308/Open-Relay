@@ -37,22 +37,25 @@ final class CallAudioSession {
     /// phone's built-in echo cancellation enabled. `.voiceChat` (not `.measurement`)
     /// is required for echo cancellation to stay on, which is what lets barge-in
     /// (interrupting the AI while it talks) work over the speaker.
-    func activate(preferSpeaker: Bool) throws {
+    ///
+    /// `.defaultToSpeaker` is deliberately NOT used: it makes the loudspeaker
+    /// the session default, so choosing "iPhone" in the system route picker
+    /// (or `overrideOutputAudioPort(.none)`) could never reach the earpiece.
+    /// The speaker is applied as an explicit override instead — see `applyInitialRoute`.
+    func activate() throws {
         let session = AVAudioSession.sharedInstance()
-        var options: AVAudioSession.CategoryOptions = [.allowBluetoothHFP, .allowBluetoothA2DP]
-        if preferSpeaker {
-            options.insert(.defaultToSpeaker)
-        }
-        try session.setCategory(.playAndRecord, mode: .voiceChat, options: options)
+        try session.setCategory(.playAndRecord, mode: .voiceChat,
+                                options: [.allowBluetoothHFP, .allowBluetoothA2DP])
         try session.setActive(true, options: .notifyOthersOnDeactivation)
         isActive = true
         Self.isCallActive = true
-        isSpeakerOn = preferSpeaker
         installObserversIfNeeded()
-        logger.info("Call audio session activated (speaker=\(preferSpeaker))")
+        preferExternalInputIfAvailable()
+        logger.info("Call audio session activated")
     }
 
-    /// Toggles between the earpiece/Bluetooth route and the built-in loudspeaker.
+    /// Routes to the loudspeaker (`true`) or clears the override (`false`),
+    /// which lets the system use the earpiece or a connected headset / car.
     func setSpeakerOverride(_ on: Bool) {
         let session = AVAudioSession.sharedInstance()
         do {
@@ -60,6 +63,36 @@ final class CallAudioSession {
             isSpeakerOn = on
         } catch {
             logger.error("Speaker override failed: \(error.localizedDescription, privacy: .public)")
+        }
+    }
+
+    /// Picks the starting output: a connected headset / car always wins;
+    /// otherwise the loudspeaker if `preferSpeaker`, else the earpiece.
+    func applyInitialRoute(preferSpeaker: Bool) {
+        if CallOutputRoute.hasExternalDevice() {
+            setSpeakerOverride(false)
+        } else {
+            setSpeakerOverride(preferSpeaker)
+        }
+        preferExternalInputIfAvailable()
+    }
+
+    /// Uses the Bluetooth / car / headset microphone when one is connected, so
+    /// the user is heard through the device they are listening on. Falls back
+    /// to letting the system choose (built-in mic).
+    func preferExternalInputIfAvailable() {
+        let session = AVAudioSession.sharedInstance()
+        let preferred: [AVAudioSession.Port] = [.carAudio, .bluetoothHFP, .headsetMic, .usbAudio]
+        let inputs = session.availableInputs ?? []
+        let external = preferred.lazy.compactMap { port in inputs.first { $0.portType == port } }.first
+        // Leave the choice alone if it's already correct — setPreferredInput
+        // triggers a route change (and an engine rebuild) every time.
+        if session.preferredInput?.uid == external?.uid { return }
+        do {
+            try session.setPreferredInput(external)
+            logger.info("Preferred input → \(external?.portName ?? "system default", privacy: .public)")
+        } catch {
+            logger.error("setPreferredInput failed: \(error.localizedDescription, privacy: .public)")
         }
     }
 

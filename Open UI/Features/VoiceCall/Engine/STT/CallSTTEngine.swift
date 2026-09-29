@@ -53,10 +53,18 @@ protocol CallSTTEngine: AnyObject {
     func cancelTurn()
     /// Release models / recognizers when the call ends.
     func shutdown()
+    /// The engine returned nothing although the user clearly spoke: repair
+    /// itself and transcribe `frames` (the turn's mic audio) again.
+    /// nil = this engine can't recover.
+    func recover(replaying frames: [MicFrame]) async -> String?
+    /// Called at the start of every listening turn: rebuild if broken.
+    func ensureHealthy() async
 }
 
 extension CallSTTEngine {
     var isContinuous: Bool { false }
     func beginTurn(from date: Date) { beginTurn() }
     func words(from date: Date) -> [TimedWord] { [] }
+    func recover(replaying frames: [MicFrame]) async -> String? { nil }
+    func ensureHealthy() async {}
 }

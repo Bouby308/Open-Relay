@@ -1,82 +1,87 @@
 # Changelog
 
-## 📦 NEXT BUILD
+## v6.1 — September 29, 2026
 
 ### What's New
-- Redesigned channels with Liquid Glass on iOS 26 — a glass nav bar and message box, a new glass long-press menu with quick reactions and actions, cleaner message bubbles, date labels, thread badges, and a floating "is typing" bubble.
-- Added channel webhooks — create, rename, set an avatar, copy the URL, or delete webhooks from the channel menu.
+- Redesigned channels with Liquid Glass on iOS 26 — a glass nav bar, message box and long-press menu with quick reactions, cleaner message bubbles, date labels, thread badges, and a floating "is typing" bubble.
 - Tap anyone's avatar in a channel to see their profile card with status, bio, and groups, plus a Message button to start a DM.
-- Added replies inside threads — swipe or long-press a thread message to reply to it directly.
+- Added replies inside threads — swipe or long-press a thread message to reply to it directly. On iPad, threads now open in a side panel next to the channel.
+- Added channel webhooks — create, rename, set an avatar, copy the URL, or delete webhooks from the channel menu.
 - Added / prompt shortcuts and voice dictation to channel and thread message boxes.
-- On iPad, threads now open in a side panel next to the channel.
 - Model replies in channels now show their reasoning and tool calls, just like in chats.
-- Edit calendar events, including whole repeating series, and set events to repeat daily, on weekdays, weekly, monthly, yearly, or on a custom schedule.
-- Added Manage Calendars — create, rename, recolor, set your default, and delete calendars.
-- Models with chat variables now ask for them before your first message, and you can edit them any time from chat Controls.
-- Chat Controls now show how much conversation context is in use, with a Compact Context button to summarize older turns.
-- Redesigned the terminal and file browser: search file names and contents, sort and show hidden files, go back and forward, expand folders in place, select several files at once to move, download as ZIP or delete, drag files onto folders to move them, and create new files.
-- Open files right inside the terminal panel — code, Markdown, JSON, CSV tables, HTML, images, PDFs, video and audio — and edit and save text files.
-- Compare two terminal files side by side to see what changed.
+- Redesigned the terminal and file browser — search file names and contents, sort and show hidden files, go back and forward, expand folders in place, select several files to move, download as ZIP or delete, drag files onto folders, and create new files.
+- Open files right inside the terminal panel — code, Markdown, JSON, CSV tables, HTML, images, PDFs, video and audio — edit and save text files, and compare two files side by side.
+- Upload whole folders and photos to the terminal, and download any folder as a ZIP.
 - See which ports are running in your terminal and preview them in the app or open them in Safari.
 - Commands the model runs now appear as live tabs next to your shell, with running and exit status.
-- Upload whole folders and photos to the terminal, and download any folder as a ZIP.
-- Connect tools that need sign-in right from the tools menu — tools that aren't connected now show Connect, and your message waits until they are (or you choose to continue without them).
+- Edit calendar events, including whole repeating series, and set events to repeat daily, on weekdays, weekly, monthly, yearly, or on a custom schedule.
+- Respond to calendar invitations — choose Accepted, Maybe, Declined, or Not Responded right from the event.
+- Added Manage Calendars — create, rename, recolor, set your default, and delete calendars.
+- Chat about a note — tap the chat button in a note to talk with the AI about it, browse its past conversations, or start a new one. The note refreshes when the AI updates it.
+- Share notes — Manage Access in a note's menu lets you give people or groups read or edit access, or open it to everyone on your server.
+- Note attachments now stay with your notes — files and voice recordings are saved to the note, can be removed, and open in a full preview (including audio playback).
+- Chat Controls now show how much conversation context is in use, with a Compact Context button to summarize older turns.
+- Models with chat variables now ask for them before your first message, and you can edit them any time from Chat Controls.
+- Connect tools that need sign-in right from the tools menu — tools that aren't connected show Connect, and your message waits until they are (or you choose to continue without them).
+- Added client certificate (mTLS) support — import a .p12 or .pfx certificate under Advanced when connecting (or in Settings → Server → Edit Server) to use servers behind a certificate-protected proxy.
 
 ### Improvements
 - Channel members list now searches the server, loads more as you scroll, shows roles and statuses, and lets group managers add or remove members.
 - Pinned messages now load as you scroll, can be unpinned from the list, and tapping one jumps to it in the chat.
-- Channels now show "(edited)" on edited messages, a "beginning of the channel" header, a Pinned tint, and highlight replies to you.
-- Replying to a bot's message now tells you that bot will respond, and @mentions now suggest everyone on the server, not just channel members.
+- Channels now show "(edited)" on edited messages, a "beginning of the channel" header, a Pinned tint, and highlight replies to you. Deleting a message now asks for confirmation.
+- @mentions now suggest everyone on the server, not just channel members, and replying to a bot's message tells you that bot will respond.
 - The scroll-to-bottom button in channels is now centered, shows how many new messages arrived, and hides when you're already near the latest messages.
 - Swipe-to-reply in channels now follows the bubble — swipe left on your own messages and right on others', and swiping on empty space beside a message opens the sidebar.
-- Deleting a channel message now asks for confirmation.
-- Direct messages in the sidebar now show the other person's status, and large unread counts are shortened (e.g. 1.2K).
+- Channel rows in the sidebar have a cleaner look, direct messages show the other person's status, and large unread counts are shortened (e.g. 1.2K).
 - Channel names now follow the web rules (lowercase, hyphens instead of spaces).
-- Channel list rows in the sidebar now have a cleaner look with presence dots for direct messages.
 - The terminal now matches your app's light or dark theme (with Classic, Solarized and Dracula options), supports pinch-to-zoom text, and has a new key bar with Esc, Tab, sticky Ctrl/Alt, arrow keys that repeat when held, and common symbols.
 - The terminal panel can now be resized by dragging, shows clear connection status, and lets you copy all output, paste, clear, or restart the shell.
-- The file browser now opens in the same folder the model is working in and keeps it in sync, and refreshes by itself when the model writes files or runs commands.
-- When the model shows you a file, the terminal panel now opens it for you.
+- The file browser now opens in the folder the model is working in, stays in sync, and refreshes by itself when the model writes files or runs commands. When the model shows you a file, the terminal panel opens it for you.
 - File errors now show as a quick banner instead of replacing the whole file list, and uploads and downloads show progress.
+- Read Aloud now fetches the next paragraph early after short ones, cutting pauses between paragraphs.
+- Voice call replies start faster — the app no longer re-checks model settings before every turn.
 - Toolbar and close buttons across the app now use consistent native icons.
 
 ### Bug Fixes
+- Fixed voice calls ignoring Bluetooth headsets, AirPods, and CarPlay — audio and the microphone now go through your connected device again.
+- Fixed the speaker button in voice calls doing nothing — it now opens the audio picker so you can choose iPhone, Speaker, or a Bluetooth device.
+- Interrupting a voice call is now more natural — just start talking and the assistant stops, while background noises no longer cut it off.
+- Fixed voice calls staying on the basic system voice after returning from the background — your chosen voice now comes back automatically, and the server voice is used while the app is in the background.
+- Changing the voice or listening settings during a call now takes effect right away, without restarting the call.
+- Fixed the app crashing immediately on launch on iOS 18.
 - Fixed @mentions and user pickers (sharing, access, new DMs, channel members) only showing the first 30 users — they now include everyone on your server.
-- Fixed channel reactions from iPhone and the web showing up as separate reactions.
-- Fixed typing in a thread showing as typing in the main channel, and thread typing never being shown to others.
-- Fixed the "is typing" indicator flickering while someone keeps typing.
+- Fixed channel reactions from iPhone and the web showing up as separate reactions, and reactions on thread replies not working.
+- Fixed typing in a thread showing as typing in the main channel and never being shown to others, and the "is typing" indicator flickering.
 - Fixed deleted channel messages leaving behind quotes, pending replies, or an open thread.
 - Fixed admins being unable to edit or delete other people's channel messages.
 - Fixed channel settings access for group managers, and non-owners seeing Delete Channel.
 - Fixed webhook messages showing broken avatars in channels.
 - Fixed bot replies in channels sometimes getting stuck on "Generating…".
 - Fixed your own messages and thread replies adding to a channel's unread count.
-- Fixed reactions on thread replies not working.
-- Fixed calendars failing to load when one of them has no color set.
-- Fixed automations with a terminal failing to load, and editing an automation no longer resets its paused state, channel, terminal, or folder.
-- Fixed "Verify connection" for ComfyUI saving your image settings before testing — it now tests the URL and key you entered.
-- Fixed Notes search not finding notes on the server, and added "Load More" for long result lists.
-- Fixed task list rows appearing to change status when tapped even though the server never saved it.
 - Fixed tool confirmations being approved automatically, tool input requests being ignored, and live questions never resuming the response.
-- Fixed the model editor mixing up Actions and Skills and losing number, true/false, or nested custom parameter values on save.
+- Fixed tools that need sign-in looking enabled even when they weren't connected.
 - Fixed web search running without asking first when your server requires confirmation.
 - Fixed responses hanging when the server asked the app to run code, tools, or models it doesn't support.
-- Fixed renaming a note wiping its formatted content on the server.
-- Fixed note pins not syncing with the server — pinned notes now show as pinned and pinning is saved to your account.
-- Fixed exporting a chat as PDF failing on newer servers — PDFs are now created right on your device.
 - Fixed live previews from tools not appearing or disappearing after reopening a chat.
 - Fixed replies corrected by server filters still showing the original text.
-- Fixed event reminders set to "None" still alerting, and new events defaulting to someone else's shared calendar.
+- Fixed exporting a chat as PDF failing on newer servers — PDFs are now created right on your device.
+- Fixed task list rows appearing to change status when tapped even though the server never saved it.
 - Fixed terminals set up per chat showing the wrong files or refusing to connect — the file browser and shell now use the same workspace as the model.
-- Fixed renaming terminal files failing on newer terminal servers.
 - Fixed the terminal showing "connected" before the server accepted it, and retrying forever when access was denied.
-- Fixed the file browser failing to open on servers whose home folder isn't /home/user.
 - Fixed the shell not reconnecting when returning to the app with the terminal collapsed.
+- Fixed the file browser failing to open on servers whose home folder isn't /home/user.
+- Fixed renaming terminal files failing on newer terminal servers.
 - Fixed downloaded terminal files with the same name overwriting each other.
+- Fixed unsaved note edits being lost when a save failed — your changes are now kept on the device, survive closing the app, and can be retried, shared, or discarded.
+- Fixed renaming a note wiping its formatted content on the server.
+- Fixed note pins not syncing with the server — pinned notes now show as pinned and pinning is saved to your account.
 - Fixed read-only shared notes offering editing that the server then rejected — they now show as Read Only.
-- Fixed tools that need sign-in looking enabled even when they weren't connected.
-
-## Previous Builds
+- Fixed Notes search not finding notes on the server, and added "Load More" for long result lists.
+- Fixed calendars failing to load when one of them has no color set.
+- Fixed event reminders set to "None" still alerting, and new events defaulting to someone else's shared calendar.
+- Fixed automations with a terminal failing to load, and editing an automation no longer resets its paused state, channel, terminal, or folder.
+- Fixed "Verify connection" for ComfyUI saving your image settings before testing — it now tests the URL and key you entered.
+- Fixed the model editor mixing up Actions and Skills and losing number, true/false, or nested custom parameter values on save.
 
 ## v6.0 — September 28, 2026
 

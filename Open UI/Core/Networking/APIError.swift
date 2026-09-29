@@ -67,7 +67,10 @@ enum APIError: LocalizedError, Sendable {
         case .networkError(let error):
             return Self.friendlyNetworkMessage(error)
 
-        case .sslError:
+        case .sslError(let underlying):
+            if TLSChallengeHandler.isClientCertificateError(underlying) {
+                return "This server requires a client certificate. Import one under Advanced → Client Certificate."
+            }
             return "Couldn't establish a secure connection. If you're using a private server, enable self-signed certificates in Settings."
 
         case .streamError:
@@ -236,7 +239,9 @@ enum APIError: LocalizedError, Sendable {
                  .serverCertificateHasBadDate,
                  .serverCertificateHasUnknownRoot,
                  .serverCertificateNotYetValid,
-                 .secureConnectionFailed:
+                 .secureConnectionFailed,
+                 .clientCertificateRequired,
+                 .clientCertificateRejected:
                 return .sslError(underlying: urlError)
             case .timedOut, .cannotFindHost, .cannotConnectToHost,
                  .networkConnectionLost, .notConnectedToInternet:
@@ -260,6 +265,8 @@ enum HealthCheckResult: Sendable {
     /// Server is behind Cloudflare Bot Fight Mode / Browser Integrity Check.
     /// Requires a real browser (WKWebView) to complete the JS challenge.
     case cloudflareChallenge
+    /// Server (or its reverse proxy) requires a valid mTLS client certificate.
+    case clientCertificateRequired
     /// Server could not be reached.
     case unreachable
 }

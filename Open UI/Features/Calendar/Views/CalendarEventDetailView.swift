@@ -101,6 +101,8 @@ struct CalendarEventDetailView: View {
                         // Date/Time
                         detailRow(icon: "clock", title: "When", value: timeString)
 
+                        CalendarRSVPView(event: event, vm: vm)
+
                         if event.rrule != nil {
                             Divider().background(theme.divider).padding(.leading, 56)
                             detailRow(icon: "repeat", title: "Recurrence", value: event.rrule ?? "")

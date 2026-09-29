@@ -113,12 +113,14 @@ actor ImageCacheService {
 
     /// Returns the URLSession to use for a given URL.
     /// Uses the self-signed-cert session when the URL targets the configured
-    /// server host and `allowSelfSignedCerts` is enabled; otherwise uses `URLSession.shared`.
+    /// server host and `allowSelfSignedCerts` is enabled; otherwise uses the shared
+    /// mTLS-aware session (which only presents a client certificate to origins the
+    /// user imported one for, and otherwise behaves like `URLSession.shared`).
     private func session(for url: URL) -> URLSession {
         guard allowSelfSignedCerts,
               let targetHost = selfSignedCertServerHost,
               url.host?.lowercased() == targetHost.lowercased() else {
-            return URLSession.shared
+            return ClientCertificateSession.shared
         }
 
         if let existing = selfSignedSession {
@@ -788,13 +790,14 @@ private final class SelfSignedCertDelegate: NSObject, URLSessionDelegate, Sendab
         didReceive challenge: URLAuthenticationChallenge,
         completionHandler: @escaping @Sendable (URLSession.AuthChallengeDisposition, URLCredential?) -> Void
     ) {
-        // Only bypass SSL for the configured server host
-        guard challenge.protectionSpace.authenticationMethod == NSURLAuthenticationMethodServerTrust,
-              challenge.protectionSpace.host.lowercased() == serverHost.lowercased(),
-              let serverTrust = challenge.protectionSpace.serverTrust else {
-            completionHandler(.performDefaultHandling, nil)
-            return
-        }
-        completionHandler(.useCredential, URLCredential(trust: serverTrust))
+        // Only bypass SSL for the configured server host; also present an imported
+        // mTLS client certificate for that origin.
+        let (disposition, credential) = TLSChallengeHandler.resolve(
+            challenge,
+            serverURL: "https://\(serverHost)",
+            allowSelfSigned: true,
+            checkPort: false
+        )
+        completionHandler(disposition, credential)
     }
 }

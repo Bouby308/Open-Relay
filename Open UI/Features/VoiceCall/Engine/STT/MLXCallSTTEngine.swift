@@ -103,4 +103,14 @@ final class MLXCallSTTEngine: UtteranceSTTEngine, CallSTTEngine {
         Memory.clearCache()
         #endif
     }
+
+    /// The GPU was unavailable (backgrounded mid-turn): transcribe again once
+    /// it's allowed, otherwise let the caller hand the audio to another engine.
+    func recover(replaying frames: [MicFrame]) async -> String? {
+        guard MLXCallLock.gpuAllowed else { return nil }
+        beginTurn()
+        for f in frames where !f.vadSamples.isEmpty { appendVAD(f.vadSamples) }
+        let text = await finishTurn()
+        return text.isEmpty ? nil : text
+    }
 }

@@ -1298,18 +1298,35 @@ private struct StableStreamingMarkdown: View {
     let isStreaming: Bool
     let theme: MarkdownTheme
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.streamRateMeter) private var streamRateMeter
     @State private var reveal = StreamingTextReveal()
     @State private var parser = StreamingMarkdownParser()
+    @State private var pump = ParsePump()
+
+    /// Drives streaming parses so that every finished parse is used.
+    ///
+    /// A `.task(id:)` keyed on the text cancels the running parse on every server
+    /// update and discards its result. With a fast model, updates arrive faster
+    /// than a parse takes, so almost nothing reached the typewriter until a pause
+    /// let one parse through — and then a large block appeared at once. The pump
+    /// instead runs one parse at a time and always parses the newest text next.
+    /// Each result is a prefix of the latest text, so it is always usable.
+    @MainActor private final class ParsePump {
+        var latest: (text: String, reduceMotion: Bool)?
+        var task: Task<Void, Never>?
+    }
 
     private struct Request: Equatable {
-        let text: String
         let isStreaming: Bool
         let theme: MarkdownTheme
         let reduceMotion: Bool
+        /// Settled content only: live text goes through the pump.
+        let settledText: String?
     }
 
     var body: some View {
-        let request = Request(text: text, isStreaming: isStreaming, theme: theme, reduceMotion: reduceMotion)
+        let request = Request(isStreaming: isStreaming, theme: theme, reduceMotion: reduceMotion,
+                              settledText: isStreaming ? nil : text)
         let cached = isStreaming ? nil : MarkdownBlockRenderCache.shared.lookup(content: text, theme: theme)
         let live = isStreaming || reveal.isAnimating
         Group {
@@ -1334,30 +1351,65 @@ private struct StableStreamingMarkdown: View {
                     .accessibilityHidden(true)
             }
         }
-        .onDisappear { reveal.finish() }
+        .onAppear { reveal.rateMeter = streamRateMeter }
+        .onDisappear {
+            pump.task?.cancel()
+            pump.task = nil
+            pump.latest = nil
+            reveal.finish()
+        }
+        // Live text: hand the newest version to the pump on every update.
+        .onChange(of: text, initial: true) { _, newText in
+            guard isStreaming else { return }
+            enqueueLiveParse(newText)
+        }
+        // Settled text, theme and motion changes keep the existing task path.
         .task(id: request) {
-            if let cached {
-                reveal.receive(cached, source: text, streaming: isStreaming, reduceMotion: reduceMotion)
+            reveal.rateMeter = streamRateMeter
+            if isStreaming {
+                enqueueLiveParse(text)
                 return
             }
-            if isStreaming || reveal.hasContent {
-                // The actor serializes parses; cancelled, superseded requests
-                // are skipped before parsing. No shared mutable detached parser.
+            // A live parse still in flight must not land after the final content.
+            pump.task?.cancel()
+            pump.task = nil
+            pump.latest = nil
+            if let cached {
+                reveal.receive(cached, source: text, streaming: false, reduceMotion: reduceMotion)
+                return
+            }
+            if reveal.hasContent {
                 let parsed = await parser.parse(text)
                 guard !Task.isCancelled else { return }
-                reveal.receive(parsed, source: text, streaming: isStreaming, reduceMotion: reduceMotion)
+                reveal.receive(parsed, source: text, streaming: false, reduceMotion: reduceMotion)
             }
-            if !isStreaming {
-                // Reuse the existing finished-message cache, including its math
-                // rendering. Keep the visible text while that work completes.
-                let finished = await withCheckedContinuation { continuation in
-                    MarkdownBlockRenderCache.shared.build(content: text, theme: theme) {
-                        continuation.resume(returning: $0)
-                    }
+            // Reuse the existing finished-message cache, including its math
+            // rendering. Keep the visible text while that work completes.
+            let finished = await withCheckedContinuation { continuation in
+                MarkdownBlockRenderCache.shared.build(content: text, theme: theme) {
+                    continuation.resume(returning: $0)
                 }
-                guard !Task.isCancelled else { return }
-                reveal.receive(finished, source: text, streaming: false, reduceMotion: reduceMotion)
             }
+            guard !Task.isCancelled else { return }
+            reveal.receive(finished, source: text, streaming: false, reduceMotion: reduceMotion)
+        }
+    }
+
+    /// Queues `newText` for parsing; starts the single parse loop if idle.
+    private func enqueueLiveParse(_ newText: String) {
+        let work = pump
+        work.latest = (newText, reduceMotion)
+        guard work.task == nil else { return }
+        let parser = parser
+        let reveal = reveal
+        work.task = Task { @MainActor in
+            while let next = work.latest, !Task.isCancelled {
+                work.latest = nil
+                let parsed = await parser.parse(next.text)
+                guard !Task.isCancelled else { break }
+                reveal.receive(parsed, source: next.text, streaming: true, reduceMotion: next.reduceMotion)
+            }
+            work.task = nil
         }
     }
 
@@ -1500,6 +1552,12 @@ final class StreamingTextReveal {
         return after + spacings.lineSpacing + before
     }
 
+    /// Shared delivery rate for the reply this text belongs to.
+    var rateMeter: StreamRateMeter? {
+        get { progress.rateMeter }
+        set { progress.rateMeter = newValue }
+    }
+
     func receive(_ next: [MarkdownView.PreprocessedContent], source: String,
                  streaming: Bool, reduceMotion: Bool = false) {
         let previous = target ?? []
@@ -1515,14 +1573,18 @@ final class StreamingTextReveal {
     func finish() { progress.finish() }
 }
 
-/// Both formatted answers and plain reasoning use this clock. While a stream is
-/// live it stays a short, adaptive cushion behind the newest text, so there is
-/// always something left to type: the reveal flows continuously through gaps
-/// between packets instead of catching up, stopping and jumping at each one.
-/// The cushion is about half a second of text at the learned arrival rate; the
-/// reveal eases toward the live edge instead of halting, and bursts are absorbed
-/// by a smooth catch-up. A new reply types from its first character at a speed
-/// that already matches the backlog, so it neither crawls nor visibly speeds up.
+/// Both formatted answers and plain reasoning use this clock.
+///
+/// While a reply is live the reveal holds a short, steady lag behind the newest
+/// text, so there is always something left to type and packet gaps never show.
+/// Speed follows the reply's measured delivery rate (shared per reply via
+/// `StreamRateMeter`) and a gentle correction toward the target lag. It changes
+/// only through bounded acceleration: a burst of new text raises the speed over a
+/// fraction of a second instead of sprinting, and a gap slows it gradually.
+///
+/// Very fast models: the reveal soft-caps near `softCap` characters per second so
+/// it stays letter-by-letter. The cap rises only while the lag stays beyond
+/// `maxLag`, so a slower-than-server reveal cannot fall further and further behind.
 @MainActor @Observable
 final class StreamingTypewriter {
     private(set) var visibleCount = 0
@@ -1532,28 +1594,36 @@ final class StreamingTypewriter {
     @ObservationIgnored private var total = 0
     @ObservationIgnored private var isLive = false
     @ObservationIgnored private var speed = 0.0
-    @ObservationIgnored private var arrivalRate = initialRate
-    @ObservationIgnored private var lastArrival: Double?
-    @ObservationIgnored private var meanInterval = 0.0
-    @ObservationIgnored private var meanSize = 0.0
-    @ObservationIgnored private var arrivalSamples = 0
+    /// Local arrival estimate, used when no shared meter is available.
+    @ObservationIgnored private var localRate = ArrivalRateEstimator()
     @ObservationIgnored private var link: CADisplayLink?
+    /// Shared delivery rate for this reply; set by the owning view.
+    @ObservationIgnored weak var rateMeter: StreamRateMeter?
     var isAnimating: Bool { visibleCount < total }
 
-    /// Typical model output before the first interval has been measured.
+    /// Typical model output before any arrival has been measured.
     private static let initialRate = 240.0
-    /// Seconds of already-received text kept in reserve while streaming.
-    private static let cushionSeconds = 0.45
-    /// Reserve bounds, in characters.
-    private static let minCushion = 8.0
-    private static let maxCushion = 240.0
-    /// Backlog beyond the reserve is worked off over roughly this long.
-    private static let catchUpSeconds = 0.9
-    /// Once the stream ends, a large remaining backlog drains within about this
-    /// long; a normal cushion simply keeps typing at the learned rate.
-    private static let finishSeconds = 0.8
-    /// Speed smoothing time constant, so rate changes never show as jumps.
-    private static let easing = 0.12
+    /// Target distance behind the newest text while live, in seconds of text.
+    private static let targetLag = 0.45
+    /// Lag bounds in characters (tiny packets, very fast models).
+    private static let minLagChars = 16.0
+    private static let maxLagChars = 400.0
+    /// How quickly a lag error is corrected, in seconds.
+    private static let lagCorrection = 1.0
+    /// Letter-by-letter ceiling for fast models (about 10 characters per frame).
+    private static let softCap = 1_200.0
+    /// Past this much lag the cap gives way so the reveal keeps up with the server.
+    private static let maxLag = 1.5
+    /// Bounded acceleration and deceleration, as a fraction of speed per second.
+    private static let accelerationPerSecond = 2.2
+    private static let decelerationPerSecond = 3.5
+    /// Speed change is at least this many characters per second per second.
+    private static let minimumAcceleration = 600.0
+    /// After the stream ends, a large backlog drains within about this long.
+    private static let finishSeconds = 1.0
+    /// A frame longer than this (a hitch or backgrounding) is not caught up on:
+    /// the text pauses for that moment instead of leaping forward.
+    private static let maxFrameStep = 1.0 / 40
     /// A view that first sees more than this much text joined a reply already in
     /// progress (opened mid-stream) and starts near the live edge instead of
     /// retyping it. Shorter first packets are a new reply and type from the start.
@@ -1570,8 +1640,14 @@ final class StreamingTypewriter {
 
     deinit { link?.invalidate() }
 
-    private var cushion: Double {
-        min(Self.maxCushion, max(Self.minCushion, arrivalRate * Self.cushionSeconds))
+    /// The reply's delivery rate: the shared meter when present, else local.
+    private func deliveryRate(now: Double) -> Double {
+        rateMeter?.rate(now: now) ?? localRate.rate(now: now) ?? Self.initialRate
+    }
+
+    /// How far behind the newest text the reveal aims to be, in characters.
+    private func targetLagChars(rate: Double) -> Double {
+        min(Self.maxLagChars, max(Self.minLagChars, rate * Self.targetLag))
     }
 
     func receive(_ source: String, count: Int, streaming: Bool, reduceMotion: Bool = false,
@@ -1583,64 +1659,62 @@ final class StreamingTypewriter {
         isLive = streaming
         hasStreamed = hasStreamed || streaming
         guard hasStreamed, !reduceMotion, append else {
-            lastArrival = nil; meanInterval = 0; meanSize = 0
-            arrivalSamples = 0
-            arrivalRate = Self.initialRate; speed = 0
+            localRate = ArrivalRateEstimator()
+            speed = 0
             finish()
             return
         }
-        if added > 0 {
-            if let lastArrival {
-                let interval = now - lastArrival
-                // A network outage is not a new typing speed. Average packet
-                // sizes and intervals separately so clustered packets do not
-                // inflate the estimate as averages of instantaneous rates do.
-                if interval > 0, interval < 1.5 {
-                    arrivalSamples += 1
-                    let weight = max(0.3, 1 / Double(arrivalSamples))
-                    meanInterval += (interval - meanInterval) * weight
-                    meanSize += (Double(added) - meanSize) * weight
-                    arrivalRate = min(20_000, max(20, meanSize / meanInterval))
-                }
-            }
-            lastArrival = now
-        }
+        if added > 0 { localRate.record(added, now: now) }
         shown = min(shown, Double(total))
         if shown == 0, total > Self.joinThreshold {
-            shown = Double(total) - cushion
+            shown = Double(total) - targetLagChars(rate: deliveryRate(now: now))
         }
         setVisible()
         if shown < Double(total) {
-            startLinkIfNeeded()
+            startLinkIfNeeded(now: now)
         } else if !streaming {
             finish()
         }
     }
 
-    /// The reveal speed the current backlog calls for.
-    private func targetSpeed(lead: Double) -> Double {
-        guard isLive else { return max(arrivalRate, lead / Self.finishSeconds) }
-        let reserve = cushion
-        // Beyond the reserve: arrival rate plus a gentle catch-up of the excess.
-        // Within it: slow in proportion to what is left, so a server pause reads
-        // as a smooth deceleration rather than a dead stop.
-        return lead > reserve
-            ? arrivalRate + (lead - reserve) / Self.catchUpSeconds
-            : arrivalRate * max(0.12, lead / reserve)
+    /// The speed the reveal is steering toward right now.
+    ///
+    /// Live: the delivery rate, plus a correction that removes a lag error over
+    /// `lagCorrection` seconds — so the lag, not each packet, sets the pace. When
+    /// the reveal runs out of backlog it slows smoothly instead of stopping dead.
+    private func targetSpeed(lead: Double, now: Double) -> Double {
+        let rate = deliveryRate(now: now)
+        guard isLive else {
+            // Keep typing at the reply's pace; only a large backlog speeds up.
+            return max(speed, rate, lead / Self.finishSeconds)
+        }
+        let lagTarget = targetLagChars(rate: rate)
+        let desired = max(0, rate + (lead - lagTarget) / Self.lagCorrection)
+        // Soft cap: letter-by-letter for fast models, until the lag grows past
+        // maxLag seconds — then let the pace rise just enough to keep up.
+        let lagSeconds = lead / max(rate, 1)
+        let cap = lagSeconds > Self.maxLag
+            ? max(Self.softCap, rate + (lead - rate * Self.maxLag) / Self.lagCorrection)
+            : Self.softCap
+        return min(desired, cap)
     }
 
-    func advance(by seconds: Double) {
+    func advance(by seconds: Double, now: Double = ProcessInfo.processInfo.systemUptime) {
         guard seconds > 0, seconds.isFinite else { return }
-        // Clamp after a hitch or backgrounding so the text never leaps forward.
-        let dt = min(seconds, 0.1)
+        // A long frame (hitch or backgrounding) is not caught up on in one go.
+        let dt = min(seconds, Self.maxFrameStep)
         let lead = Double(total) - shown
         guard lead > 0 else {
             // Caught up: idle until the next packet restarts the clock.
             if isLive { stopLink() } else { finish() }
             return
         }
-        let target = targetSpeed(lead: lead)
-        speed += (target - speed) * (1 - exp(-dt / Self.easing))
+        let target = targetSpeed(lead: lead, now: now)
+        // Bounded acceleration: speed moves toward the target at a limited rate,
+        // so a burst of new text never turns into a visible sprint.
+        let limit = (target > speed ? Self.accelerationPerSecond : Self.decelerationPerSecond)
+            * max(speed, Self.minimumAcceleration) * dt
+        speed += max(-limit, min(limit, target - speed))
         shown = min(Double(total), shown + max(0, speed) * dt)
         setVisible()
         if shown >= Double(total) {
@@ -1661,11 +1735,11 @@ final class StreamingTypewriter {
         if next != visibleCount { visibleCount = next }
     }
 
-    private func startLinkIfNeeded() {
+    private func startLinkIfNeeded(now: Double = ProcessInfo.processInfo.systemUptime) {
         guard link == nil else { return }
-        // Starting from rest: begin at the speed the backlog needs rather than
-        // easing up from zero, which reads as a slow start followed by a rush.
-        if speed <= 0 { speed = targetSpeed(lead: Double(total) - shown) }
+        // Starting from rest: begin at the reply's pace rather than easing up from
+        // zero, which reads as a slow start followed by a rush.
+        if speed <= 0 { speed = min(deliveryRate(now: now), Self.softCap) }
         let clock = Clock(self)
         let displayLink = CADisplayLink(target: clock, selector: #selector(Clock.tick(_:)))
         displayLink.preferredFrameRateRange = CAFrameRateRange(

@@ -14,10 +14,10 @@ extension CallOrchestrator {
     func handleDuringReply(_ frame: MicFrame) async {
         // Continuous engines hear everything (word log with timings); echo is
         // judged later against what the AI was saying at those moments.
+        recentFrames.append(frame)
         if stt.isContinuous {
             stt.appendNative(frame.native, at: frame.capturedAt)
         } else {
-            recentFrames.append(frame)
             if bargeIn.isCandidate {
                 stt.appendNative(frame.native, at: frame.capturedAt)
                 if !frame.vadSamples.isEmpty { stt.appendVAD(frame.vadSamples) }
@@ -31,7 +31,7 @@ extension CallOrchestrator {
         let ratio = player.echo.ratioAboveEcho(micLevel: frame.rms, at: frame.capturedAt,
                                                noiseFloor: Self.micNoiseFloor)
         if diagnosticsEnabled { diagnostics.echoRatio = ratio }
-        let novel = bargeIn.isCandidate ? novelWordCount() : 0
+        let words = bargeIn.isCandidate ? candidateWords() : (novel: 0, echo: 0)
         for p in probs {
             // Learn residual echo from frames that are the AI alone.
             if !bargeIn.isCandidate, p < bargeIn.config.speechThreshold {
@@ -39,7 +39,8 @@ extension CallOrchestrator {
             }
             let obs = BargeInDetector.Observation(
                 probability: p, ratioAboveEcho: ratio,
-                novelWords: stt.providesLivePartials ? novel : nil
+                novelWords: stt.providesLivePartials ? words.novel : nil,
+                echoWords: stt.providesLivePartials ? words.echo : 0
             )
             guard let event = bargeIn.process(obs) else { continue }
             handleBargeIn(event, frame: frame, observation: obs)
@@ -47,18 +48,22 @@ extension CallOrchestrator {
         }
     }
 
-    /// Novel (non-echo) words the user said since the candidate started.
-    private func novelWordCount() -> Int {
-        guard let start = candidateStartedAt else { return 0 }
+    /// Words heard since the candidate started: how many the AI wasn't
+    /// saying (the user's) and how many were the AI's own voice leaking back.
+    private func candidateWords() -> (novel: Int, echo: Int) {
+        guard let start = candidateStartedAt else { return (0, 0) }
         let now = Date()
+        let verdict: EchoMatcher.Verdict
         if stt.isContinuous {
             let heard = stt.words(from: start)
             let spoken = player.timeline.spokenWords(from: start, to: now)
-            return EchoMatcher.evaluate(heard: heard, spoken: spoken).novelTokens
+            verdict = EchoMatcher.evaluate(heard: heard, spoken: spoken)
+        } else {
+            let partial = stt.partialTranscript
+            guard !partial.isEmpty else { return (0, 0) }
+            let spokenText = player.timeline.recentSpokenText(within: now.timeIntervalSince(start) + 1)
+            verdict = EchoMatcher.evaluate(transcript: partial, against: spokenText)
         }
-        let partial = stt.partialTranscript
-        guard !partial.isEmpty else { return 0 }
-        let spokenText = player.timeline.recentSpokenText(within: now.timeIntervalSince(start) + 1)
-        return EchoMatcher.evaluate(transcript: partial, against: spokenText).novelTokens
+        return (verdict.novelTokens, verdict.echoTokens)
     }
 }

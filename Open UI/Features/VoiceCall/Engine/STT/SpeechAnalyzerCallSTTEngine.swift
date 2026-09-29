@@ -48,6 +48,21 @@ final class SpeechAnalyzerCallSTTEngine: CallSTTEngine {
     fileprivate var turnStart: Date = .distantPast
     fileprivate(set) var partialTranscript: String = ""
 
+    /// Current analysis session; results from older sessions are ignored.
+    fileprivate var sessionId = 0
+    fileprivate var locale: Locale?
+    /// False once the session's results stream has ended — no more words
+    /// will arrive until `restart()`.
+    fileprivate(set) var isHealthy = false
+    fileprivate var isRestarting = false
+    fileprivate(set) var restartCount = 0
+    /// When the recogniser last produced a result (volatile or final).
+    fileprivate var lastResultAt = Date()
+    /// When audio feeding started for this session.
+    fileprivate var feedStartedAt: Date?
+    /// How long `finishTurn` waits for final results.
+    fileprivate var finalizeWait: TimeInterval = 1.2
+
     /// Words older than this are dropped from the log.
     fileprivate static let memory: TimeInterval = 60
 
@@ -98,13 +113,11 @@ final class SpeechAnalyzerCallSTTEngine: CallSTTEngine {
                 options: .init(priority: .userInitiated, modelRetention: .lingering)
             )
             try await analyzer.prepareToAnalyze(in: format)
-            let (stream, continuation) = AsyncStream<AnalyzerInput>.makeStream(bufferingPolicy: .unbounded)
-            try await analyzer.start(inputSequence: stream)
             self.transcriber = module
             self.analyzer = analyzer
             self.analyzerFormat = format
-            self.inputContinuation = continuation
-            startResultsLoop(module)
+            self.locale = locale
+            try await startSession(analyzer: analyzer, module: module)
             logger.info("SpeechAnalyzer ready — \(locale.identifier, privacy: .public), \(format.sampleRate, format: .fixed(precision: 0)) Hz")
             return true
         } catch {
@@ -113,15 +126,86 @@ final class SpeechAnalyzerCallSTTEngine: CallSTTEngine {
         }
     }
 
-    private func startResultsLoop(_ module: SpeechTranscriber) {
+    /// Starts one analysis session: a fresh input stream, audio clock and
+    /// results loop. Bumps `sessionId` so late results from an older
+    /// session are ignored.
+    fileprivate func startSession(analyzer: SpeechAnalyzer, module: SpeechTranscriber) async throws {
+        sessionId &+= 1
+        let session = sessionId
+        let (stream, continuation) = AsyncStream<AnalyzerInput>.makeStream(bufferingPolicy: .unbounded)
+        epoch = nil
+        fedSeconds = 0
+        finalizedThrough = 0
+        lastResultAt = Date()
+        feedStartedAt = nil
+        try await analyzer.start(inputSequence: stream)
+        inputContinuation = continuation
+        isHealthy = true
+        startResultsLoop(module, session: session)
+    }
+
+    private func startResultsLoop(_ module: SpeechTranscriber, session: Int) {
         resultsTask = Task { [weak self] in
             do {
                 for try await result in module.results {
-                    self?.ingest(result)
+                    guard let self, self.sessionId == session else { return }
+                    self.ingest(result)
                 }
+                self?.sessionEnded(session, error: nil)
             } catch {
-                self?.logger.error("SpeechAnalyzer results ended: \(error.localizedDescription, privacy: .public)")
+                self?.sessionEnded(session, error: error)
             }
+        }
+    }
+
+    /// The results stream finished: the analysis session is over and no
+    /// more words will ever arrive. Mark it dead so the next turn rebuilds it.
+    private func sessionEnded(_ session: Int, error: Error?) {
+        guard session == sessionId else { return }
+        isHealthy = false
+        logger.error("SpeechAnalyzer session ended: \(error?.localizedDescription ?? "results finished", privacy: .public)")
+    }
+
+    /// Rebuilds the analyzer after its session died (or stopped producing
+    /// results). Assets are already installed, so this is quick.
+    func restart() async -> Bool {
+        // A restart already in flight (e.g. ensureHealthy + recover): wait for it.
+        if isRestarting {
+            while isRestarting { try? await Task.sleep(for: .milliseconds(50)) }
+            return isHealthy
+        }
+        guard transcriber != nil, let format = analyzerFormat else { return false }
+        isRestarting = true
+        defer { isRestarting = false }
+        inputContinuation?.finish()
+        inputContinuation = nil
+        resultsTask?.cancel()
+        resultsTask = nil
+        if let old = analyzer { Task { await old.cancelAndFinishNow() } }
+        // Modules can't be shared between analyzers: make a fresh one.
+        let fresh = SpeechTranscriber(
+            locale: locale ?? Locale.current,
+            transcriptionOptions: [],
+            reportingOptions: [.volatileResults, .fastResults],
+            attributeOptions: [.audioTimeRange]
+        )
+        do {
+            let analyzer = SpeechAnalyzer(
+                modules: [fresh],
+                options: .init(priority: .userInitiated, modelRetention: .lingering)
+            )
+            try await analyzer.prepareToAnalyze(in: format)
+            self.transcriber = fresh
+            self.analyzer = analyzer
+            log.clear()
+            try await startSession(analyzer: analyzer, module: fresh)
+            restartCount += 1
+            logger.info("SpeechAnalyzer restarted (\(self.restartCount))")
+            return true
+        } catch {
+            isHealthy = false
+            logger.error("SpeechAnalyzer restart failed: \(error.localizedDescription, privacy: .public)")
+            return false
         }
     }
 }
@@ -134,7 +218,7 @@ extension SpeechAnalyzerCallSTTEngine {
     func appendNative(_ buffer: AVAudioPCMBuffer, at time: Date) {
         guard let continuation = inputContinuation, let target = analyzerFormat,
               buffer.frameLength > 0 else { return }
-        if epoch == nil { epoch = time }
+        if epoch == nil { epoch = time; feedStartedAt = Date() }
         guard let converted = convert(buffer, to: target), let epoch else { return }
         // Feed one contiguous stream: each buffer follows the previous one
         // exactly. Tap timestamps jitter by a few ms, and signalling that as a
@@ -182,6 +266,7 @@ extension SpeechAnalyzerCallSTTEngine {
 
     fileprivate func ingest(_ result: SpeechTranscriber.Result) {
         guard let epoch else { return }
+        lastResultAt = Date()
         log.ingest(Self.segment(from: result, epoch: epoch))
         if result.isFinal {
             finalizedThrough = max(finalizedThrough, result.range.end.seconds)
@@ -229,21 +314,53 @@ extension SpeechAnalyzerCallSTTEngine {
 
     func finishTurn() async -> String {
         let start = turnStart
-        if let analyzer {
+        if let analyzer, isHealthy {
             let through = CMTime(seconds: fedSeconds, preferredTimescale: 48_000)
-            // Force final results for everything fed so far. Bounded, so a
-            // stalled analyzer can never hang the call.
-            let finalize = Task { try? await analyzer.finalize(through: through) }
-            let deadline = Date().addingTimeInterval(1.2)
-            while Date() < deadline, finalizedThrough < through.seconds - 0.05 {
+            // Force final results for everything fed so far. The finalize
+            // call is NEVER cancelled — cancelling it can end the whole
+            // analysis session (it throws CancellationError "if analysis is
+            // finished early"), after which no words arrive for the rest of
+            // the call. We just stop *waiting* after the deadline.
+            let session = sessionId
+            Task { [weak self] in
+                do { try await analyzer.finalize(through: through) }
+                catch { self?.finalizeFailed(session, error: error) }
+            }
+            let deadline = Date().addingTimeInterval(finalizeWait)
+            while Date() < deadline, finalizedThrough < through.seconds - 0.05, isHealthy {
                 try? await Task.sleep(for: .milliseconds(40))
             }
-            finalize.cancel()
         }
         let text = log.text(from: start)
         turnStart = Date()
         partialTranscript = ""
         return text
+    }
+
+    private func finalizeFailed(_ session: Int, error: Error) {
+        guard session == sessionId else { return }
+        logger.error("SpeechAnalyzer finalize failed: \(error.localizedDescription, privacy: .public)")
+    }
+
+    /// True when the recogniser is broken: its session ended, so no more
+    /// words will arrive until it's rebuilt.
+    var needsRestart: Bool { !isHealthy }
+
+    func ensureHealthy() async {
+        if needsRestart { _ = await restart() }
+    }
+
+    /// Restart and transcribe the turn's audio again (the words the broken
+    /// session never delivered), so the user doesn't have to repeat.
+    func recover(replaying frames: [MicFrame]) async -> String? {
+        guard let first = frames.first, await restart() else { return nil }
+        beginTurn(from: first.capturedAt)
+        for f in frames { appendNative(f.native, at: f.capturedAt) }
+        // Several seconds of audio arrive at once: give finalize more time.
+        finalizeWait = 3.0
+        defer { finalizeWait = 1.2 }
+        let text = await finishTurn().trimmingCharacters(in: .whitespacesAndNewlines)
+        return text.isEmpty ? nil : text
     }
 
     func cancelTurn() {
@@ -252,6 +369,8 @@ extension SpeechAnalyzerCallSTTEngine {
     }
 
     func shutdown() {
+        sessionId &+= 1
+        isHealthy = false
         inputContinuation?.finish()
         inputContinuation = nil
         resultsTask?.cancel()

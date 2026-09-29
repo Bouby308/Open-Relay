@@ -99,6 +99,15 @@ struct ProxyAuthWebView: UIViewRepresentable {
         }
 
         // MARK: - Navigation Delegate
+        /// Presents the imported mTLS client certificate when the server (or its
+        /// reverse proxy) requests one. Server trust keeps the default handling.
+        func webView(
+            _ webView: WKWebView,
+            respondTo challenge: URLAuthenticationChallenge
+        ) async -> (URLSession.AuthChallengeDisposition, URLCredential?) {
+            TLSChallengeHandler.resolveClientCertificateOnly(challenge)
+        }
+
 
         func webView(
             _ webView: WKWebView,
@@ -365,12 +374,9 @@ struct ProxyAuthWebView: UIViewRepresentable {
             request.timeoutInterval = 8
             request.setValue("application/json", forHTTPHeaderField: "Accept")
 
-            let sessionConfig = URLSessionConfiguration.default
-            sessionConfig.httpCookieStorage = HTTPCookieStorage.shared
-            sessionConfig.httpCookieAcceptPolicy = .always
-            sessionConfig.httpShouldSetCookies = true
-            sessionConfig.timeoutIntervalForRequest = 8
-            let session = URLSession(configuration: sessionConfig)
+            // Shared cookie-enabled session that also presents an imported mTLS
+            // client certificate (request timeout is set on the request above).
+            let session = ClientCertificateSession.shared
 
             do {
                 let (data, response) = try await session.data(for: request)

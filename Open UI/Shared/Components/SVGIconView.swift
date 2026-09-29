@@ -90,7 +90,7 @@ struct RemoteSVGIconView: View {
             return
         }
         do {
-            let (data, _) = try await URLSession.shared.data(from: parsedURL)
+            let (data, _) = try await ClientCertificateSession.shared.data(from: parsedURL)
             if let svgText = String(data: data, encoding: .utf8),
                svgText.contains("<svg") {
                 await MainActor.run { svgString = svgText }

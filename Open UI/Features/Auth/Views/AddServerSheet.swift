@@ -19,6 +19,7 @@ struct AddServerSheet: View {
     @State private var url: String = ""
     @State private var apiKey: String = ""
     @State private var allowSelfSigned: Bool = false
+    @State private var clientCertificate: ClientCertificate?
     @State private var customHeaderEntries: [CustomHeaderEntry] = []
     @State private var showAdvanced = false
     @State private var nativeSSOEnabled = false
@@ -85,6 +86,8 @@ struct AddServerSheet: View {
                                         .labelsHidden()
                                         .tint(theme.brandPrimary)
                                 }
+
+                                ClientCertificateAdvancedField(certificate: $clientCertificate)
 
                                 // Custom Headers
                                 CustomHeadersEditor(entries: $customHeaderEntries)
@@ -199,6 +202,8 @@ struct AddServerSheet: View {
             // silently carry over to the new server being added.
             customHeaderEntries = []
             viewModel.customHeaderEntries = []
+            // Never carry a client certificate over from a previous connect attempt.
+            viewModel.clientCertificate = nil
             // Clear error from any previous attempt
             viewModel.errorMessage = nil
         }
@@ -214,6 +219,7 @@ struct AddServerSheet: View {
         viewModel.serverURL = url
         viewModel.apiKey = apiKey
         viewModel.allowSelfSignedCerts = allowSelfSigned
+        viewModel.clientCertificate = clientCertificate
         viewModel.customHeaderEntries = customHeaderEntries
         viewModel.nativeSSOEnabled = nativeSSOEnabled
         viewModel.nativeSSOIssuer = nativeSSOIssuer
@@ -230,6 +236,7 @@ struct AddServerSheet: View {
         viewModel.serverURL = previousURL
         viewModel.apiKey = previousApiKey
         viewModel.allowSelfSignedCerts = previousAllowSelfSigned
+        viewModel.clientCertificate = nil
         viewModel.customHeaderEntries = previousCustomHeaderEntries
         resetNativeSSOForm()
         onDismiss()

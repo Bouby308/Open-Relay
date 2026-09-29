@@ -45,6 +45,9 @@ private final class PumpRef {
     /// Current scroll offset Y — tracked at 120Hz but stored here (not @State) so that
     /// writing it never triggers a SwiftUI body re-evaluation. Read at tap-time by FAB.
     var currentScrollOffsetY: CGFloat = 0
+    /// Cached scroll content height, updated in onScrollGeometryChange. Not @State:
+    /// nothing in body depends on it, and it changes constantly while streaming.
+    var contentHeight: CGFloat = 0
     /// Timestamp of the last time scroll content height increased.
     /// Updated every time contentHeight grows inside onScrollGeometryChange.
     /// The follower uses this to stay alive as long as content is still being
@@ -140,6 +143,7 @@ struct ChatDetailView: View {
     @Environment(\.theme) private var theme
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     @Environment(\.verticalSizeClass) private var verticalSizeClass
+    @Environment(\.isEnabled) private var isEnabled
 
     private let logger = Logger(subsystem: "com.openui", category: "ChatDetailView")
 
@@ -172,8 +176,8 @@ struct ChatDetailView: View {
     /// nil = haven't jumped yet (next tap jumps to the user message nearest the current viewport top).
     /// Reset to nil whenever the user scrolls back to the bottom.
     @State private var userMessageJumpIndex: Int? = nil
-    /// Cached scroll content height — updated via onScrollGeometryChange.
-    @State private var viewState_contentHeight: CGFloat = 0
+    // Scroll content height lives in _pumpRef.contentHeight: nothing in body reads it,
+    // and as @State every 30pt of streamed growth re-evaluated the whole chat view.
     /// Cached scroll container height — updated via onScrollGeometryChange.
     /// Pre-seeded with screen height so welcomeView Spacers can centre content
     /// from the very first frame (avoids the top→centre jump when a new
@@ -422,6 +426,14 @@ struct ChatDetailView: View {
     /// Optional callback invoked when the new-chat button is tapped.
     /// When set, a compose icon is shown at the trailing edge of the custom top bar.
     private var newChatAction: (() -> Void)?
+
+    private var backAction: (() -> Void)?
+
+    func onBack(_ action: @escaping () -> Void) -> ChatDetailView {
+        var copy = self
+        copy.backAction = action
+        return copy
+    }
 
     func onNewChat(_ action: @escaping () -> Void) -> ChatDetailView {
         var copy = self
@@ -745,6 +757,7 @@ struct ChatDetailView: View {
         // Pick up files shared from other apps via "Open In" / document import.
         // The version counter fires this even when the view is already visible.
         .onChange(of: dependencies.pendingIncomingFileVersion) { _, _ in
+            guard viewModel.noteChatSession == nil else { return }
             if let file = dependencies.pendingIncomingFile {
                 viewModel.attachments.append(file)
                 // Trigger immediate upload for shared files (via "Open In")
@@ -755,6 +768,7 @@ struct ChatDetailView: View {
         // Pick up extra attachments from the Share Extension (URLs shared alongside files).
         // These are any attachments beyond the first (which uses pendingIncomingFile).
         .onChange(of: dependencies.pendingIncomingFileVersion) { _, _ in
+            guard viewModel.noteChatSession == nil else { return }
             let extras = dependencies.pendingIncomingExtraAttachments
             if !extras.isEmpty {
                 for attachment in extras {
@@ -817,13 +831,14 @@ struct ChatDetailView: View {
         // Extracted into a private extension to keep the type-checker expression size manageable.
         .applyLinkAndPromptHandlers(
             viewModel: viewModel,
+            isEnabled: isEnabled,
             downloadAndShare: { fileId in Task { await downloadAndShareFile(fileId: fileId) } },
             downloadAndShareURL: { url in Task { await downloadAndShareArbitraryURL(url) } }
         )
         // Handle "Ask" / "Explain" taps from the text selection menu in assistant
         // messages. Extracted into a private extension to keep the type-checker
         // expression size manageable.
-        .applyTextSelectionHandlers(viewModel: viewModel)
+        .applyTextSelectionHandlers(viewModel: viewModel, isEnabled: isEnabled)
         // Drive keyboard focus via the ViewModel flag rather than directly setting
         // FocusState from inside an onReceive — the indirect path avoids a race
         // with UIKit's responder-chain cleanup (LTXLabel calls resignFirstResponder
@@ -926,6 +941,8 @@ struct ChatDetailView: View {
             .themed()
         }
         .applyWidgetAndPickerHandlers(
+            isEnabled: isEnabled,
+            acceptsQuickActions: viewModel.noteChatSession == nil,
             showCameraPicker: $showCameraPicker,
             showPhotosPicker: $showPhotosPicker,
             showAnimatedPhotoPicker: $showAnimatedPhotoPicker,
@@ -1002,7 +1019,16 @@ struct ChatDetailView: View {
     private var customTopBar: some View {
         HStack(spacing: Spacing.sm) {
             // Leading: hamburger — large circle pill matching image 2
-            if let drawerAction = toggleDrawerAction {
+            if let backAction {
+                Button(action: backAction) {
+                    Image(systemName: "chevron.left")
+                        .scaledFont(size: 18, weight: .medium, context: .ui)
+                        .frame(width: 40, height: 40)
+                }
+                .buttonStyle(.plain)
+                .chatControlGlass(in: Circle(), fallback: .ultraThinMaterial)
+                .accessibilityLabel("Note chats")
+            } else if let drawerAction = toggleDrawerAction {
                 Button {
                     drawerAction()
                 } label: {
@@ -1048,7 +1074,7 @@ struct ChatDetailView: View {
                     Label("Chat Settings", systemImage: "slider.horizontal.3")
                 }
 
-                if viewModel.messages.isEmpty {
+                if viewModel.messages.isEmpty && viewModel.noteChatSession == nil {
                     Button {
                         withAnimation(MicroAnimation.snappy) { viewModel.isTemporaryChat.toggle() }
                         Haptics.play(.light)
@@ -1458,7 +1484,7 @@ struct ChatDetailView: View {
                 attachmentUsage: vm.attachmentUsage,
                 placeholder: placeholderText,
                 isKeyboardVisible: keyboard.isVisible,
-                isEnabled: !vm.isCreatingConversation && (!vm.isStreaming || vm.enableMessageQueue),
+                isEnabled: !vm.isCreatingConversation && !vm.isCreatingNoteChat && (!vm.isStreaming || vm.enableMessageQueue),
                 onSend: { Task { await viewModel.sendMessage() } },
                 onStopGenerating: vm.isStreaming ? { viewModel.stopStreaming() } : nil,
                 webSearchEnabled: $vm.webSearchEnabled,
@@ -2019,7 +2045,7 @@ struct ChatDetailView: View {
                 // should NOT show the FAB. Use a computed distance from the cached sizes —
                 // not perfect but good enough for this phase-change callback.
                 if viewModel.isStreaming && !isScrolledUp {
-                    let distAtDecel = max(0, viewState_contentHeight - viewState_containerHeight)
+                    let distAtDecel = max(0, _pumpRef.contentHeight - viewState_containerHeight)
                     // Only show FAB if the user is clearly away from the bottom (> 60pt).
                     // This prevents the FAB appearing when coasting after a manual scroll-to-bottom.
                     if distAtDecel > 60 {
@@ -2070,7 +2096,7 @@ struct ChatDetailView: View {
         //
         // CRITICAL: This replaces the previous two separate callbacks (one for CGPoint
         // offset, one for CGSize content/container). The old design had a race condition:
-        // the offset callback used @State viewState_contentHeight / viewState_containerHeight
+        // the offset callback used cached content/container heights
         // which could be 1-2 frames stale relative to the current offset. This caused
         // isBouncing to compute incorrectly during rubber-band overscroll — it would
         // return false during a real bounce, letting nav-bar and FAB logic fire at 120Hz
@@ -2118,11 +2144,11 @@ struct ChatDetailView: View {
             }
 
             // Growth tracking still uses the raw value for accuracy.
-            if contentHeight > viewState_contentHeight {
+            if contentHeight > _pumpRef.contentHeight {
                 _pumpRef.lastContentGrowthAt = Date()
             }
-            if abs(contentHeight - viewState_contentHeight) > 30 {
-                viewState_contentHeight = contentHeight
+            if abs(contentHeight - _pumpRef.contentHeight) > 1 {
+                _pumpRef.contentHeight = contentHeight
             }
             if abs(containerHeight - viewState_containerHeight) > 30 {
                 viewState_containerHeight = containerHeight
@@ -2393,8 +2419,8 @@ struct ChatDetailView: View {
                             // First tap: use window position + fraction estimate as reference.
                             let refIdx: Int = {
                                 // The scroll geometry describes only the rendered window.
-                                guard viewState_contentHeight > 0 else { return allMessages.count - 1 }
-                                let fraction = max(0, min(1, _pumpRef.currentScrollOffsetY / viewState_contentHeight))
+                                guard _pumpRef.contentHeight > 0 else { return allMessages.count - 1 }
+                                let fraction = max(0, min(1, _pumpRef.currentScrollOffsetY / _pumpRef.contentHeight))
                                 let end = min(windowEnd ?? allMessages.count, allMessages.count)
                                 let start = max(0, end - windowSize)
                                 return min(start + Int(fraction * CGFloat(end - start)), end - 1)
@@ -4703,7 +4729,7 @@ struct ChatDetailView: View {
         }
         // Perform non-async setup before awaiting load() so the UI
         // populates prompts and temporary-chat state instantly.
-        if viewModel.isNewConversation {
+        if viewModel.isNewConversation && viewModel.noteChatSession == nil {
             viewModel.isTemporaryChat = UserDefaults.standard.bool(forKey: "temporaryChatDefault")
         }
         // Only resolve prompts pre-load for new chats — existing chats
@@ -4803,7 +4829,7 @@ struct ChatDetailView: View {
                 while Date() < settleDeadline {
                     try? await Task.sleep(nanoseconds: tickInterval)
                     scrollPosition.scrollTo(edge: .bottom)
-                    let currentHeight = viewState_contentHeight
+                    let currentHeight = _pumpRef.contentHeight
                     if abs(currentHeight - lastHeight) < 1 && currentHeight > 0 {
                         stableTickCount += 1
                         if stableTickCount >= requiredStableTicks { break }
@@ -4818,7 +4844,7 @@ struct ChatDetailView: View {
                 // snap to .top instead of .bottom — this prevents the gravity-bottom
                 // effect (blank space at the top) that defaultScrollAnchor(.bottom)
                 // causes when there is nothing to scroll.
-                let contentFitsViewport = viewState_contentHeight > 0 && viewState_contentHeight <= viewState_containerHeight
+                let contentFitsViewport = _pumpRef.contentHeight > 0 && _pumpRef.contentHeight <= viewState_containerHeight
                 scrollPosition.scrollTo(edge: contentFitsViewport ? .top : .bottom)
                 // Lift the curtain — user sees the chat already at the true bottom.
                 // Window remains at 8 rows — the scroll-up pagination handler in
@@ -4878,7 +4904,8 @@ struct ChatDetailView: View {
               dependencies.authViewModel.phase == .authenticated else { return nil }
         if let selected = dependencies.serverConfigStore.activeAccount, selected.userId != user.id { return nil }
         return DictationContext(server: server.url, account: user.id,
-                                conversation: viewModel.conversationId ?? viewModel.conversation?.id)
+                                conversation: viewModel.conversationId ?? viewModel.conversation?.id
+                                    ?? viewModel.noteChatSession.map { "note-draft:\($0.noteId)" })
     }
 
     /// Binds the shared dictation service to this chat's draft, restoring any saved recording.
@@ -5898,6 +5925,8 @@ private struct IsolatedAssistantMessage: View {
                     liveTerminalFiles: liveTerminalFiles
                 )
                 .transaction { $0.animation = nil }
+                // Typewriters in this reply share one measured delivery rate.
+                .environment(\.streamRateMeter, isActivelyStreaming ? streamingStore.rateMeter : nil)
             } else {
                 // Plain text (markdown rendering disabled).
                 // All states use the same Text view type — no structural change.
@@ -6597,6 +6626,8 @@ private extension View {
 /// ChatDetailView.body, which was hitting the Swift type-checker limit.
 private extension View {
     func applyWidgetAndPickerHandlers(
+        isEnabled: Bool,
+        acceptsQuickActions: Bool,
         showCameraPicker: Binding<Bool>,
         showPhotosPicker: Binding<Bool>,
         showAnimatedPhotoPicker: Binding<Bool>,
@@ -6610,6 +6641,7 @@ private extension View {
     ) -> some View {
         self
             .onReceive(NotificationCenter.default.publisher(for: .markdownCodePreview)) { notification in
+                guard isEnabled else { return }
                 if let code = notification.userInfo?["code"] as? String {
                     codePreviewLanguage.wrappedValue = notification.userInfo?["language"] as? String ?? ""
                     codePreviewCode.wrappedValue = code
@@ -6619,9 +6651,11 @@ private extension View {
                 onDismissOverlays()
             }
             .onReceive(NotificationCenter.default.publisher(for: .openUICameraChat)) { _ in
+                guard acceptsQuickActions else { return }
                 showCameraPicker.wrappedValue = true
             }
             .onReceive(NotificationCenter.default.publisher(for: .openUIPhotosChat)) { _ in
+                guard acceptsQuickActions else { return }
                 if let request = photoPickerRequestAction {
                     request()
                 } else {
@@ -6629,9 +6663,11 @@ private extension View {
                 }
             }
             .onReceive(NotificationCenter.default.publisher(for: .openUIFileChat)) { _ in
+                guard acceptsQuickActions else { return }
                 showFilePicker.wrappedValue = true
             }
             .onReceive(NotificationCenter.default.publisher(for: .openUIPhotoPickerConfirm)) { notification in
+                guard isEnabled else { return }
                 guard let assets = notification.userInfo?["assets"] as? [PHAsset] else { return }
                 Task { await onProcessPhotos(assets) }
             }
@@ -6662,6 +6698,7 @@ private extension View {
         self
             // --- Plain-text pre-fill (Share Extension + openui://new-chat?prompt=) ---
             .onChange(of: dependencies.pendingIncomingTextVersion) { _, _ in
+                guard viewModel.noteChatSession == nil else { return }
                 if let text = dependencies.pendingIncomingText, !text.isEmpty {
                     viewModel.inputText = text
                     dependencies.pendingIncomingText = nil
@@ -6669,6 +6706,7 @@ private extension View {
             }
             // --- Web-scraping URL pipeline (Share Extension) ---
             .onChange(of: dependencies.pendingIncomingWebURLsVersion) { _, _ in
+                guard viewModel.noteChatSession == nil else { return }
                 let urls = dependencies.pendingIncomingWebURLs
                 if !urls.isEmpty {
                     dependencies.pendingIncomingWebURLs = []
@@ -6681,6 +6719,7 @@ private extension View {
             // Only applied on new chats (initialConversationId == nil) so the URL
             // scheme can't silently hijack an existing conversation's model.
             .onChange(of: dependencies.pendingIncomingModelVersion) { _, _ in
+                guard viewModel.noteChatSession == nil else { return }
                 if let modelId = dependencies.pendingIncomingModelId, !modelId.isEmpty {
                     dependencies.pendingIncomingModelId = nil
                     // Validate against the available models list; fall back silently
@@ -6707,6 +6746,7 @@ private extension View {
             // Fires after `pendingIncomingTextVersion` has already pre-filled the input.
             // A short delay ensures the input text is committed before sendMessage() reads it.
             .onChange(of: dependencies.pendingAutoSendVersion) { _, _ in
+                guard viewModel.noteChatSession == nil else { return }
                 guard dependencies.pendingAutoSend else { return }
                 dependencies.pendingAutoSend = false
                 // Only send if there is actually something to send.
@@ -6727,6 +6767,7 @@ private extension View {
 private extension View {
     func applyLinkAndPromptHandlers(
         viewModel: ChatViewModel,
+        isEnabled: Bool,
         downloadAndShare: @escaping (String) -> Void,
         downloadAndShareURL: @escaping (URL) -> Void
     ) -> some View {
@@ -6734,6 +6775,7 @@ private extension View {
             // Intercept link taps from MarkdownView: download server file URLs
             // with auth instead of opening Safari.
             .onReceive(NotificationCenter.default.publisher(for: .markdownLinkTapped)) { notification in
+                guard isEnabled else { return }
                 guard let url = notification.userInfo?["url"] as? URL else { return }
                 let urlString = url.absoluteString
                 let base = viewModel.serverBaseURL.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
@@ -6762,6 +6804,7 @@ private extension View {
             }
             // Handle sendPrompt bridge calls from InlineVisualizerView.
             .onReceive(NotificationCenter.default.publisher(for: .vizSendPrompt)) { notification in
+                guard isEnabled else { return }
                 guard let text = notification.userInfo?["text"] as? String, !text.isEmpty else { return }
                 if viewModel.isStreaming {
                     viewModel.inputText = text
@@ -6779,7 +6822,7 @@ private extension View {
 /// assistant messages. Extracted from body so the Swift type-checker doesn't
 /// have to resolve these two `.onReceive` closures inline.
 private extension View {
-    func applyTextSelectionHandlers(viewModel: ChatViewModel) -> some View {
+    func applyTextSelectionHandlers(viewModel: ChatViewModel, isEnabled: Bool) -> some View {
         self
             // "Ask": quote the selected text into the input box so the user can
             // type a follow-up question (cursor placed after the quote), then
@@ -6788,6 +6831,7 @@ private extension View {
             // in the body — that indirect path avoids racing with LTXLabel's
             // resignFirstResponder() call during clearSelection().
             .onReceive(NotificationCenter.default.publisher(for: .ltxLabelAskSelection)) { notification in
+                guard isEnabled else { return }
                 guard let selected = notification.userInfo?["selectedText"] as? String,
                       !selected.isEmpty else { return }
                 viewModel.inputText = "\"\(selected)\"\n"
@@ -6795,6 +6839,7 @@ private extension View {
             }
             // "Explain": pre-fill "Explain: [text]" ready to send (no keyboard needed).
             .onReceive(NotificationCenter.default.publisher(for: .ltxLabelExplainSelection)) { notification in
+                guard isEnabled else { return }
                 guard let selected = notification.userInfo?["selectedText"] as? String,
                       !selected.isEmpty else { return }
                 viewModel.inputText = "Explain: \"\(selected)\""
@@ -6802,6 +6847,7 @@ private extension View {
             // Insert a terminal file path into the chat input when the user taps
             // "Insert Path into Chat" from the file browser context menu.
             .onReceive(NotificationCenter.default.publisher(for: .terminalInsertPath)) { notification in
+                guard isEnabled else { return }
                 guard let path = notification.object as? String, !path.isEmpty else { return }
                 let separator = viewModel.inputText.isEmpty ? "" : " "
                 viewModel.inputText += "\(separator)\(path)"

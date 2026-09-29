@@ -1,5 +1,6 @@
 import SwiftUI
 import Speech
+import AVKit
 
 /// Modern compact voice call interface presented as a sheet.
 /// Minimal, sleek design inspired by iOS Live Activities and Dynamic Island.
@@ -143,7 +144,19 @@ struct VoiceCallView: View {
                     .scaledFont(size: 13, weight: .medium, design: .monospaced)
                     .foregroundStyle(.white.opacity(0.5))
                     .contentTransition(.numericText())
+
+                // A stand-in engine is in use (e.g. server voice while in the
+                // background) — never let the screen silently contradict Settings.
+                if let notice = viewModel.engineNotice {
+                    Label(notice, systemImage: "arrow.triangle.2.circlepath")
+                        .scaledFont(size: 11, weight: .medium)
+                        .foregroundStyle(.white.opacity(0.55))
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.85)
+                        .transition(.opacity.combined(with: .move(edge: .top)))
+                }
             }
+            .animation(.easeInOut(duration: 0.25), value: viewModel.engineNotice)
 
             Spacer()
 
@@ -306,6 +319,15 @@ struct VoiceCallView: View {
                     .foregroundStyle(.red.opacity(0.7))
                     .multilineTextAlignment(.center)
                     .padding(.horizontal, 32)
+            } else if let msg = viewModel.errorMessage, viewModel.callState == .listening {
+                // A turn that couldn't be sent — the call keeps listening.
+                Text(msg)
+                    .scaledFont(size: 13)
+                    .foregroundStyle(.orange.opacity(0.85))
+                    .lineLimit(3)
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal, 32)
+                    .transition(.opacity)
             }
         }
         .frame(minHeight: 40)
@@ -333,14 +355,8 @@ struct VoiceCallView: View {
 
             Spacer()
 
-            // Speaker toggle
-            compactControl(
-                icon: viewModel.isSpeakerOn ? "speaker.wave.3.fill" : "speaker.slash.fill",
-                isActive: viewModel.isSpeakerOn,
-                activeColor: .white.opacity(0.85)
-            ) {
-                viewModel.toggleSpeaker()
-            }
+            // Audio output — opens the native route picker (iPhone / Speaker / AirPods / CarPlay…)
+            audioRouteControl
 
             Spacer()
 
@@ -401,6 +417,33 @@ struct VoiceCallView: View {
         }
     }
 
+    // MARK: - Audio Route Control
+
+    /// Same look as the other controls, with an invisible system route picker
+    /// on top so a tap opens the native iPhone / Speaker / Bluetooth sheet.
+    private var audioRouteControl: some View {
+        let route = viewModel.outputRoute
+        let size: CGFloat = 48
+        return ZStack {
+            Circle()
+                .fill(route.isHighlighted ? Color.white.opacity(0.85) : .white.opacity(0.1))
+                .frame(width: size, height: size)
+                .overlay(
+                    Image(systemName: route.iconName)
+                        .scaledFont(size: size * 0.38, weight: .semibold)
+                        .foregroundStyle(route.isHighlighted ? .white : .white.opacity(0.8))
+                        .contentTransition(.symbolEffect(.replace))
+                )
+                .allowsHitTesting(false)
+                .accessibilityHidden(true)
+
+            AudioRoutePickerButton(accessibilityLabel: route.accessibilityLabel)
+                .frame(width: size, height: size)
+        }
+        .frame(width: size, height: size)
+        .animation(.easeInOut(duration: 0.2), value: route)
+    }
+
     // MARK: - Compact Control Button
 
     private func compactControl(
@@ -436,6 +479,31 @@ struct VoiceCallView: View {
             )
         }
         await viewModel.startCall()
+    }
+}
+
+// MARK: - Audio Route Picker
+
+/// Wraps `AVRoutePickerView` — the system audio output button. Its own glyph
+/// is made invisible so our styled circle shows through; taps still reach it
+/// and present the native route sheet (iPhone, Speaker, Bluetooth, CarPlay).
+struct AudioRoutePickerButton: UIViewRepresentable {
+    var accessibilityLabel: String
+
+    func makeUIView(context: Context) -> AVRoutePickerView {
+        let picker = AVRoutePickerView()
+        picker.prioritizesVideoDevices = false
+        picker.tintColor = .clear
+        picker.activeTintColor = .clear
+        picker.backgroundColor = .clear
+        picker.isAccessibilityElement = true
+        picker.accessibilityTraits = .button
+        picker.accessibilityHint = "Choose where call audio plays"
+        return picker
+    }
+
+    func updateUIView(_ picker: AVRoutePickerView, context: Context) {
+        picker.accessibilityLabel = accessibilityLabel
     }
 }
 

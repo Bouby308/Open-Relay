@@ -54,7 +54,7 @@ struct VoiceCallAdvancedView: View {
             } header: {
                 Text("Interrupting")
             } footer: {
-                Text("Interrupt time is how long you need to keep talking over the assistant before it stops, even if your words haven't been recognised yet. Strong echo protection helps when the assistant cuts itself off on a loud speaker. The call learns your speaker's echo automatically; reset it after changing rooms or speakers if interruptions misbehave.")
+                Text("Interrupt time is how long you need to keep talking over the assistant before it stops. Background noise, taps and coughs never interrupt. Strong echo protection helps when the assistant cuts itself off on a loud speaker. The call learns your speaker's echo automatically; reset it after changing rooms or speakers if interruptions misbehave.")
             }
             .disabled(!s.vadEnabled || !s.bargeInEnabled)
 

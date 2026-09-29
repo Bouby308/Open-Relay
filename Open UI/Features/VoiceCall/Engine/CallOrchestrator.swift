@@ -81,6 +81,8 @@ final class CallOrchestrator {
     var candidateStartedAt: Date?
     /// Recent mic frames for utterance engines (see `RecentFrames`).
     var recentFrames = RecentFrames()
+    /// Mic audio of the current user turn (see `TurnAudio`).
+    var turnAudio = TurnAudio()
 
     // MARK: - Outputs
 
@@ -113,7 +115,19 @@ final class CallOrchestrator {
 
     /// Engines that run MLX on the GPU (must not run while backgrounded).
     var usesGPUSTT: Bool { stt is MLXCallSTTEngine }
-    private(set) var usesGPUTTS: Bool
+    var usesGPUTTS: Bool { currentTTS is MLXCallTTSEngine }
+
+    /// The voice engine currently speaking replies.
+    private(set) var currentTTS: CallTTSEngine
+    /// What the current engines were built from (`CallEngineSelection`
+    /// signatures) — compared against the wanted selection to decide swaps.
+    var ttsSignature = ""
+    var sttSignature = ""
+    /// A listening engine waiting to take over at the next turn (swaps never
+    /// happen while a finished turn is still being transcribed).
+    var pendingSTT: (engine: CallSTTEngine, signature: String)?
+    /// Fired after the voice or listening engine was swapped.
+    var onEnginesChanged: (() -> Void)?
 
     init(
         stt: CallSTTEngine,
@@ -145,7 +159,7 @@ final class CallOrchestrator {
         self.bargeInEnabled = settings.bargeInEnabled && settings.vadEnabled
         self.diagnosticsEnabled = settings.diagnosticsEnabled
         self.chat = chat
-        self.usesGPUTTS = tts is MLXCallTTSEngine
+        self.currentTTS = tts
         self.speech = CallSpeechPipeline(player: player, engine: tts)
         speech.onStarted = { [weak self] in self?.speakingStarted() }
         speech.onFinished = { [weak self] in self?.speakingFinished() }
@@ -155,10 +169,13 @@ final class CallOrchestrator {
         }
     }
 
-    func replaceTTS(_ newTTS: CallTTSEngine) {
-        // Remaining sentences of a reply in progress continue on the new engine.
+    /// Swaps the voice. Unspoken sentences of a reply in progress continue
+    /// on the new engine, so the switch is heard at a sentence boundary.
+    func replaceTTS(_ newTTS: CallTTSEngine, signature: String) {
         speech.replaceEngine(newTTS)
-        usesGPUTTS = newTTS is MLXCallTTSEngine
+        currentTTS = newTTS
+        ttsSignature = signature
         logger.info("[call] TTS → \(newTTS.displayName, privacy: .public)")
+        onEnginesChanged?()
     }
 }

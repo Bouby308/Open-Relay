@@ -83,6 +83,7 @@ final class ServerConfigStore {
         KeychainService.shared.deleteToken(forServer: config.url)
         KeychainService.shared.deleteToken(forServer: "cached_user_\(config.url)")
         NativeSSOSettings.deleteRefreshTokens(for: config)
+        ClientCertificateStore.shared.delete(forServerURL: config.url)
         servers.removeAll(where: { $0.id == id })
         saveServers()
     }
@@ -93,6 +94,7 @@ final class ServerConfigStore {
             KeychainService.shared.deleteToken(forServer: server.url)
             KeychainService.shared.deleteToken(forServer: "cached_user_\(server.url)")
             NativeSSOSettings.deleteRefreshTokens(for: server)
+            ClientCertificateStore.shared.delete(forServerURL: server.url)
         }
         servers.removeAll()
         saveServers()

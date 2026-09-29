@@ -217,6 +217,14 @@ final class ActiveChatStore {
         accessOrder.append(conversationId)
     }
 
+    /// Embedded chats must not replace the ordinary new-chat draft.
+    func retain(_ viewModel: ChatViewModel, for conversationId: String) {
+        viewModels[conversationId] = viewModel
+        accessOrder.removeAll { $0 == conversationId }
+        accessOrder.append(conversationId)
+        evictIfNeeded()
+    }
+
     /// Removes all cached view models and model cache (e.g. on server switch or logout).
     func clear() {
         // Account/server change: web search consent must not carry over.
@@ -260,6 +268,13 @@ final class AppDependencyContainer: ServiceContainer {
 
     /// The notes manager for local note storage and server sync.
     private(set) var notesManager: NotesManager?
+
+    var noteDraftStore: NoteDraftStore? {
+        guard let apiClient, let user = authViewModel.currentUser,
+              authViewModel.phase == .authenticated else { return nil }
+        if let account = serverConfigStore.activeAccount, account.userId != user.id { return nil }
+        return NoteDraftStore(identity: .init(server: apiClient.baseURL, account: user.id))
+    }
 
     /// The folder manager for organising conversations into folders.
     private(set) var folderManager: FolderManager?

@@ -287,6 +287,8 @@ struct ServerConnectionView: View {
                                         .tint(theme.brandPrimary)
                                 }
 
+                                ClientCertificateAdvancedField(certificate: $viewModel.clientCertificate)
+
                                 // Custom Headers
                                 CustomHeadersEditor(entries: $viewModel.customHeaderEntries)
 

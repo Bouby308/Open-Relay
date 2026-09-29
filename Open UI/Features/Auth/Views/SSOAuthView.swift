@@ -260,6 +260,15 @@ struct SSOWebViewRepresentable: UIViewRepresentable {
         }
 
         // MARK: - WKNavigationDelegate
+        /// Presents the imported mTLS client certificate when the server (or its
+        /// reverse proxy) requests one. Server trust keeps the default handling.
+        func webView(
+            _ webView: WKWebView,
+            respondTo challenge: URLAuthenticationChallenge
+        ) async -> (URLSession.AuthChallengeDisposition, URLCredential?) {
+            TLSChallengeHandler.resolveClientCertificateOnly(challenge)
+        }
+
 
         func webView(
             _ webView: WKWebView,

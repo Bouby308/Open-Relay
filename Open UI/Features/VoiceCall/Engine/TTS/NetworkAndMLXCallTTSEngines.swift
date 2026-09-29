@@ -80,14 +80,76 @@ final class ServerCallTTSEngine: CallTTSEngine {
     }
 }
 
+/// Server voice with the system voice as a per-sentence safety net: a
+/// sentence the server can't deliver (network drop, timeout) is spoken by the
+/// system voice instead of being skipped. Used while the app is backgrounded
+/// in place of an on-device voice.
+@MainActor
+final class FallbackCallTTSEngine: CallTTSEngine {
+    private let primary: CallTTSEngine
+    private let backup: CallTTSEngine
+    var displayName: String { primary.displayName }
+
+    init(primary: CallTTSEngine, backup: CallTTSEngine) {
+        self.primary = primary
+        self.backup = backup
+    }
+
+    func prepare() async -> Bool {
+        let ok = await primary.prepare()
+        _ = await backup.prepare()
+        return ok
+    }
+
+    func synthesize(_ sentence: String) -> AsyncThrowingStream<CallTTSChunk, Error> {
+        let primary = primary, backup = backup
+        return AsyncThrowingStream { continuation in
+            let task = Task { @MainActor in
+                var produced = false
+                do {
+                    for try await chunk in primary.synthesize(sentence) {
+                        produced = true
+                        continuation.yield(chunk)
+                    }
+                    continuation.finish()
+                    return
+                } catch {
+                    // Audio already played for this sentence: don't repeat it.
+                    if produced || Task.isCancelled { continuation.finish(); return }
+                }
+                do {
+                    for try await chunk in backup.synthesize(sentence) { continuation.yield(chunk) }
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
+    }
+
+    func shutdown() {
+        primary.shutdown()
+        backup.shutdown()
+    }
+}
+
 /// On-device Kokoro / Qwen3 via the shared `OnDeviceTTSService` model.
 @MainActor
 final class MLXCallTTSEngine: CallTTSEngine {
     private let service: OnDeviceTTSService
     var displayName: String { service.config.activeModel.displayName }
+    var model: OnDeviceTTSModel { service.config.activeModel }
 
     init(service: OnDeviceTTSService) {
         self.service = service
+    }
+
+    /// Voice / speed / language changes for the loaded model — applied to
+    /// the next sentence without reloading the model.
+    func updateVoice(from config: OnDeviceTTSConfig) {
+        guard config.activeModel == service.config.activeModel else { return }
+        service.config = config
     }
 
     func prepare() async -> Bool {
@@ -100,12 +162,19 @@ final class MLXCallTTSEngine: CallTTSEngine {
     }
 
     func synthesize(_ sentence: String) -> AsyncThrowingStream<CallTTSChunk, Error> {
-        let rate = service.callOutputSampleRate ?? 24_000
-        let source = service.synthesizeForCall(sentence)
+        let service = service
         return AsyncThrowingStream { continuation in
-            let task = Task {
+            let task = Task { @MainActor in
                 do {
-                    for try await samples in source {
+                    // In the background the GPU is off-limits. Wait instead of
+                    // failing: the call swaps this engine out (cancelling the
+                    // wait and re-queueing the sentence on the new engine), or
+                    // the app returns to the foreground and it simply continues.
+                    while !MLXCallLock.gpuAllowed {
+                        try await Task.sleep(for: .milliseconds(50))
+                    }
+                    let rate = service.callOutputSampleRate ?? 24_000
+                    for try await samples in service.synthesizeForCall(sentence) {
                         continuation.yield(CallTTSChunk(samples: samples, sampleRate: rate))
                     }
                     continuation.finish()

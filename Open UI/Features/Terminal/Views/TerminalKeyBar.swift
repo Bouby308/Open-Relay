@@ -4,19 +4,24 @@ import SwiftTerm
 /// Keyboard accessory row for the terminal: modifiers, arrows and the
 /// symbols that are awkward to reach on the iOS keyboard.
 ///
+/// Keys are plain views (not `UIControl`s). One tap recognizer and one
+/// long-press recognizer on the scroll view decide which key was hit, so a
+/// horizontal swipe always scrolls the bar instead of pressing a key.
+///
 /// - `ctrl` / `alt` are sticky for the next key (tap again to cancel) and
 ///   drive SwiftTerm's own modifier state so typed letters are translated.
 /// - Arrow keys honour application-cursor mode (vim, less, tmux…) and repeat
 ///   while held.
-final class TerminalKeyBar: UIInputView, UIInputViewAudioFeedback {
+final class TerminalKeyBar: UIInputView, UIInputViewAudioFeedback, UIGestureRecognizerDelegate {
 
     weak var terminalView: TerminalView?
     var onPaste: (() -> Void)?
 
     private let scrollView = KeyBarScrollView()
     private let stack = UIStackView()
-    private var ctrlButton: UIButton?
-    private var altButton: UIButton?
+    private var keyViews: [KeyCapView] = []
+    private var ctrlKey: KeyCapView?
+    private var altKey: KeyCapView?
     private var repeatTimer: Timer?
     private var observers: [NSObjectProtocol] = []
 
@@ -28,7 +33,7 @@ final class TerminalKeyBar: UIInputView, UIInputViewAudioFeedback {
         case ctrl, alt
     }
 
-    enum KeyAction { case bytes([UInt8]), arrowUp, arrowDown, arrowLeft, arrowRight, paste, dismiss }
+    enum KeyAction { case bytes([UInt8]), arrowUp, arrowDown, arrowLeft, arrowRight, paste, dismiss, ctrl, alt }
 
     init(terminalView: TerminalView) {
         self.terminalView = terminalView
@@ -38,10 +43,10 @@ final class TerminalKeyBar: UIInputView, UIInputViewAudioFeedback {
         translatesAutoresizingMaskIntoConstraints = false
         build()
         observers.append(NotificationCenter.default.addObserver(forName: .terminalViewControlModifierReset, object: terminalView, queue: .main) { [weak self] _ in
-            MainActor.assumeIsolated { self?.updateModifierButtons() }
+            MainActor.assumeIsolated { self?.updateModifierKeys() }
         })
         observers.append(NotificationCenter.default.addObserver(forName: .terminalViewMetaModifierReset, object: terminalView, queue: .main) { [weak self] _ in
-            MainActor.assumeIsolated { self?.updateModifierButtons() }
+            MainActor.assumeIsolated { self?.updateModifierKeys() }
         })
     }
 
@@ -82,20 +87,18 @@ final class TerminalKeyBar: UIInputView, UIInputViewAudioFeedback {
         scrollView.showsHorizontalScrollIndicator = false
         scrollView.alwaysBounceHorizontal = true
         scrollView.translatesAutoresizingMaskIntoConstraints = false
-        // Keys respond instantly, but a horizontal drag that starts on a key
-        // still scrolls the bar (see KeyBarScrollView).
-        scrollView.delaysContentTouches = false
-        scrollView.canCancelContentTouches = true
-        scrollView.onBeginScroll = { [weak self] in self?.endRepeat() }
+        scrollView.onBeginScroll = { [weak self] in self?.cancelPress() }
         addSubview(scrollView)
 
         stack.axis = .horizontal
         stack.spacing = 6
         stack.alignment = .center
         stack.translatesAutoresizingMaskIntoConstraints = false
+        stack.isUserInteractionEnabled = false // touches are resolved by the recognizers below
         scrollView.addSubview(stack)
 
-        let dismiss = makeButton(title: nil, symbol: "keyboard.chevron.compact.down", accessibility: "Hide Keyboard")
+        let dismiss = UIButton(configuration: Self.dismissConfiguration())
+        dismiss.accessibilityLabel = "Hide Keyboard"
         dismiss.addAction(UIAction { [weak self] _ in self?.perform(.dismiss) }, for: .touchUpInside)
         dismiss.translatesAutoresizingMaskIntoConstraints = false
         addSubview(dismiss)
@@ -116,6 +119,7 @@ final class TerminalKeyBar: UIInputView, UIInputViewAudioFeedback {
             divider.trailingAnchor.constraint(equalTo: dismiss.leadingAnchor, constant: -4),
             dismiss.trailingAnchor.constraint(equalTo: safeAreaLayoutGuide.trailingAnchor, constant: -8),
             dismiss.centerYAnchor.constraint(equalTo: centerYAnchor),
+            dismiss.heightAnchor.constraint(equalToConstant: 32),
 
             stack.leadingAnchor.constraint(equalTo: scrollView.contentLayoutGuide.leadingAnchor, constant: 8),
             stack.trailingAnchor.constraint(equalTo: scrollView.contentLayoutGuide.trailingAnchor, constant: -8),
@@ -125,33 +129,128 @@ final class TerminalKeyBar: UIInputView, UIInputViewAudioFeedback {
         ])
 
         for key in keys {
+            let view: KeyCapView
             switch key {
             case .text(let title, let send):
-                let button = makeButton(title: title, symbol: nil, accessibility: accessibilityName(title))
-                button.addAction(UIAction { [weak self] _ in self?.perform(.bytes(Array(send.utf8))) }, for: .touchUpInside)
-                stack.addArrangedSubview(button)
+                view = KeyCapView(title: title, symbol: nil, action: .bytes(Array(send.utf8)))
+                view.accessibilityLabel = accessibilityName(title)
             case .symbol(let symbol, let label, let action):
-                let button = makeButton(title: nil, symbol: symbol, accessibility: label)
+                view = KeyCapView(title: nil, symbol: symbol, action: action)
+                view.accessibilityLabel = label
                 switch action {
-                case .arrowUp, .arrowDown, .arrowLeft, .arrowRight:
-                    button.addAction(UIAction { [weak self] _ in self?.beginRepeat(action) }, for: .touchDown)
-                    button.addAction(UIAction { [weak self] _ in self?.endRepeat() }, for: [.touchUpInside, .touchUpOutside, .touchCancel, .touchDragExit])
-                default:
-                    button.addAction(UIAction { [weak self] _ in self?.perform(action) }, for: .touchUpInside)
+                case .arrowUp, .arrowDown, .arrowLeft, .arrowRight: view.repeats = true
+                default: break
                 }
-                stack.addArrangedSubview(button)
             case .ctrl:
-                let button = makeButton(title: "ctrl", symbol: nil, accessibility: "Control")
-                button.addAction(UIAction { [weak self] _ in self?.toggleCtrl() }, for: .touchUpInside)
-                ctrlButton = button
-                stack.addArrangedSubview(button)
+                view = KeyCapView(title: "ctrl", symbol: nil, action: .ctrl)
+                view.accessibilityLabel = "Control"
+                ctrlKey = view
             case .alt:
-                let button = makeButton(title: "alt", symbol: nil, accessibility: "Option")
-                button.addAction(UIAction { [weak self] _ in self?.toggleAlt() }, for: .touchUpInside)
-                altButton = button
-                stack.addArrangedSubview(button)
+                view = KeyCapView(title: "alt", symbol: nil, action: .alt)
+                view.accessibilityLabel = "Option"
+                altKey = view
+            }
+            view.onAccessibilityActivate = { [weak self] action in self?.fire(action) }
+            keyViews.append(view)
+            stack.addArrangedSubview(view)
+        }
+
+        // Touch-down highlight + tap + hold-to-repeat, all yielding to scrolling.
+        let press = UILongPressGestureRecognizer(target: self, action: #selector(handlePress(_:)))
+        press.minimumPressDuration = 0
+        press.allowableMovement = 10
+        press.cancelsTouchesInView = false
+        press.delegate = self
+        scrollView.addGestureRecognizer(press)
+        scrollView.panGestureRecognizer.addTarget(self, action: #selector(handlePan(_:)))
+    }
+
+    // MARK: Touch handling
+
+    private var pressedKey: KeyCapView?
+    private var pressStart: Date?
+    private var didRepeat = false
+    private var holdTimer: Timer?
+
+    func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer,
+                           shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer) -> Bool { true }
+
+    private func key(at recognizer: UIGestureRecognizer) -> KeyCapView? {
+        let point = recognizer.location(in: stack)
+        // Generous hit area: nearest key horizontally within its slot.
+        return keyViews.first { $0.frame.insetBy(dx: -3, dy: -8).contains(point) }
+    }
+
+    @objc private func handlePress(_ recognizer: UILongPressGestureRecognizer) {
+        switch recognizer.state {
+        case .began:
+            guard let key = key(at: recognizer) else { return }
+            pressedKey = key
+            key.isPressed = true
+            didRepeat = false
+            if key.repeats {
+                holdTimer?.invalidate()
+                let timer = Timer(timeInterval: 0.35, repeats: false) { [weak self] _ in
+                    MainActor.assumeIsolated { self?.startRepeating() }
+                }
+                RunLoop.main.add(timer, forMode: .common)
+                holdTimer = timer
+            }
+        case .ended:
+            guard let key = pressedKey else { return }
+            let repeated = didRepeat
+            cancelPress()
+            if !repeated { fire(key.action) }
+        case .cancelled, .failed:
+            cancelPress()
+        default:
+            break
+        }
+    }
+
+    @objc private func handlePan(_ recognizer: UIPanGestureRecognizer) {
+        if recognizer.state == .began || recognizer.state == .changed { cancelPress() }
+    }
+
+    private func startRepeating() {
+        guard let key = pressedKey else { return }
+        didRepeat = true
+        fire(key.action)
+        endRepeat()
+        let timer = Timer(timeInterval: 0.07, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self, let key = self.pressedKey else { return }
+                self.perform(key.action, click: false)
             }
         }
+        RunLoop.main.add(timer, forMode: .common)
+        repeatTimer = timer
+    }
+
+    private func cancelPress() {
+        holdTimer?.invalidate(); holdTimer = nil
+        endRepeat()
+        pressedKey?.isPressed = false
+        pressedKey = nil
+    }
+
+    private func fire(_ action: KeyAction) {
+        switch action {
+        case .ctrl: toggleCtrl()
+        case .alt: toggleAlt()
+        default: perform(action)
+        }
+    }
+
+    private static func dismissConfiguration() -> UIButton.Configuration {
+        var config = UIButton.Configuration.filled()
+        config.baseBackgroundColor = UIColor.secondarySystemFill
+        config.baseForegroundColor = UIColor.label
+        config.cornerStyle = .medium
+        config.contentInsets = NSDirectionalEdgeInsets(top: 6, leading: 11, bottom: 6, trailing: 11)
+        config.image = UIImage(systemName: "keyboard.chevron.compact.down",
+                               withConfiguration: UIImage.SymbolConfiguration(pointSize: 13, weight: .semibold))
+        return config
     }
 
     private func accessibilityName(_ title: String) -> String {
@@ -169,67 +268,25 @@ final class TerminalKeyBar: UIInputView, UIInputViewAudioFeedback {
         }
     }
 
-    private func makeButton(title: String?, symbol: String?, accessibility: String) -> UIButton {
-        var config = UIButton.Configuration.filled()
-        config.baseBackgroundColor = UIColor.secondarySystemFill
-        config.baseForegroundColor = UIColor.label
-        config.cornerStyle = .medium
-        config.contentInsets = NSDirectionalEdgeInsets(top: 6, leading: title.map { $0.count > 2 ? 10 : 12 } ?? 11,
-                                                        bottom: 6, trailing: title.map { $0.count > 2 ? 10 : 12 } ?? 11)
-        if let title {
-            var attributes = AttributeContainer()
-            attributes.font = UIFont.monospacedSystemFont(ofSize: 14, weight: .medium)
-            config.attributedTitle = AttributedString(title, attributes: attributes)
-        }
-        if let symbol {
-            config.image = UIImage(systemName: symbol,
-                                   withConfiguration: UIImage.SymbolConfiguration(pointSize: 13, weight: .semibold))
-        }
-        let button = UIButton(configuration: config)
-        button.accessibilityLabel = accessibility
-        button.heightAnchor.constraint(equalToConstant: 32).isActive = true
-        button.widthAnchor.constraint(greaterThanOrEqualToConstant: 36).isActive = true
-        button.configurationUpdateHandler = { [weak self] button in
-            guard var config = button.configuration else { return }
-            let active = (button === self?.ctrlButton && self?.terminalView?.controlModifier == true)
-                || (button === self?.altButton && self?.terminalView?.metaModifier == true)
-            config.baseBackgroundColor = active ? button.tintColor : (button.isHighlighted ? UIColor.tertiarySystemFill : UIColor.secondarySystemFill)
-            config.baseForegroundColor = active ? .white : .label
-            button.configuration = config
-        }
-        return button
-    }
-
     // MARK: Actions
 
     private func toggleCtrl() {
         guard let terminalView else { return }
         terminalView.controlModifier.toggle()
         UIDevice.current.playInputClick()
-        updateModifierButtons()
+        updateModifierKeys()
     }
 
     private func toggleAlt() {
         guard let terminalView else { return }
         terminalView.metaModifier.toggle()
         UIDevice.current.playInputClick()
-        updateModifierButtons()
+        updateModifierKeys()
     }
 
-    private func updateModifierButtons() {
-        ctrlButton?.setNeedsUpdateConfiguration()
-        altButton?.setNeedsUpdateConfiguration()
-    }
-
-    private func beginRepeat(_ action: KeyAction) {
-        perform(action)
-        repeatTimer?.invalidate()
-        let timer = Timer(timeInterval: 0.08, repeats: true) { [weak self] _ in
-            MainActor.assumeIsolated { self?.perform(action, click: false) }
-        }
-        timer.fireDate = Date().addingTimeInterval(0.45)
-        RunLoop.main.add(timer, forMode: .common)
-        repeatTimer = timer
+    private func updateModifierKeys() {
+        ctrlKey?.isLatched = terminalView?.controlModifier == true
+        altKey?.isLatched = terminalView?.metaModifier == true
     }
 
     private func endRepeat() {
@@ -259,11 +316,81 @@ final class TerminalKeyBar: UIInputView, UIInputViewAudioFeedback {
         case .arrowLeft: terminalView.send(data: (app ? EscapeSequences.moveLeftApp : EscapeSequences.moveLeftNormal)[...])
         case .arrowRight: terminalView.send(data: (app ? EscapeSequences.moveRightApp : EscapeSequences.moveRightNormal)[...])
         case .paste: onPaste?()
+        case .ctrl: toggleCtrl(); return
+        case .alt: toggleAlt(); return
         case .dismiss:
             endRepeat()
             _ = terminalView.resignFirstResponder()
         }
-        updateModifierButtons()
+        updateModifierKeys()
+    }
+}
+
+/// A single key on the bar. Purely visual — touches are handled by the bar.
+final class KeyCapView: UIView {
+    let action: TerminalKeyBar.KeyAction
+    var repeats = false
+    var onAccessibilityActivate: ((TerminalKeyBar.KeyAction) -> Void)?
+    private let label = UILabel()
+    private let imageView = UIImageView()
+
+    var isPressed = false { didSet { updateAppearance() } }
+    var isLatched = false { didSet { updateAppearance() } }
+
+    init(title: String?, symbol: String?, action: TerminalKeyBar.KeyAction) {
+        self.action = action
+        super.init(frame: .zero)
+        layer.cornerRadius = 8
+        layer.cornerCurve = .continuous
+        isAccessibilityElement = true
+        accessibilityTraits = .keyboardKey
+        translatesAutoresizingMaskIntoConstraints = false
+
+        let content: UIView
+        if let title {
+            label.text = title
+            label.font = UIFont.monospacedSystemFont(ofSize: 14, weight: .medium)
+            label.textAlignment = .center
+            content = label
+        } else {
+            imageView.image = UIImage(systemName: symbol ?? "questionmark",
+                                      withConfiguration: UIImage.SymbolConfiguration(pointSize: 13, weight: .semibold))
+            imageView.contentMode = .center
+            content = imageView
+        }
+        content.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(content)
+        let padding: CGFloat = (title?.count ?? 0) > 2 ? 10 : 12
+        NSLayoutConstraint.activate([
+            heightAnchor.constraint(equalToConstant: 32),
+            widthAnchor.constraint(greaterThanOrEqualToConstant: 36),
+            content.leadingAnchor.constraint(equalTo: leadingAnchor, constant: title == nil ? 11 : padding),
+            content.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -(title == nil ? 11 : padding)),
+            content.centerYAnchor.constraint(equalTo: centerYAnchor)
+        ])
+        updateAppearance()
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    override func tintColorDidChange() {
+        super.tintColorDidChange()
+        updateAppearance()
+    }
+
+    override func accessibilityActivate() -> Bool {
+        onAccessibilityActivate?(action)
+        return true
+    }
+
+    private func updateAppearance() {
+        let background: UIColor = isLatched ? tintColor : (isPressed ? .tertiarySystemFill : .secondarySystemFill)
+        let foreground: UIColor = isLatched ? .white : .label
+        backgroundColor = background
+        label.textColor = foreground
+        imageView.tintColor = foreground
+        transform = isPressed ? CGAffineTransform(scaleX: 0.94, y: 0.94) : .identity
+        accessibilityTraits = isLatched ? [.keyboardKey, .selected] : .keyboardKey
     }
 }
 

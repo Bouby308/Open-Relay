@@ -75,7 +75,7 @@ enum CallEngineFactory {
     /// choices from Read Aloud but never mutates the read-aloud service, and
     /// the app's background unload (which targets the read-aloud instance)
     /// can't pull the model out from under an active call.
-    private static func makeCallTTSService(
+    static func makeCallTTSService(
         _ model: OnDeviceTTSModel,
         from ttsService: TextToSpeechService
     ) -> OnDeviceTTSService {
@@ -92,5 +92,72 @@ enum CallEngineFactory {
         let rate = UserDefaults.standard.double(forKey: "ttsSpeechRate")
         return SystemCallTTSEngine(voiceIdentifier: voiceId.isEmpty ? nil : voiceId,
                                    rateMultiplier: rate > 0 ? rate : 1)
+    }
+
+    // MARK: - From a selection (mid-call swaps)
+
+    /// Whether a built voice engine is the kind `voice` asked for.
+    static func matches(_ engine: CallTTSEngine, _ voice: CallEngineSelection.Voice) -> Bool {
+        switch voice {
+        case .onDevice(let model): return (engine as? MLXCallTTSEngine)?.model == model
+        case .server:              return engine is ServerCallTTSEngine
+        case .serverFallback:      return engine is FallbackCallTTSEngine
+        case .system:              return engine is SystemCallTTSEngine
+        }
+    }
+
+    /// Whether a built listening engine is the kind `listening` asked for.
+    static func matches(_ engine: CallSTTEngine, _ listening: CallEngineSelection.Listening) -> Bool {
+        switch listening {
+        case .apple:               return !(engine is ServerCallSTTEngine) && !(engine is MLXCallSTTEngine)
+        case .server:              return engine is ServerCallSTTEngine
+        case .onDevice(let v):     return (engine as? MLXCallSTTEngine)?.variant == v
+        }
+    }
+
+    /// Builds the voice for `selection`. Returns nil if it can't start (the
+    /// caller keeps the current engine).
+    static func makeTTS(
+        for selection: CallEngineSelection,
+        apiClient: APIClient?,
+        ttsService: TextToSpeechService
+    ) async -> CallTTSEngine? {
+        let engine: CallTTSEngine
+        switch selection.voice {
+        case .onDevice(let model):
+            guard ttsService.isKokoroAvailable else { return nil }
+            engine = MLXCallTTSEngine(service: makeCallTTSService(model, from: ttsService))
+        case .server:
+            guard let apiClient else { return nil }
+            engine = ServerCallTTSEngine(apiClient: apiClient, voice: ttsService.serverVoiceId,
+                                         model: ttsService.serverModel)
+        case .serverFallback:
+            guard let apiClient else { return makeSystemTTS() }
+            engine = FallbackCallTTSEngine(
+                primary: ServerCallTTSEngine(apiClient: apiClient, voice: ttsService.serverVoiceId,
+                                             model: ttsService.serverModel),
+                backup: makeSystemTTS()
+            )
+        case .system:
+            engine = makeSystemTTS()
+        }
+        guard await engine.prepare() else { engine.shutdown(); return nil }
+        return engine
+    }
+
+    /// Builds the listening engine for `selection` (nil if it can't start).
+    static func makeSTT(for selection: CallEngineSelection, apiClient: APIClient?) async -> CallSTTEngine? {
+        switch selection.listening {
+        case .apple:
+            return await makeAppleSTT()
+        case .server:
+            guard let apiClient else { return nil }
+            let engine = ServerCallSTTEngine(apiClient: apiClient)
+            return await engine.prepare() ? engine : nil
+        case .onDevice(let variant):
+            let engine = MLXCallSTTEngine(variant: variant)
+            guard await engine.prepare() else { engine.shutdown(); return nil }
+            return engine
+        }
     }
 }

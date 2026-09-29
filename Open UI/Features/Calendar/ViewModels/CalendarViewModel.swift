@@ -37,6 +37,7 @@ final class CalendarViewModel {
     private let calendarScope: String?
     private let calendarUserId: String?
     var isManagingCalendars = false
+    var respondingEventIds: Set<String> = []
 
     // MARK: - State
 
@@ -196,6 +197,32 @@ final class CalendarViewModel {
             events.removeAll { $0.id == event.id && $0.instanceId == event.instanceId }
         } catch {
             errorMessage = error.localizedDescription
+        }
+    }
+
+    // MARK: - RSVP
+
+    func respondToEvent(_ event: CalendarEvent, userId: String, response: CalendarRSVP) async throws {
+        guard !respondingEventIds.contains(event.id), !event.isCancelled,
+              !event.isAutomationEvent, !event.isRunEvent,
+              event.attendees.contains(where: { $0.userId == userId }),
+              calendarScope != nil, calendarScope == apiClient.network.conversationCacheScope else {
+            throw APIError.cancelled
+        }
+        respondingEventIds.insert(event.id)
+        defer { respondingEventIds.remove(event.id) }
+        // An RSVP belongs to the series, not its expanded occurrence ID.
+        try await apiClient.respondToCalendarEvent(id: event.id, response: response)
+        try Task.checkCancellation()
+        guard calendarScope == apiClient.network.conversationCacheScope else { throw APIError.cancelled }
+        for index in events.indices where events[index].id == event.id {
+            for attendee in events[index].attendees.indices where events[index].attendees[attendee].userId == userId {
+                events[index].attendees[attendee].status = response.rawValue
+            }
+        }
+        if selectedEvent?.id == event.id,
+           let index = selectedEvent?.attendees.firstIndex(where: { $0.userId == userId }) {
+            selectedEvent?.attendees[index].status = response.rawValue
         }
     }
 

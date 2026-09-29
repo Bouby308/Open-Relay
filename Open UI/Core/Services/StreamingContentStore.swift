@@ -1,6 +1,80 @@
 import Foundation
 import SwiftUI
 
+/// Estimates a delivery rate in characters per second from irregular arrivals.
+///
+/// Each arrival adds its characters to an exponentially decayed sum (about a
+/// 0.6s window). Uneven packet sizes and spacing then average out, where a
+/// per-packet estimate jumps with every burst. The first arrival only starts the
+/// clock: its characters built up before the stream was observed, and counting
+/// them would inflate the early estimate.
+struct ArrivalRateEstimator {
+    private static let window = 0.6
+    private var decayed = 0.0
+    private var firstTime: Double?
+    private var lastTime: Double?
+
+    mutating func record(_ characters: Int, now: Double) {
+        guard characters > 0 else { return }
+        guard let lastTime else {
+            firstTime = now
+            self.lastTime = now
+            return
+        }
+        decayed = decayed * exp(-max(0, now - lastTime) / Self.window) + Double(characters)
+        self.lastTime = now
+    }
+
+    /// Characters per second, or nil until there is enough to measure.
+    func rate(now: Double) -> Double? {
+        guard let firstTime, let lastTime, decayed > 0 else { return nil }
+        let span = now - firstTime
+        guard span > 0.05 else { return nil }
+        let current = decayed * exp(-max(0, now - lastTime) / Self.window)
+        // Early on the window has not filled yet; scale up for the covered part.
+        let coverage = 1 - exp(-span / Self.window)
+        return current / (Self.window * coverage)
+    }
+}
+
+/// Measures how fast the server is delivering the reply that is streaming now.
+///
+/// Typewriters read this instead of estimating speed from the updates they
+/// receive. Those arrive in parse-sized batches, and a text section that appears
+/// partway through a reply would otherwise start from a guess. Deliberately not
+/// observable: reading it never causes a view update.
+@MainActor
+final class StreamRateMeter {
+    private var estimator = ArrivalRateEstimator()
+    private var lastBytes = 0
+
+    func reset(existingContent: String = "") {
+        estimator = ArrivalRateEstimator()
+        lastBytes = existingContent.utf8.count
+    }
+
+    func record(_ content: String, now: Double = ProcessInfo.processInfo.systemUptime) {
+        let bytes = content.utf8.count
+        guard bytes > lastBytes else {
+            lastBytes = bytes
+            return
+        }
+        // Count characters in the appended bytes only: O(new text), not O(reply).
+        let added = String(decoding: content.utf8.suffix(bytes - lastBytes), as: UTF8.self).count
+        lastBytes = bytes
+        estimator.record(added, now: now)
+    }
+
+    func rate(now: Double = ProcessInfo.processInfo.systemUptime) -> Double? {
+        estimator.rate(now: now)
+    }
+}
+
+extension EnvironmentValues {
+    /// Delivery rate of the reply being streamed, for typewriters in that reply.
+    @Entry var streamRateMeter: StreamRateMeter? = nil
+}
+
 /// Publishes off-main streaming analysis to the view layer.
 @MainActor @Observable
 final class StreamingContentStore {
@@ -14,6 +88,8 @@ final class StreamingContentStore {
     var isActive = false
     var isFinishing: Bool { isActive && updates == nil }
     var streamingModelId: String?
+    /// How fast the current reply is arriving. Not observed.
+    @ObservationIgnored let rateMeter = StreamRateMeter()
 
     private struct Update: Sendable {
         let content: String
@@ -51,6 +127,7 @@ final class StreamingContentStore {
         streamingError = nil
         isActive = true
         rawServerContent = existingContent
+        rateMeter.reset(existingContent: existingContent)
 
         let pipeline = StreamingPipeline { [weak self] snapshot in
             guard let self, self.generation == currentGeneration else { return }
@@ -76,6 +153,7 @@ final class StreamingContentStore {
     func updateContent(_ content: String) {
         guard let updates else { return }
         rawServerContent = content
+        rateMeter.record(content)
         updates.yield(Update(content: content, isFinal: false))
     }
 

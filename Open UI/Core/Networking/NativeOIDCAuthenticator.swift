@@ -171,7 +171,7 @@ final class NativeOIDCAuthenticator {
 
     /// Interactive sign-in through the system browser.
     func signIn(issuerURL: String, clientID: String) async throws -> NativeSSOSession {
-        let metadata = try await Self.fetchDiscovery(issuer: issuerURL, allowSelfSigned: server.allowSelfSignedCertificates)
+        let metadata = try await Self.fetchDiscovery(issuer: issuerURL, allowSelfSigned: server.allowSelfSignedCertificates, clientCertificateServerURL: server.url)
 
         let verifier = Self.randomBase64URL(bytes: 32)
         let state = Self.randomBase64URL(bytes: 32)
@@ -202,7 +202,7 @@ final class NativeOIDCAuthenticator {
     /// Open WebUI exchange. The input refresh token is echoed back when the IdP
     /// doesn't rotate it, so the caller can always overwrite its stored value.
     func renew(issuerURL: String, clientID: String, refreshToken: String) async throws -> NativeSSOSession {
-        let metadata = try await Self.fetchDiscovery(issuer: issuerURL, allowSelfSigned: server.allowSelfSignedCertificates)
+        let metadata = try await Self.fetchDiscovery(issuer: issuerURL, allowSelfSigned: server.allowSelfSignedCertificates, clientCertificateServerURL: server.url)
         let tokens = try await tokenRequest(endpoint: metadata.tokenEndpoint, form: [
             ("grant_type", "refresh_token"),
             ("refresh_token", refreshToken),
@@ -242,6 +242,7 @@ final class NativeOIDCAuthenticator {
                 request,
                 trustHosts: [serverHost],
                 allowSelfSigned: server.allowSelfSignedCertificates,
+                clientCertificateServerURL: server.url,
                 followRedirects: false
             ),
                   [301, 302, 303, 307, 308].contains(response.statusCode),
@@ -257,19 +258,19 @@ final class NativeOIDCAuthenticator {
             break
         }
         guard let landing else { return nil }
-        let issuer = await Self.probeDiscovery(from: landing, allowSelfSigned: server.allowSelfSignedCertificates)
+        let issuer = await Self.probeDiscovery(from: landing, allowSelfSigned: server.allowSelfSignedCertificates, clientCertificateServerURL: server.url)
         logger.info("Native SSO: issuer detection \(issuer == nil ? "failed" : "succeeded", privacy: .public)")
         return issuer
     }
 
-    private static func probeDiscovery(from url: URL, allowSelfSigned: Bool) async -> String? {
+    private static func probeDiscovery(from url: URL, allowSelfSigned: Bool, clientCertificateServerURL: String?) async -> String? {
         guard let scheme = url.scheme, let host = url.host else { return nil }
         let port = url.port.map { ":\($0)" } ?? ""
         let segments = url.path.split(separator: "/").map(String.init)
         for depth in stride(from: min(segments.count, 6), through: 0, by: -1) {
             let prefix = segments.prefix(depth).map { "/\($0)" }.joined()
             let candidate = "\(scheme)://\(host)\(port)\(prefix)"
-            if let metadata = try? await fetchDiscovery(issuer: candidate, allowSelfSigned: allowSelfSigned) {
+            if let metadata = try? await fetchDiscovery(issuer: candidate, allowSelfSigned: allowSelfSigned, clientCertificateServerURL: clientCertificateServerURL) {
                 if let declared = metadata.issuer?.trimmingCharacters(in: .whitespacesAndNewlines), !declared.isEmpty {
                     return declared
                 }
@@ -293,7 +294,7 @@ final class NativeOIDCAuthenticator {
         }
     }
 
-    private static func fetchDiscovery(issuer: String, allowSelfSigned: Bool) async throws -> OIDCMetadata {
+    private static func fetchDiscovery(issuer: String, allowSelfSigned: Bool, clientCertificateServerURL: String?) async throws -> OIDCMetadata {
         let trimmed = issuer.trimmingCharacters(in: .whitespacesAndNewlines)
         guard var components = URLComponents(string: trimmed),
               let scheme = components.scheme?.lowercased(), scheme == "https" || scheme == "http",
@@ -309,7 +310,7 @@ final class NativeOIDCAuthenticator {
 
         var request = URLRequest(url: url, timeoutInterval: 15)
         request.setValue("application/json", forHTTPHeaderField: "Accept")
-        let (data, response) = try await send(request, trustHosts: [host], allowSelfSigned: allowSelfSigned)
+        let (data, response) = try await send(request, trustHosts: [host], allowSelfSigned: allowSelfSigned, clientCertificateServerURL: clientCertificateServerURL)
         guard response.statusCode == 200 else {
             throw NativeOIDCAuthError.discoveryFailed(statusCode: response.statusCode)
         }
@@ -409,7 +410,7 @@ final class NativeOIDCAuthenticator {
         request.setValue("application/json", forHTTPHeaderField: "Accept")
         request.httpBody = Data(Self.formEncode(form).utf8)
 
-        let (data, response) = try await Self.send(request, trustHosts: [host], allowSelfSigned: server.allowSelfSignedCertificates)
+        let (data, response) = try await Self.send(request, trustHosts: [host], allowSelfSigned: server.allowSelfSignedCertificates, clientCertificateServerURL: server.url)
         let wire = try? JSONDecoder().decode(TokenWire.self, from: data)
         guard response.statusCode == 200, let access = wire?.access_token, !access.isEmpty else {
             throw NativeOIDCAuthError.tokenRequestFailed(
@@ -475,6 +476,7 @@ final class NativeOIDCAuthenticator {
         _ request: URLRequest,
         trustHosts: Set<String>,
         allowSelfSigned: Bool,
+        clientCertificateServerURL: String? = nil,
         followRedirects: Bool = true
     ) async throws -> (Data, HTTPURLResponse) {
         let configuration = URLSessionConfiguration.ephemeral
@@ -482,6 +484,7 @@ final class NativeOIDCAuthenticator {
         configuration.urlCache = nil
         let delegate = IdPSessionDelegate(
             trustHosts: allowSelfSigned ? trustHosts : [],
+            clientCertificateServerURL: clientCertificateServerURL,
             followRedirects: followRedirects
         )
         let session = URLSession(configuration: configuration, delegate: delegate, delegateQueue: nil)
@@ -562,10 +565,14 @@ final class WebAuthPresentationAnchorProvider: NSObject, ASWebAuthenticationPres
 
 private nonisolated final class IdPSessionDelegate: NSObject, URLSessionTaskDelegate, Sendable {
     let trustHosts: Set<String>
+    /// Open WebUI server whose imported mTLS client certificate may also be presented
+    /// to the identity provider (commonly behind the same client-cert proxy).
+    let clientCertificateServerURL: String?
     let followRedirects: Bool
 
-    init(trustHosts: Set<String>, followRedirects: Bool) {
+    init(trustHosts: Set<String>, clientCertificateServerURL: String?, followRedirects: Bool) {
         self.trustHosts = trustHosts
+        self.clientCertificateServerURL = clientCertificateServerURL
         self.followRedirects = followRedirects
         super.init()
     }
@@ -575,6 +582,17 @@ private nonisolated final class IdPSessionDelegate: NSObject, URLSessionTaskDele
         didReceive challenge: URLAuthenticationChallenge,
         completionHandler: @escaping @Sendable (URLSession.AuthChallengeDisposition, URLCredential?) -> Void
     ) {
+        if challenge.protectionSpace.authenticationMethod == NSURLAuthenticationMethodClientCertificate {
+            if let credential = TLSChallengeHandler.clientCertificateCredential(
+                for: challenge,
+                fallbackServerURL: clientCertificateServerURL
+            ) {
+                completionHandler(.useCredential, credential)
+            } else {
+                completionHandler(.performDefaultHandling, nil)
+            }
+            return
+        }
         guard challenge.protectionSpace.authenticationMethod == NSURLAuthenticationMethodServerTrust,
               let serverTrust = challenge.protectionSpace.serverTrust,
               trustHosts.contains(challenge.protectionSpace.host.lowercased())

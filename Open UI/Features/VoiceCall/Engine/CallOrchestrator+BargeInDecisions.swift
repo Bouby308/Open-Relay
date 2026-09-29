@@ -49,8 +49,12 @@ extension CallOrchestrator {
         smartTurnInFlight = false
         lastLoudAt = Date()
         heardSpeechFallback = true
-        turnStartedAt = candidateStartedAt ?? Date()
+        let start = candidateStartedAt ?? Date()
+        turnStartedAt = start
         candidateStartedAt = nil
+        // The interrupting words belong to this turn (kept for STT recovery).
+        turnAudio.removeAll()
+        for f in recentFrames.frames(since: start) { turnAudio.append(f) }
         recentFrames.clear()
         // Keep Silero's state (the user is mid-sentence); restart the window
         // Smart Turn judges on, and seed the turn detector as speaking.
@@ -66,7 +70,7 @@ extension CallOrchestrator {
 /// handed the audio that triggered a barge-in candidate (never older audio,
 /// which would contain the AI's voice).
 struct RecentFrames {
-    static let seconds: TimeInterval = 1.0
+    static let seconds: TimeInterval = 3.0
     private var frames: [MicFrame] = []
 
     mutating func append(_ frame: MicFrame) {

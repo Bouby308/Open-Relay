@@ -1976,7 +1976,7 @@ private struct RichUIWebView: UIViewRepresentable {
                 richUILog.debug("fetchAndShare: added Authorization header")
             }
 
-            URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
+            ClientCertificateSession.shared.dataTask(with: request) { [weak self] data, response, error in
                 guard let self else { return }
 
                 if let error {
@@ -2682,6 +2682,7 @@ struct ReasoningView: View {
     @Environment(\.theme) private var theme
     @Environment(\.accessibilityScale) private var accessibilityScale
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.streamRateMeter) private var streamRateMeter
 
     private struct RevealRequest: Equatable {
         let text: String
@@ -2754,6 +2755,7 @@ struct ReasoningView: View {
         // Keep reveal state outside the conditional text view. Collapsed
         // thinking catches up without animating, so reopening does not replay it.
         .onChange(of: request, initial: true) { _, request in
+            progress.rateMeter = streamRateMeter
             progress.receive(request.text, count: reasoning.characterCount, streaming: request.streaming,
                              reduceMotion: request.skipAnimation)
         }

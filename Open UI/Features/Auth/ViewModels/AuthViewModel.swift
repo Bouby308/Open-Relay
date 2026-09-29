@@ -57,6 +57,9 @@ final class AuthViewModel {
     var profileImageVersion: Int = 0
     var phase: AuthPhase = .serverConnection
     var allowSelfSignedCerts: Bool = false
+    /// Advanced connect option: mTLS client certificate (.p12/.pfx) for servers behind
+    /// a client-certificate proxy. Saved to the Keychain for the server on connect.
+    var clientCertificate: ClientCertificate?
     /// Advanced connect option: sign in via system browser (generic OIDC only).
     var nativeSSOEnabled: Bool = false
     var nativeSSOIssuer: String = ""
@@ -353,6 +356,12 @@ final class AuthViewModel {
 
         let client = APIClient(serverConfig: config)
 
+        // Install the mTLS client certificate BEFORE the first request so the
+        // health check can already complete the TLS handshake.
+        if let clientCertificate {
+            ClientCertificateStore.shared.save(clientCertificate, forServerURL: normalizedURL)
+        }
+
         // If an API key is provided, treat it as the auth token
         if !apiKey.isEmpty {
             client.updateAuthToken(apiKey)
@@ -371,6 +380,9 @@ final class AuthViewModel {
             logger.info("🔀 [connect] HTTP→HTTPS redirect detected: \(normalizedURL) → \(redirectedURL)")
             normalizedURL = redirectedURL
             serverURL = redirectedURL
+            if let clientCertificate {
+                ClientCertificateStore.shared.save(clientCertificate, forServerURL: redirectedURL)
+            }
             // Rebuild config + client with the corrected HTTPS URL
             activeConfig = ServerConfig(
                 name: URL(string: redirectedURL)?.host ?? "Server",
@@ -410,6 +422,12 @@ final class AuthViewModel {
             errorMessage = "Server is reachable but not responding correctly."
             isConnecting = false
             return
+        case .clientCertificateRequired:
+            errorMessage = clientCertificate == nil
+                ? "This server requires a client certificate. Import one under Advanced → Client Certificate."
+                : "The server rejected your client certificate. Check that it's valid and issued for this server."
+            isConnecting = false
+            return
         case .unreachable:
             errorMessage = "Could not connect to the server. Check the URL and your network."
             isConnecting = false
@@ -445,6 +463,7 @@ final class AuthViewModel {
         nativeSSOEnabled = false
         nativeSSOIssuer = ""
         nativeSSOClientID = NativeSSOSettings.defaultClientID
+        clientCertificate = nil
         // Upsert the new server. For multi-server scenarios the new server
         // must be made active explicitly — addServer() only auto-activates
         // the very first server in an empty list.

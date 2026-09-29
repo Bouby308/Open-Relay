@@ -56,7 +56,10 @@ final class MessageMenuPresenter {
         }
         if let action {
             // Run after the dismissal starts so sheets/keyboards don't fight the overlay.
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.18, execute: action)
+            Task { @MainActor in
+                try? await Task.sleep(for: .milliseconds(180))
+                action()
+            }
         }
     }
 }

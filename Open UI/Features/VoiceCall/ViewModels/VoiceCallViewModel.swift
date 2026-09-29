@@ -21,7 +21,8 @@ final class VoiceCallViewModel {
     private(set) var voiceIntensity: Int = 0
     private(set) var isMuted = false
     private(set) var isPaused = false
-    private(set) var isSpeakerOn = true
+    /// Where call audio is currently heard — drives the route picker button.
+    private(set) var outputRoute: CallOutputRoute = .speaker
     private(set) var modelName = ""
     private(set) var callDuration: TimeInterval = 0
     var errorMessage: String?
@@ -29,7 +30,7 @@ final class VoiceCallViewModel {
     private(set) var diagnostics: CallDiagnostics?
 
     /// True when the active STT engine transcribes the whole utterance after the turn ends.
-    private(set) var isUsingServerSTT = false
+    var isUsingServerSTT = false
 
     // MARK: - Dependencies
     let ttsService: TextToSpeechService
@@ -50,6 +51,16 @@ final class VoiceCallViewModel {
     /// Short background-task assertion held while a turn is being answered, so
     /// iOS doesn't suspend networking in the gap between mic and speaker audio.
     @ObservationIgnored var turnBackgroundTask: UIBackgroundTaskIdentifier = .invalid
+    /// Shown under the model name while a stand-in engine is used
+    /// (e.g. "Using server voice while in background").
+    var engineNotice: String?
+    @ObservationIgnored var settingsObserver: NSObjectProtocol?
+    @ObservationIgnored var engineSyncTask: Task<Void, Never>?
+    @ObservationIgnored var debounceTask: Task<Void, Never>?
+    /// On-device model the call used before a stand-in took over (Auto mode).
+    @ObservationIgnored var autoModelLoaded: OnDeviceTTSModel?
+    /// Signatures the running `engineSyncTask` is loading.
+    @ObservationIgnored var syncTarget: String?
 
     init(
         ttsService: TextToSpeechService,
@@ -61,7 +72,6 @@ final class VoiceCallViewModel {
         self.vadModelStore = vadModelStore
         self.settings = settings
         self.apiClientProvider = apiClientProvider
-        self.isSpeakerOn = settings.defaultSpeakerOn
     }
 
     func configure(conversationManager: ConversationManager, chatViewModel: ChatViewModel, modelName: String) {
@@ -126,8 +136,9 @@ extension VoiceCallViewModel {
         guard callState == .connecting else { return }
 
         do {
-            try audioSession.activate(preferSpeaker: isSpeakerOn)
-            audioSession.setSpeakerOverride(isSpeakerOn)
+            try audioSession.activate()
+            audioSession.applyInitialRoute(preferSpeaker: settings.defaultSpeakerOn)
+            refreshOutputRoute()
         } catch {
             fail("Couldn't start audio: \(error.localizedDescription)")
             return
@@ -141,6 +152,18 @@ extension VoiceCallViewModel {
         _ = await vadReady
         guard callState == .connecting else { stt.shutdown(); tts.shutdown(); return }
         isUsingServerSTT = stt is ServerCallSTTEngine
+        // Record what was actually built: if an engine fell back at start
+        // (e.g. the on-device model failed to load), its signature differs
+        // from the wanted one, so the next sync (settings change or return
+        // to the foreground) retries the user's choice.
+        let wanted = CallEngineSelection.resolve(
+            settings: settings, ttsService: ttsService, hasServer: api != nil, inForeground: true,
+            onDeviceLoaded: (tts as? MLXCallTTSEngine)?.model
+        )
+        let startSelection = (
+            voice: CallEngineFactory.matches(tts, wanted.voice) ? wanted.voiceSignature : "start|\(tts.displayName)",
+            listening: CallEngineFactory.matches(stt, wanted.listening) ? wanted.listeningSignature : "start|\(stt.displayName)"
+        )
 
         let orch = CallOrchestrator(stt: stt, tts: tts, vadStore: vadModelStore, settings: settings, chat: chat)
         bind(orch)
@@ -153,17 +176,21 @@ extension VoiceCallViewModel {
         }
         orch.isMicMuted = isMuted
         wireAudioSession()
+        orch.ttsSignature = startSelection.voice
+        orch.sttSignature = startSelection.listening
+        startEngineSync()
         let start = Date()
         callStartTime = start
         startDurationTimer()
         startLiveActivity(startDate: start)
         // The app may already be leaving the foreground (e.g. locked while
         // connecting) — make sure GPU engines are swapped out right away.
-        if UIApplication.shared.applicationState != .active { leaveForeground() }
+        if !isInForeground { enterBackground() }
     }
 
     func endCall() async {
         callState = .disconnected
+        stopEngineSync()
         unwireAudioSession()
         orchestrator?.stop()
         orchestrator = nil
@@ -206,16 +233,11 @@ extension VoiceCallViewModel {
         orchestrator?.interrupt()
     }
 
-    func toggleSpeaker() {
-        isSpeakerOn.toggle()
-        applySpeakerOverride()
-    }
-
-    func applySpeakerOverride() {
-        let outputs = AVAudioSession.sharedInstance().currentRoute.outputs
-        // Never pull audio away from CarPlay / Bluetooth.
-        guard !outputs.contains(where: { $0.portType == .carAudio || $0.portType == .bluetoothHFP }) else { return }
-        audioSession.setSpeakerOverride(isSpeakerOn)
+    /// Re-reads where call audio is heard (earpiece, speaker, AirPods, car…).
+    /// Output choices themselves are made in the system route picker.
+    func refreshOutputRoute() {
+        let route = CallOutputRoute.current()
+        if route != outputRoute { outputRoute = route }
     }
 }
 
@@ -227,6 +249,7 @@ extension VoiceCallViewModel {
     fileprivate func fail(_ message: String) {
         callState = .error(message)
         errorMessage = message
+        stopEngineSync()
         unwireAudioSession()
         orchestrator?.stop()
         orchestrator = nil
@@ -310,8 +333,13 @@ extension VoiceCallViewModel {
         orch.onPartialTranscript = { [weak self] text in
             guard let self, self.currentTranscript != text else { return }
             self.currentTranscript = text
+            // The user is talking again — an earlier turn error is stale.
+            if !text.isEmpty, self.errorMessage != nil { self.errorMessage = nil }
         }
-        orch.onUserTurn = { [weak self] text in self?.currentTranscript = text }
+        orch.onUserTurn = { [weak self] text in
+            self?.currentTranscript = text
+            self?.errorMessage = nil
+        }
         orch.onDiagnostics = { [weak self] d in
             guard let self, self.diagnostics != d else { return }
             self.diagnostics = d
@@ -340,7 +368,8 @@ extension VoiceCallViewModel {
                 // Without CallKit the app owns the session: take it back and
                 // resume (resume() rebuilds the audio engine if it stopped).
                 self.audioSession.reactivate()
-                self.applySpeakerOverride()
+                self.audioSession.applyInitialRoute(preferSpeaker: self.settings.defaultSpeakerOn)
+                self.refreshOutputRoute()
                 if !self.isPaused { self.orchestrator?.resume() }
             @unknown default:
                 break
@@ -350,11 +379,20 @@ extension VoiceCallViewModel {
             guard let self, self.orchestrator != nil else { return }
             self.logger.info("Audio route changed (reason \(reason.rawValue))")
             switch reason {
-            case .newDeviceAvailable, .oldDeviceUnavailable, .override, .categoryChange:
-                self.applySpeakerOverride()
+            case .newDeviceAvailable:
+                // Headset / car connected mid-call: drop any speaker override
+                // so audio (and the mic) move to it.
+                if CallOutputRoute.hasExternalDevice() { self.audioSession.setSpeakerOverride(false) }
+                self.audioSession.preferExternalInputIfAvailable()
+            case .oldDeviceUnavailable:
+                // Device went away: fall back to the user's starting preference.
+                self.audioSession.applyInitialRoute(preferSpeaker: self.settings.defaultSpeakerOn)
             default:
+                // .override / .categoryChange / picker selections are the
+                // user's (or system's) choice — never undo them.
                 break
             }
+            self.refreshOutputRoute()
             self.orchestrator?.audioRouteChanged()
         }
         backgroundObservers.forEach(NotificationCenter.default.removeObserver)
@@ -364,36 +402,14 @@ extension VoiceCallViewModel {
             NotificationCenter.default.addObserver(
                 forName: UIApplication.willResignActiveNotification, object: nil, queue: .main
             ) { [weak self] _ in
-                MainActor.assumeIsolated { self?.leaveForeground() }
+                MainActor.assumeIsolated { self?.enterBackground() }
             },
             NotificationCenter.default.addObserver(
                 forName: UIApplication.didBecomeActiveNotification, object: nil, queue: .main
-            ) { _ in
-                MLXCallLock.gpuAllowed = true
+            ) { [weak self] _ in
+                MainActor.assumeIsolated { self?.enterForeground() }
             },
         ]
-    }
-
-    /// iOS kills apps that submit Metal work in the background, so the GPU
-    /// gate closes immediately and on-device (MLX) STT/TTS engines are swapped
-    /// for Apple Speech / the system voice for the rest of the call. VAD
-    /// always runs on the CPU and needs no change.
-    fileprivate func leaveForeground() {
-        MLXCallLock.gpuAllowed = false
-        guard let orch = orchestrator else { return }
-        if orch.usesGPUTTS {
-            orch.replaceTTS(CallEngineFactory.makeSystemTTS())
-        }
-        guard orch.usesGPUSTT else { return }
-        Task { [weak self] in
-            let apple = await CallEngineFactory.makeAppleSTT()
-            guard let self, let orch = self.orchestrator, orch.usesGPUSTT else {
-                apple.shutdown()
-                return
-            }
-            orch.replaceSTT(apple)
-            self.isUsingServerSTT = false
-        }
     }
 
     fileprivate func unwireAudioSession() {

@@ -77,6 +77,7 @@ final class ChatViewModel {
     var selectedModelId: String?
     var isStreaming: Bool = false {
         didSet {
+            if oldValue && !isStreaming { noteChatSession?.revision += 1 }
             // Update the store's streamingConversationId so the sidebar spinner
             // can react purely by observing one property on the @Observable store,
             // bypassing the @ObservationIgnored viewModels dictionary entirely.
@@ -106,6 +107,8 @@ final class ChatViewModel {
     /// Populated from the server on load and updated in real-time during streaming.
     var tasks: [ChatTask] = []
     var errorMessage: String?
+    /// Set when the last `sendMessage` call returned without sending.
+    private(set) var lastSendBlockReason: SendBlockReason?
     var isCompactingContext = false
     var contextNeedsRefresh = false
     var contextCompactionNotice: String?
@@ -166,8 +169,10 @@ final class ChatViewModel {
     func restoreDictationDraft(for context: DictationContext) throws {
         guard dictationDraftContext != context else { return }
         let previous = dictationDraftContext
+        let previousWasDraft = previous?.conversation == nil
+            || previous?.conversation == noteChatSession.map { "note-draft:\($0.noteId)" }
         let isPromotion = previous?.server == context.server && previous?.account == context.account
-            && previous?.conversation == nil && context.conversation != nil && conversationId == nil
+            && previousWasDraft && context.conversation != nil && conversationId == nil
         if isPromotion, let previous {
             try DictationRecoveryStore.shared.move(from: previous, to: context)
         }
@@ -193,7 +198,10 @@ final class ChatViewModel {
     let webSearchConsent = WebSearchConsent()
     var webSearchEnabled: Bool = false {
         didSet {
-            if !webSearchEnabled { webSearchConsent.reset() }
+            // Only a real on→off change revokes consent. Re-assigning the same
+            // value (model-default syncs do this) must not bump the consent
+            // revision, which would make an in-flight send abort silently.
+            if oldValue && !webSearchEnabled { webSearchConsent.reset() }
             guard !suppressBuiltinFeatureTracking else { return }
             if webSearchEnabled {
                 userDisabledBuiltinFeatures.remove("web_search")
@@ -441,6 +449,8 @@ final class ChatViewModel {
     // MARK: - Private State
 
     let conversationId: String?
+    var noteChatSession: NoteChatSession?
+    private(set) var isCreatingNoteChat = false
     private var manager: ConversationManager?
     private var socketService: SocketIOService?
     /// Weak reference to the shared ASR service, set via configure().
@@ -654,7 +664,7 @@ final class ChatViewModel {
             || (!isStreaming
                 && !attachments.contains(where: { $0.type == .audio && $0.isTranscribing }))
         return notBlocked && !isCompactingContext && !contextNeedsRefresh
-            && !isSavingChatVariables && !isCreatingConversation
+            && !isSavingChatVariables && !isCreatingConversation && !isCreatingNoteChat
             && (!inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                 || !attachments.isEmpty)
     }
@@ -2154,7 +2164,10 @@ final class ChatViewModel {
         // incorrectly turn an unknown OAuth state into an authenticated one.
     }
 
-    private func checkToolConnections() async -> Bool {
+    /// - Parameter ignoreDraftAndBranch: direct sends (voice turns, suggestion
+    ///   taps) don't use the typed draft, and the previous reply's background
+    ///   refresh can move `history.currentId` — neither should cancel them.
+    private func checkToolConnections(ignoreDraftAndBranch: Bool = false) async -> Bool {
         guard !isCheckingToolConnections else { return false }
         guard let manager else { return false }
         isCheckingToolConnections = true
@@ -2168,11 +2181,12 @@ final class ChatViewModel {
         let model = selectedModelId
         let mentioned = mentionedModelId
         let isCurrent = {
-            !Task.isCancelled && scope == manager.apiClient.network.conversationCacheScope
-                && context == self.toolCheckContext && chatId == (self.conversationId ?? self.conversation?.id)
-                && branchId == self.conversation?.history.currentId && draft == self.inputText
-                && files == self.attachments.map(\.id) && model == self.selectedModelId
-                && mentioned == self.mentionedModelId
+            guard !Task.isCancelled, scope == manager.apiClient.network.conversationCacheScope,
+                  context == self.toolCheckContext, chatId == (self.conversationId ?? self.conversation?.id),
+                  files == self.attachments.map(\.id), model == self.selectedModelId,
+                  mentioned == self.mentionedModelId else { return false }
+            if ignoreDraftAndBranch { return true }
+            return branchId == self.conversation?.history.currentId && draft == self.inputText
         }
         // Model defaults were already refreshed by authorizeWebSearch(), which
         // every send path calls first, so newly assigned tools are included here.
@@ -3281,21 +3295,43 @@ final class ChatViewModel {
     /// starter prompt), that text is used directly and is NOT written to the
     /// bound `inputText` — this avoids the prompt briefly flashing in the input
     /// field before being sent.
-    func sendMessage(directText: String? = nil) async {
+    ///
+    /// Returns `true` only when a request was actually started. When it
+    /// returns `false`, `lastSendBlockReason` says why (voice calls use this
+    /// instead of silently waiting for a reply that will never come).
+    @discardableResult
+    func sendMessage(directText: String? = nil) async -> Bool {
+        lastSendBlockReason = nil
         guard !isCompactingContext, !contextNeedsRefresh,
-              !isSavingChatVariables, !isCreatingConversation else { return }
+              !isSavingChatVariables, !isCreatingConversation else {
+            return sendBlocked(.busy, "chat is busy (compacting / saving / creating)")
+        }
         let text = (directText ?? inputText).trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty || !attachments.isEmpty else { return }
-        guard await authorizeWebSearch() else { return }
+        guard !text.isEmpty || !attachments.isEmpty else { return sendBlocked(.empty, "empty message") }
+        guard await authorizeWebSearch() else {
+            return sendBlocked(.webSearch, "web search was not approved")
+        }
         // Selected OAuth tools must be connected before the draft is consumed.
-        guard await checkToolConnections() else { return }
+        // Direct sends (voice, suggestions) don't depend on the typed draft or
+        // the current branch, so background refreshes can't cancel them.
+        guard await checkToolConnections(ignoreDraftAndBranch: directText != nil) else {
+            return sendBlocked(toolConnectionRequested != nil ? .needsInput : .busy,
+                               "tool connection check failed")
+        }
+
+        // A voice turn must go out now — never sit in the queue. A stream
+        // still marked active (e.g. a stale external stream) is ended first.
+        if isVoiceMode && isStreaming {
+            logger.info("Voice send while a stream is marked active — clearing it first")
+            stopStreaming(stopAllChatTasks: false)
+        }
 
         // If message queue is enabled and we're currently streaming, enqueue the text
         // (only text messages can be queued — attachments are sent normally when not streaming)
-        if enableMessageQueue && isStreaming && !text.isEmpty && attachments.isEmpty {
+        if enableMessageQueue && isStreaming && !isVoiceMode && !text.isEmpty && attachments.isEmpty {
             messageQueue.append(QueuedMessage(id: UUID(), text: text))
             inputText = ""
-            return
+            return sendBlocked(.queued, "queued while streaming")
         }
 
         // A4: If any attachment is still uploading, queue the text and wait for all uploads
@@ -3305,19 +3341,40 @@ final class ChatViewModel {
             pendingTextAfterUpload = text
             inputText = ""
             logger.info("A4: attachments uploading — queued '\(text.prefix(30))…' for auto-send on upload complete")
-            return
+            return sendBlocked(.queued, "waiting for attachments to upload")
         }
 
-        guard let manager else { return }
+        guard let manager else { return sendBlocked(.busy, "not configured") }
         // Use mentioned model (@ override) if set, otherwise the chat's selected model
         guard let modelId = mentionedModelId ?? selectedModelId else {
             errorMessage = "Please select a model first."
-            return
+            return sendBlocked(.needsInput, "no model selected")
         }
         if needsChatVariables(modelID: modelId) {
             inputText = text
-            return
+            return sendBlocked(.needsInput, "chat variables needed")
         }
+        // Note-linked drafts are created through the note's native chat route
+        // (never as an ordinary chat), so run this before generic creation.
+        if let noteChatSession {
+            guard !isCreatingNoteChat else { return sendBlocked(.busy, "note chat is being created") }
+            isCreatingNoteChat = true
+            defer { isCreatingNoteChat = false }
+            do {
+                try noteChatSession.checkSession()
+                if conversation == nil {
+                    conversation = try await noteChatSession.create()
+                    if let conversation { activeChatStore?.retain(self, for: conversation.id) }
+                }
+                isTemporaryChat = false
+            } catch is CancellationError {
+                return sendBlocked(.busy, "cancelled")
+            } catch {
+                errorMessage = "Couldn’t create the note chat. Your message has not been sent. Please try again."
+                return sendBlocked(.failed, "note chat creation failed")
+            }
+        }
+
         // Persist variables before consuming the draft. If creation fails, keep
         // the text and attachments and let the user retry explicitly.
         if conversation == nil && !isTemporaryChat {
@@ -3329,7 +3386,9 @@ final class ChatViewModel {
                 var created = try await manager.createConversation(title: String(text.prefix(50)),
                     model: modelId, folderId: folderContextId, variables: pendingChatVariables)
                 guard scope == self.manager?.apiClient.network.conversationCacheScope,
-                      draftGeneration == chatVariablesDraftGeneration, !Task.isCancelled else { return }
+                      draftGeneration == chatVariablesDraftGeneration, !Task.isCancelled else {
+                    return sendBlocked(.busy, "chat changed while creating it")
+                }
                 created.chatParams = pendingChatParams
                 pendingChatParams = nil
                 conversation = created
@@ -3339,7 +3398,7 @@ final class ChatViewModel {
                 if scope == self.manager?.apiClient.network.conversationCacheScope {
                     errorMessage = error.localizedDescription
                 }
-                return
+                return sendBlocked(.failed, "creating the chat failed: \(error.localizedDescription)")
             }
         }
 
@@ -3836,11 +3895,37 @@ final class ChatViewModel {
                 }
             }
         }
+        return true
+    }
+
+    /// Why the most recent `sendMessage` call did not start a request.
+    enum SendBlockReason: Equatable, Sendable {
+        /// Transient (busy / state changed) — a retry may succeed.
+        case busy
+        case empty
+        case queued
+        case webSearch
+        /// Waiting for the user (tool sign-in, chat variables, model).
+        case needsInput
+        case failed
+
+        var isTransient: Bool { self == .busy }
+    }
+
+    private func sendBlocked(_ reason: SendBlockReason, _ detail: String) -> Bool {
+        lastSendBlockReason = reason
+        logger.info("sendMessage not sent — \(detail, privacy: .public)")
+        return false
     }
 
     /// Stops the current streaming response by cancelling the server-side task
     /// via `/api/tasks/stop/{taskId}` and cleaning up local state.
-    func stopStreaming() {
+    ///
+    /// - Parameter stopAllChatTasks: when there's no known task ID, also stop
+    ///   every server task for this chat. Voice calls pass `false`: that
+    ///   request is fire-and-forget and could land after the *next* reply has
+    ///   started, killing it.
+    func stopStreaming(stopAllChatTasks: Bool = true) {
         // Cancel the local HTTP task
         streamingTask?.cancel()
         streamingTask = nil
@@ -3855,7 +3940,7 @@ final class ChatViewModel {
                 try? await apiClient.stopTask(taskId: taskId)
                 logger.info("Server task stopped: \(taskId)")
             }
-        } else if let chatId, let apiClient = manager?.apiClient {
+        } else if stopAllChatTasks, let chatId, let apiClient = manager?.apiClient {
             Task {
                 do {
                     try await apiClient.stopTasksByChatId(chatId: chatId)
@@ -6253,6 +6338,9 @@ final class ChatViewModel {
 
     private func refreshSelectedModelMetadata() async {
         guard let modelId = selectedModelId, let manager else { return }
+        // Voice turns are latency-critical: model defaults change rarely, so
+        // refresh at most every 60 s during a call (as the original throttle did).
+        if isVoiceMode, Date().timeIntervalSince(lastModelMetadataRefreshTime) < 60 { return }
         let scope = manager.apiClient.network.conversationCacheScope
         let context = toolCheckContext
         let chatId = conversationId ?? conversation?.id

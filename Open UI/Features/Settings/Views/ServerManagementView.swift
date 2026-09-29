@@ -7,6 +7,9 @@ struct ServerManagementView: View {
     @State private var editingURL: String = ""
     @State private var editingName: String = ""
     @State private var editingSelfSigned: Bool = false
+    @State private var editingClientCertificate: ClientCertificate?
+    /// Certificate currently stored for the active server (for the details row).
+    @State private var activeClientCertificate: ClientCertificate?
     @State private var editingSwitchStatusURL: String = ""
     @State private var editingHeaderEntries: [CustomHeaderEntry] = []
     @State private var editingNativeSSOEnabled = false
@@ -37,7 +40,12 @@ struct ServerManagementView: View {
                     detailRow(
                         icon: "lock.shield",
                         label: "Self-Signed Certs",
-                        value: activeServer?.allowSelfSignedCertificates == true ? "Allowed" : "Not Allowed",
+                        value: activeServer?.allowSelfSignedCertificates == true ? "Allowed" : "Not Allowed"
+                    )
+                    detailRow(
+                        icon: "person.badge.key",
+                        label: "Client Certificate",
+                        value: activeClientCertificate?.subject ?? String(localized: "None"),
                         showDivider: false
                     )
                 }
@@ -82,6 +90,9 @@ struct ServerManagementView: View {
         .navigationTitle("Server")
         .navigationBarTitleDisplayMode(.inline)
         .task {
+            activeClientCertificate = activeServer.flatMap {
+                ClientCertificateStore.shared.certificate(forServerURL: $0.url)
+            }
             await checkHealth()
         }
         .sheet(isPresented: $isEditing) {
@@ -503,6 +514,9 @@ struct ServerManagementView: View {
         editingURL = activeServer?.url ?? ""
         editingName = activeServer?.name ?? ""
         editingSelfSigned = activeServer?.allowSelfSignedCertificates ?? false
+        editingClientCertificate = activeServer.flatMap {
+            ClientCertificateStore.shared.certificate(forServerURL: $0.url)
+        }
         // Convert persisted [String:String] dict back to editable entries.
         // Skip system-managed headers (User-Agent set by CF/proxy flows).
         let systemKeys: Set<String> = ["User-Agent"]
@@ -535,6 +549,8 @@ struct ServerManagementView: View {
                 Section("Security") {
                     Toggle("Allow Self-Signed Certificates", isOn: $editingSelfSigned)
                 }
+
+                ClientCertificateFormSection(certificate: $editingClientCertificate)
 
                 Section {
                     CustomHeadersEditor(entries: $editingHeaderEntries)
@@ -587,9 +603,18 @@ struct ServerManagementView: View {
 
     private func saveEdits() {
         guard var config = activeServer else { return }
+        let previousURL = config.url
         config.url = editingURL
         config.name = editingName
         config.allowSelfSignedCertificates = editingSelfSigned
+
+        // Client certificates are keyed by origin — drop the old entry if the URL
+        // moved, then store (or remove) the edited certificate for the new URL.
+        if ClientCertificateStore.key(forServerURL: previousURL) != ClientCertificateStore.key(forServerURL: editingURL) {
+            ClientCertificateStore.shared.delete(forServerURL: previousURL)
+        }
+        ClientCertificateStore.shared.set(editingClientCertificate, forServerURL: editingURL)
+        activeClientCertificate = editingClientCertificate
 
         // Merge user-edited headers back in. Preserve system-managed headers
         // (CF User-Agent etc.) that were stripped out of the editing UI.

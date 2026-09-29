@@ -177,8 +177,16 @@ final class APIClient: @unchecked Sendable {
                 return (.proxyAuthRequired, nil)
             }
 
+            // mTLS proxy rejected the request (e.g. Nginx 400 "No required SSL certificate was sent")
+            if TLSChallengeHandler.isClientCertificateRejectionPage(statusCode: statusCode, body: healthData) {
+                return (.clientCertificateRequired, nil)
+            }
+
             return (.unhealthy, nil)
         } catch {
+            if TLSChallengeHandler.isClientCertificateError(error) {
+                return (.clientCertificateRequired, nil)
+            }
             let apiError = APIError.from(error)
             if case .sslError = apiError { return (.unreachable, nil) }
             if case .networkError = apiError { return (.unreachable, nil) }
@@ -1691,13 +1699,10 @@ final class APIClient: @unchecked Sendable {
         config.timeoutIntervalForRequest = timeout
         config.timeoutIntervalForResource = timeout + 60
         config.waitsForConnectivity = true
-
-        let session: URLSession
-        if network.serverConfig.allowSelfSignedCertificates {
-            session = network.session
-        } else {
-            session = URLSession(configuration: config)
-        }
+        config.httpCookieStorage = HTTPCookieStorage.shared
+        config.httpAdditionalHeaders = network.session.configuration.httpAdditionalHeaders
+        let session = network.makeSession(configuration: config)
+        defer { session.finishTasksAndInvalidate() }
 
         let (bytes, response) = try await session.bytes(for: request)
 
@@ -3574,6 +3579,20 @@ final class APIClient: @unchecked Sendable {
         )
     }
 
+    /// The server applies this response to the authenticated attendee only.
+    func respondToCalendarEvent(id: String, response: CalendarRSVP) async throws {
+        let (data, _) = try await network.requestRaw(
+            path: "/api/v1/calendars/events/\(id)/rsvp",
+            method: .post,
+            body: JSONEncoder().encode(["status": response.rawValue])
+        )
+        let result = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+        guard result?["status"] as? Bool == true,
+              result?["rsvp"] as? String == response.rawValue else {
+            throw APIError.unknown(underlying: nil)
+        }
+    }
+
     // MARK: - Memories
 
     func getMemories() async throws -> [[String: Any]] {
@@ -3998,7 +4017,7 @@ final class APIClient: @unchecked Sendable {
         )
     }
 
-    nonisolated private func parseFullConversation(_ json: [String: Any]) -> Conversation {
+    nonisolated func parseFullConversation(_ json: [String: Any]) -> Conversation {
         let id = json["id"] as? String ?? UUID().uuidString
         let title = (json["chat"] as? [String: Any])?["title"] as? String
             ?? json["title"] as? String
@@ -6311,7 +6330,7 @@ final class APIClient: @unchecked Sendable {
         var request = URLRequest(url: endpoint)
         request.timeoutInterval = 5
         do {
-            let (data, response) = try await URLSession.shared.data(for: request)
+            let (data, response) = try await ClientCertificateSession.shared.data(for: request)
             guard (response as? HTTPURLResponse)?.statusCode == 200 else { return nil }
             let decoder = JSONDecoder()
             return try decoder.decode(ModelSwitchStatus.self, from: data)
@@ -6645,15 +6664,12 @@ private final class RedirectCapturingDelegate: NSObject, URLSessionDelegate, URL
         didReceive challenge: URLAuthenticationChallenge,
         completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void
     ) {
-        guard allowSelfSigned,
-              challenge.protectionSpace.authenticationMethod == NSURLAuthenticationMethodServerTrust,
-              let serverTrust = challenge.protectionSpace.serverTrust,
-              let baseURL = URL(string: serverConfig.url),
-              challenge.protectionSpace.host.lowercased() == baseURL.host?.lowercased()
-        else {
-            completionHandler(.performDefaultHandling, nil)
-            return
-        }
-        completionHandler(.useCredential, URLCredential(trust: serverTrust))
+        let (disposition, credential) = TLSChallengeHandler.resolve(
+            challenge,
+            serverURL: serverConfig.url,
+            allowSelfSigned: allowSelfSigned,
+            checkPort: false
+        )
+        completionHandler(disposition, credential)
     }
 }

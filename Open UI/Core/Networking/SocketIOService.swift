@@ -214,18 +214,16 @@ final class SocketIOService: NSObject, @unchecked Sendable, URLSessionWebSocketD
         // STORAGE FIX: Invalidate previous session to prevent leaks.
         session?.invalidateAndCancel()
 
-        // Create session with cookie support (needed for both transports)
+        // Create session with cookie support (needed for both transports).
+        // `self` is always the delegate so self-signed trust (opt-in) and mTLS
+        // client certificates are handled for the WebSocket / polling handshake.
         let config = URLSessionConfiguration.default
         config.urlCache = nil
         config.requestCachePolicy = .reloadIgnoringLocalCacheData
         config.httpCookieStorage = HTTPCookieStorage.shared
         config.httpCookieAcceptPolicy = .always
         config.httpShouldSetCookies = true
-        if serverConfig.allowSelfSignedCertificates {
-            session = URLSession(configuration: config, delegate: self, delegateQueue: nil)
-        } else {
-            session = URLSession(configuration: config)
-        }
+        session = URLSession(configuration: config, delegate: self, delegateQueue: nil)
 
         if usePollingTransport {
             connectViaPolling()
@@ -765,22 +763,12 @@ final class SocketIOService: NSObject, @unchecked Sendable, URLSessionWebSocketD
         didReceive challenge: URLAuthenticationChallenge,
         completionHandler: @escaping @Sendable (URLSession.AuthChallengeDisposition, URLCredential?) -> Void
     ) {
-        guard serverConfig.allowSelfSignedCertificates,
-              challenge.protectionSpace.authenticationMethod == NSURLAuthenticationMethodServerTrust,
-              let serverTrust = challenge.protectionSpace.serverTrust
-        else {
-            completionHandler(.performDefaultHandling, nil)
-            return
-        }
-
-        guard let baseURL = URL(string: serverConfig.url),
-              challenge.protectionSpace.host.lowercased() == baseURL.host?.lowercased()
-        else {
-            completionHandler(.performDefaultHandling, nil)
-            return
-        }
-
-        completionHandler(.useCredential, URLCredential(trust: serverTrust))
+        let (disposition, credential) = TLSChallengeHandler.resolve(
+            challenge,
+            serverConfig: serverConfig,
+            checkPort: false
+        )
+        completionHandler(disposition, credential)
     }
 
     // MARK: - Private: Messaging (routes to correct transport)

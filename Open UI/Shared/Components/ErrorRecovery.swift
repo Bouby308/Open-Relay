@@ -139,6 +139,8 @@ struct NetworkErrorRecoveryView: View {
             return String(localized: "Please check your internet connection and try again. Make sure your server is reachable.")
         case .unauthorized, .tokenExpired:
             return String(localized: "Your session has expired. Please sign in again to continue.")
+        case .sslError(let underlying) where TLSChallengeHandler.isClientCertificateError(underlying):
+            return String(localized: "This server requires a valid client certificate. Import one in Settings → Server → Edit Server.")
         case .sslError:
             return String(localized: "The server's security certificate could not be verified. If using a private server, enable self-signed certificates in settings.")
         case .proxyAuthRequired:

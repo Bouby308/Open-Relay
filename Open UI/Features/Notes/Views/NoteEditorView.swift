@@ -14,17 +14,30 @@ struct NoteEditorView: View {
     @State private var hasChanges = false
     @State private var showAudioRecorder = false
     @State private var showFilePicker = false
-    @State private var showAudioPlayer: AudioAttachment?
+    @State private var files: NoteFilesModel?
+    @State private var importTask: Task<Void, Never>?
+    @State private var isImporting = false
     @State private var isPreviewMode = true
     @State private var recordingService = AudioRecordingService()
     @State private var isGeneratingTitle = false
     @State private var isEnhancing = false
     @State private var aiErrorMessage: String?
     @State private var autoSaveTask: Task<Void, Never>?
+    @State private var sharingModel: NoteSharingModel?
+    @State private var showSharing = false
+    @State private var noteChatSession: NoteChatSession?
+    @State private var noteChatDraft: ChatViewModel?
+    @State private var linkedChat: Conversation?
+    @State private var isOpeningChat = false
+    @State private var draftSession: NoteDraftSession?
+    @State private var draftLoadError: String?
+    @State private var showDiscardDraft = false
+    @State private var draftActionError: String?
 
     @Environment(AppDependencyContainer.self) private var dependencies
     @Environment(\.theme) private var theme
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
 
     @FocusState private var isContentFocused: Bool
 
@@ -49,17 +62,37 @@ struct NoteEditorView: View {
                 ContentUnavailableView(
                     "Note Not Found",
                     systemImage: "exclamationmark.triangle",
-                    description: Text("This note could not be loaded.")
+                    description: Text(draftLoadError ?? "This note could not be loaded.")
                 )
             }
         }
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
+            ToolbarItem(placement: .topBarTrailing) {
+                Button {
+                    Task { await openChat() }
+                } label: {
+                    if isOpeningChat { ProgressView() }
+                    else { Image(systemName: "bubble.left.and.bubble.right") }
+                }
+                .accessibilityLabel("Chat about note")
+                .disabled(note == nil || isOpeningChat || isSaving || hasChanges)
+            }
             if canEdit {
                 ToolbarItem(placement: .topBarTrailing) {
                     HStack(spacing: Spacing.sm) {
-                        // AI features menu
+                        // Note actions
                         Menu {
+                            if let api = apiClient, let user = dependencies.authViewModel.currentUser {
+                                Button("Manage Access", systemImage: "person.2") {
+                                    let container = dependencies
+                                    sharingModel = NoteSharingModel(noteId: noteId, api: api, user: user) { [weak container] in
+                                        container?.apiClient === api && container?.authViewModel.currentUser?.id == user.id
+                                    }
+                                    showSharing = true
+                                }
+                                Divider()
+                            }
                             Button {
                                 Task { await generateTitle() }
                             } label: {
@@ -84,10 +117,10 @@ struct NoteEditorView: View {
                                 ProgressView()
                                     .controlSize(.small)
                             } else {
-                                Image(systemName: "sparkles")
+                                Image(systemName: "ellipsis")
                             }
                         }
-                        .accessibilityLabel("AI Features")
+                        .accessibilityLabel("Note Actions")
 
                         // Preview toggle
                         Button {
@@ -104,6 +137,7 @@ struct NoteEditorView: View {
                             Image(systemName: "mic.circle")
                         }
                         .accessibilityLabel("Record audio")
+                        .disabled(files?.canEdit != true || files?.isBusy == true || files?.pending != nil || isImporting)
 
                         // File attachment
                         Button {
@@ -112,6 +146,7 @@ struct NoteEditorView: View {
                             Image(systemName: "paperclip")
                         }
                         .accessibilityLabel("Attach file")
+                        .disabled(files?.canEdit != true || files?.isBusy == true || files?.pending != nil || isImporting)
 
                         // Save indicator
                         if isSaving {
@@ -126,7 +161,7 @@ struct NoteEditorView: View {
                 }
             }
         }
-        .alert("AI Error", isPresented: .init(
+        .alert("Note Error", isPresented: .init(
             get: { aiErrorMessage != nil },
             set: { if !$0 { aiErrorMessage = nil } }
         )) {
@@ -134,14 +169,38 @@ struct NoteEditorView: View {
         } message: {
             Text(aiErrorMessage ?? "")
         }
-        .task { loadNote() }
+        .task(id: dependencies.noteDraftStore?.identity) { await loadNote() }
+        .confirmationDialog("Discard the local changes and reload the server version?", isPresented: $showDiscardDraft) {
+            Button("Discard Local Changes", role: .destructive) {
+                do {
+                    try draftSession?.store.discard(noteId)
+                    hasChanges = false
+                    Task { await loadNote() }
+                } catch { draftActionError = "Couldn’t discard the saved draft. A save may still be in progress. Please try again." }
+            }
+        }
+        .alert("Saved Changes", isPresented: .init(get: { draftActionError != nil }, set: { if !$0 { draftActionError = nil } })) {
+            Button("OK") { draftActionError = nil }
+        } message: { Text(draftActionError ?? "") }
+        .onChange(of: noteChatSession?.revision) { previous, _ in
+            // A completed background chat may have edited the note. Never replace
+            // text while the user is editing, or start the editor's autosave loop.
+            if previous != nil && isPreviewMode && !hasChanges && !isSaving { Task { await reloadNote() } }
+        }
+        .sheet(item: $linkedChat, onDismiss: {
+            if !hasChanges && !isSaving { Task { await reloadNote() } }
+        }) { chat in
+            if let noteChatSession {
+                NoteChatsView(session: noteChatSession, initialChat: chat, draft: $noteChatDraft)
+            }
+        }
+        .sheet(isPresented: $showSharing) {
+            if let sharingModel { NoteSharingView(model: sharingModel) }
+        }
         .sheet(isPresented: $showAudioRecorder) {
             AudioRecorderSheet(recordingService: recordingService) { result in
                 handleAudioRecording(result)
             }
-        }
-        .sheet(item: $showAudioPlayer) { attachment in
-            AudioPlayerSheet(attachment: attachment, baseURL: dependencies.conversationManager?.baseURL)
         }
         .fileImporter(
             isPresented: $showFilePicker,
@@ -149,6 +208,10 @@ struct NoteEditorView: View {
             allowsMultipleSelection: true
         ) { result in
             handleFileImport(result)
+        }
+        .onDisappear {
+            importTask?.cancel()
+            autoSaveTask?.cancel()
         }
     }
 
@@ -164,10 +227,12 @@ struct NoteEditorView: View {
                             .scaledFont(size: 28, weight: .bold)
                             .foregroundStyle(theme.textPrimary)
                     } else {
-                        TextField("Title", text: $titleText)
+                        TextField("Title", text: Binding(get: { titleText }, set: {
+                            titleText = $0
+                            scheduleAutoSave()
+                        }))
                             .scaledFont(size: 28, weight: .bold)
                             .foregroundStyle(theme.textPrimary)
-                            .onChange(of: titleText) { _, _ in scheduleAutoSave() }
                     }
 
                     // Metadata
@@ -177,7 +242,7 @@ struct NoteEditorView: View {
                             .foregroundStyle(.secondary)
                     }
                     HStack(spacing: Spacing.md) {
-                        Text("\(note.wordCount) words")
+                        Text("\(contentText.split(whereSeparator: \.isWhitespace).count) words")
                             .scaledFont(size: 12, weight: .medium)
                             .foregroundStyle(theme.textTertiary)
 
@@ -195,15 +260,34 @@ struct NoteEditorView: View {
                     Divider()
                         .foregroundStyle(theme.divider)
 
-                    // Audio attachments
-                    if !note.audioAttachments.isEmpty {
-                        audioAttachmentsSection(note.audioAttachments)
+                    if let draftLoadError {
+                        Text(draftLoadError).foregroundStyle(.red)
+                    }
+                    if hasChanges, let draftSession, draftSession.requiresRetry || draftSession.error != nil {
+                        VStack(alignment: .leading, spacing: Spacing.sm) {
+                            Text(draftSession.error?.rawValue ?? "Changes saved on this device. Not yet synced to the server.")
+                                .font(.callout)
+                            let layout = dynamicTypeSize.isAccessibilitySize
+                                ? AnyLayout(VStackLayout(alignment: .leading, spacing: Spacing.sm))
+                                : AnyLayout(HStackLayout())
+                            layout {
+                                Button("Retry", systemImage: "arrow.clockwise") { Task { await saveNote() } }
+                                    .disabled(isSaving)
+                                ShareLink(item: "# \(titleText)\n\n\(contentText)") {
+                                    Label("Share", systemImage: "square.and.arrow.up")
+                                }
+                                Button("Discard", systemImage: "trash", role: .destructive) { showDiscardDraft = true }
+                                    .disabled(isSaving)
+                            }
+                        }
+                        .padding(Spacing.md)
+                        .background(theme.surfaceContainer, in: RoundedRectangle(cornerRadius: CornerRadius.sm))
                     }
 
-                    // File attachments
-                    if !note.fileAttachments.isEmpty {
-                        fileAttachmentsSection(note.fileAttachments)
+                    if let files {
+                        NoteFilesSection(model: files)
                     }
+                    if isImporting { ProgressView("Importing attachment…") }
 
                     // Content area — fills remaining screen height
                     if isPreviewMode || !canEdit {
@@ -224,13 +308,15 @@ struct NoteEditorView: View {
             // Formatting toolbar
             markdownToolbar
 
-            TextEditor(text: $contentText)
+            TextEditor(text: Binding(get: { contentText }, set: {
+                contentText = $0
+                scheduleAutoSave()
+            }))
                 .scaledFont(size: 16)
                 .foregroundStyle(theme.textPrimary)
                 .scrollContentBackground(.hidden)
                 .frame(minHeight: max(400, screenHeight * 0.6))
                 .focused($isContentFocused)
-                .onChange(of: contentText) { _, _ in scheduleAutoSave() }
         }
     }
 
@@ -288,106 +374,130 @@ struct NoteEditorView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
     }
 
-    // MARK: - Audio Attachments
-
-    private func audioAttachmentsSection(_ attachments: [AudioAttachment]) -> some View {
-        VStack(alignment: .leading, spacing: Spacing.sm) {
-            Text("Voice Notes")
-                .scaledFont(size: 14, weight: .medium)
-                .foregroundStyle(theme.textSecondary)
-
-            ForEach(attachments) { attachment in
-                Button {
-                    showAudioPlayer = attachment
-                } label: {
-                    HStack(spacing: Spacing.sm) {
-                        Image(systemName: "waveform")
-                            .foregroundStyle(theme.brandPrimary)
-                        Text(attachment.fileName)
-                            .scaledFont(size: 14)
-                            .foregroundStyle(theme.textPrimary)
-                            .lineLimit(1)
-                        Spacer()
-                        Text(formatDuration(attachment.duration))
-                            .scaledFont(size: 12, weight: .medium)
-                            .foregroundStyle(theme.textTertiary)
-                        Image(systemName: "play.circle.fill")
-                            .foregroundStyle(theme.brandPrimary)
-                    }
-                    .padding(Spacing.sm)
-                    .background(theme.surfaceContainer)
-                    .clipShape(RoundedRectangle(cornerRadius: CornerRadius.sm, style: .continuous))
-                }
-            }
-        }
-    }
-
-    // MARK: - File Attachments
-
-    private func fileAttachmentsSection(_ attachments: [FileAttachmentRef]) -> some View {
-        VStack(alignment: .leading, spacing: Spacing.sm) {
-            Text("Attachments")
-                .scaledFont(size: 14, weight: .medium)
-                .foregroundStyle(theme.textSecondary)
-
-            ForEach(attachments) { attachment in
-                HStack(spacing: Spacing.sm) {
-                    Image(systemName: iconForMimeType(attachment.mimeType))
-                        .foregroundStyle(theme.brandPrimary)
-                    Text(attachment.fileName)
-                        .scaledFont(size: 14)
-                        .foregroundStyle(theme.textPrimary)
-                        .lineLimit(1)
-                    Spacer()
-                    Text(formatFileSize(attachment.fileSize))
-                        .scaledFont(size: 12, weight: .medium)
-                        .foregroundStyle(theme.textTertiary)
-                }
-                .padding(Spacing.sm)
-                .background(theme.surfaceContainer)
-                .clipShape(RoundedRectangle(cornerRadius: CornerRadius.sm, style: .continuous))
-            }
-        }
-    }
-
     // MARK: - Helpers
 
-    private func loadNote() {
+    private func loadNote() async {
+        autoSaveTask?.cancel()
+        isLoading = true
+        isSaving = false
+        hasChanges = false
+        note = nil
+        titleText = ""
+        contentText = ""
+        draftSession = nil
+        draftLoadError = nil
         guard let manager = notesManager else {
             isLoading = false
             return
         }
-        // Load from server asynchronously, falling back to local cache
-        Task {
-            if let serverNote = await manager.fetchNote(id: noteId) {
-                note = serverNote
-                titleText = serverNote.title
-                contentText = serverNote.content
-            } else {
-                // Fallback: try local cache
-                note = manager.fetchLocalNote(id: noteId)
-                if let note {
-                    titleText = note.title
-                    contentText = note.content
-                }
-            }
+        // Signed-in notes require an account-scoped recovery store before editing.
+        let store = dependencies.noteDraftStore
+        guard apiClient == nil || store != nil else {
             isLoading = false
+            return
         }
+        var recovered: NoteDraftStore.Entry?
+        do {
+            if let store, let apiClient {
+                draftSession = try NoteDraftSession(noteID: noteId, api: apiClient, store: store,
+                    isCurrent: { dependencies.apiClient === apiClient && dependencies.noteDraftStore?.identity == store.identity })
+                recovered = try store.load(noteId)
+            }
+        } catch {
+            draftLoadError = "Couldn’t read the saved draft. It has not been deleted."
+            isLoading = false
+            return
+        }
+        let session = draftSession
+        var serverJSON: [String: Any]?
+        if let api = apiClient {
+            let container = dependencies
+            let userId = container.authViewModel.currentUser?.id
+            let model = NoteFilesModel(noteId: noteId, api: api) { [weak container] in
+                container?.apiClient === api && container?.authViewModel.currentUser?.id == userId
+            }
+            files = model
+            serverJSON = await model.load()
+            guard !Task.isCancelled, model.sessionIsCurrent else { return }
+        }
+        guard draftSession === session, dependencies.noteDraftStore?.identity == store?.identity else { return }
+        if let recovered {
+            // A server refresh must never replace an unsynced recovery copy.
+            note = recovered.original
+            titleText = recovered.edited.title
+            contentText = recovered.edited.content
+            hasChanges = true
+        } else {
+            if let serverJSON { note = Note.fromServerJSON(serverJSON) }
+            if note == nil { note = manager.fetchLocalNote(id: noteId) }
+            if let note {
+                titleText = note.title
+                contentText = note.content
+            }
+        }
+        isLoading = false
+    }
+
+    /// Refreshes the note after a linked chat may have edited it on the server.
+    /// Skips the update if the user started editing while the request was in flight,
+    /// or if an unsynced recovery copy exists.
+    private func reloadNote() async {
+        guard let manager = notesManager, draftSession?.requiresRetry != true else { return }
+        let titleBeforeLoad = titleText
+        let contentBeforeLoad = contentText
+        let session = draftSession
+        let serverNote = await manager.fetchNote(id: noteId)
+        guard dependencies.notesManager === manager, draftSession === session, !hasChanges, !isSaving,
+              titleText == titleBeforeLoad, contentText == contentBeforeLoad,
+              let serverNote else { return }
+        note = serverNote
+        titleText = serverNote.title
+        contentText = serverNote.content
+        await files?.load()
     }
 
     private func scheduleAutoSave() {
-        guard canEdit else { return }
+        guard canEdit, !isLoading, let note, draftLoadError == nil else { return }
+        guard hasChanges || titleText != note.title || contentText != note.content else { return }
         hasChanges = true
         autoSaveTask?.cancel()
+        // Persist the edit on this device before any network write.
+        if let draftSession, !draftSession.stage(original: note, title: titleText, content: contentText) { return }
+        // Recovered or failed edits are only resubmitted by an explicit Retry.
+        guard draftSession?.requiresRetry != true else { return }
         autoSaveTask = Task {
             try? await Task.sleep(for: .seconds(1))
             guard !Task.isCancelled else { return }
-            await saveNote()
+            // Cancelling the debounce must not cancel a write already on the wire.
+            Task {
+                guard draftSession?.requiresRetry != true else { return }
+                await saveNote()
+            }
         }
     }
 
     private func saveNote() async {
-        guard canEdit, var updatedNote = note else { return }
+        guard canEdit else { return }
+        if let draftSession {
+            guard !isSaving, draftLoadError == nil else { return }
+            guard let baseline = note, draftSession.stage(original: baseline, title: titleText, content: contentText) else { return }
+            isSaving = true
+            let saved = await draftSession.save()
+            guard self.draftSession === draftSession,
+                  dependencies.noteDraftStore?.identity == draftSession.store.identity else { return }
+            isSaving = false
+            if let saved { note = saved }
+            do { hasChanges = try draftSession.store.load(noteId) != nil }
+            catch { draftLoadError = "Couldn’t read the saved draft. It has not been deleted." }
+            if !hasChanges, let saved {
+                titleText = saved.title
+                contentText = saved.content
+            }
+            if saved != nil && hasChanges { scheduleAutoSave() }
+            return
+        }
+        // Signed-in notes require an account-scoped recovery store before saving.
+        guard apiClient == nil, var updatedNote = note else { return }
         isSaving = true
 
         updatedNote.title = titleText
@@ -403,6 +513,24 @@ struct NoteEditorView: View {
     }
 
     // MARK: - AI Features
+
+    private func openChat() async {
+        guard let apiClient, !isOpeningChat, !hasChanges, !isSaving else { return }
+        isOpeningChat = true
+        defer { isOpeningChat = false }
+        let session = noteChatSession ?? NoteChatSession(noteId: noteId, api: apiClient,
+                                                        isCurrent: { dependencies.apiClient === apiClient })
+        do {
+            let chat = try await session.open(title: titleText, content: contentText)
+            isPreviewMode = true
+            isContentFocused = false
+            noteChatSession = session
+            linkedChat = chat
+        } catch is CancellationError {
+        } catch {
+            aiErrorMessage = error.localizedDescription
+        }
+    }
 
     /// Generates a title for the note using AI.
     private func generateTitle() async {
@@ -467,92 +595,47 @@ struct NoteEditorView: View {
     }
 
     private func handleAudioRecording(_ result: RecordingResult) {
-        guard canEdit, var updatedNote = note else { return }
-
-        let attachment = AudioAttachment(
-            fileName: result.fileName,
-            duration: result.duration
-        )
-        updatedNote.audioAttachments.append(attachment)
-        note = updatedNote
-        Task { await notesManager?.updateNote(updatedNote) }
-
-        // Upload to server if available
-        Task {
-            do {
-                let fileId = try await notesManager?.uploadAudio(data: result.data, fileName: result.fileName)
-                if var currentNote = note,
-                   let index = currentNote.audioAttachments.firstIndex(where: { $0.id == attachment.id }) {
-                    currentNote.audioAttachments[index].fileId = fileId
-                    await notesManager?.updateNote(currentNote)
-                    note = currentNote
-                }
-            } catch {
-                // File saved locally, server upload failed - that's OK
-            }
-        }
+        guard canEdit, let files else { return }
+        importTask = Task { await files.attach(data: result.data, name: result.fileName) }
     }
 
     private func handleFileImport(_ result: Result<[URL], Error>) {
-        guard canEdit, case .success(let urls) = result, var updatedNote = note else { return }
-
-        for url in urls {
-            guard url.startAccessingSecurityScopedResource() else { continue }
-            defer { url.stopAccessingSecurityScopedResource() }
-
-            guard let data = try? Data(contentsOf: url) else { continue }
-
-            let attachment = FileAttachmentRef(
-                fileName: url.lastPathComponent,
-                fileSize: Int64(data.count),
-                mimeType: UTType(filenameExtension: url.pathExtension)?.preferredMIMEType ?? "application/octet-stream"
-            )
-            updatedNote.fileAttachments.append(attachment)
-
-            // Upload to server
-            Task {
+        guard canEdit, let files else { return }
+        guard case .success(let urls) = result else {
+            if case .failure(let error) = result { files.error = error.localizedDescription }
+            return
+        }
+        guard !isImporting else { return }
+        isImporting = true
+        importTask = Task {
+            defer { isImporting = false }
+            for url in urls {
                 do {
-                    let fileId = try await notesManager?.uploadFile(data: data, fileName: url.lastPathComponent)
-                    if var currentNote = note,
-                       let index = currentNote.fileAttachments.firstIndex(where: { $0.id == attachment.id }) {
-                        currentNote.fileAttachments[index].fileId = fileId
-                        await notesManager?.updateNote(currentNote)
-                        note = currentNote
-                    }
+                    try Task.checkCancellation()
+                    let data = try await Task.detached(priority: .userInitiated) {
+                        let accessed = url.startAccessingSecurityScopedResource()
+                        defer { if accessed { url.stopAccessingSecurityScopedResource() } }
+                        return try Data(contentsOf: url, options: .mappedIfSafe)
+                    }.value
+                    try Task.checkCancellation()
+                    await files.attach(data: data, name: url.lastPathComponent)
+                    if files.error != nil { break }
                 } catch {
-                    // Saved locally, upload failed
+                    if !Task.isCancelled { files.error = error.localizedDescription }
+                    break
                 }
             }
         }
-
-        note = updatedNote
-        Task { await notesManager?.updateNote(updatedNote) }
     }
 
     private func insertMarkdown(_ prefix: String) {
         contentText += prefix
+        scheduleAutoSave()
     }
 
     private func wrapSelection(_ wrapper: String) {
         contentText += "\(wrapper)text\(wrapper)"
-    }
-
-    private func formatDuration(_ seconds: TimeInterval) -> String {
-        let mins = Int(seconds) / 60
-        let secs = Int(seconds) % 60
-        return String(format: "%d:%02d", mins, secs)
-    }
-
-    private func formatFileSize(_ bytes: Int64) -> String {
-        ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)
-    }
-
-    private func iconForMimeType(_ mimeType: String) -> String {
-        if mimeType.hasPrefix("image/") { return "photo" }
-        if mimeType.hasPrefix("video/") { return "film" }
-        if mimeType.hasPrefix("audio/") { return "waveform" }
-        if mimeType.contains("pdf") { return "doc.text" }
-        return "doc"
+        scheduleAutoSave()
     }
 }
 
@@ -656,63 +739,6 @@ struct AudioRecorderSheet: View {
         let level = CGFloat(recordingService.audioLevel)
         let variation = sin(CGFloat(index) * 0.5) * 0.3
         return max(4, (level + variation) * 60)
-    }
-
-    private func formatDuration(_ seconds: TimeInterval) -> String {
-        let mins = Int(seconds) / 60
-        let secs = Int(seconds) % 60
-        return String(format: "%d:%02d", mins, secs)
-    }
-}
-
-// MARK: - Audio Player Sheet
-
-struct AudioPlayerSheet: View {
-    let attachment: AudioAttachment
-    let baseURL: String?
-    @Environment(\.dismiss) private var dismiss
-    @Environment(\.theme) private var theme
-
-    var body: some View {
-        NavigationStack {
-            VStack(spacing: Spacing.xl) {
-                Spacer()
-
-                Image(systemName: "waveform.circle.fill")
-                    .scaledFont(size: 80)
-                    .foregroundStyle(theme.brandPrimary)
-
-                Text(attachment.fileName)
-                    .scaledFont(size: 16)
-                    .foregroundStyle(theme.textPrimary)
-
-                Text(formatDuration(attachment.duration))
-                    .scaledFont(size: 24, weight: .semibold)
-                    .foregroundStyle(theme.textSecondary)
-                    .monospacedDigit()
-
-                // Playback controls placeholder
-                Text("Audio playback requires AVAudioPlayer integration")
-                    .scaledFont(size: 12, weight: .medium)
-                    .foregroundStyle(theme.textTertiary)
-                    .multilineTextAlignment(.center)
-
-                Spacer()
-            }
-            .padding(Spacing.screenPadding)
-            .navigationTitle("Voice Note")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .navigationBarLeading) {
-                    Button("Close", systemImage: "xmark") {
-                        dismiss()
-                    }
-                    .labelStyle(.iconOnly)
-                    .tint(.secondary)
-                }
-            }
-        }
-        .presentationDetents([.medium])
     }
 
     private func formatDuration(_ seconds: TimeInterval) -> String {

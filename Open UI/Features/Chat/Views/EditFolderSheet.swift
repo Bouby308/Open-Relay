@@ -326,7 +326,7 @@ struct EditFolderSheet: View {
             if let token = api.network.authToken {
                 request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
             }
-            let (data, response) = try await URLSession.shared.data(for: request)
+            let (data, response) = try await api.network.session.data(for: request)
             guard (response as? HTTPURLResponse)?.statusCode == 200 else { return }
             if let uiImage = UIImage(data: data) {
                 previewUIImage = uiImage

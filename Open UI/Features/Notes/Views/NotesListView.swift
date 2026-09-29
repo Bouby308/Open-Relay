@@ -57,12 +57,15 @@ struct NotesListView: View {
         } message: {
             Text(viewModel.pinErrorMessage ?? "")
         }
-        .task {
+        .task(id: dependencies.noteDraftStore?.identity) {
             if let manager = dependencies.notesManager {
-                viewModel.configure(with: manager)
+                viewModel.configure(with: manager, drafts: dependencies.noteDraftStore)
             }
             await viewModel.loadNotes()
         }
+        .alert("Notes", isPresented: .init(get: { viewModel.draftErrorMessage != nil }, set: { if !$0 { viewModel.draftErrorMessage = nil } })) {
+            Button("OK") { viewModel.draftErrorMessage = nil }
+        } message: { Text(viewModel.draftErrorMessage ?? "") }
         .destructiveConfirmation(
             isPresented: .init(
                 get: { viewModel.deletingNote != nil },

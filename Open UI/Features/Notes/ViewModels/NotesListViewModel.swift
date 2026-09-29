@@ -16,6 +16,8 @@ final class NotesListViewModel {
     var errorMessage: String?
     /// Pin failures are shown in an alert, separate from the inline search error.
     var pinErrorMessage: String?
+    /// Unsynced-draft problems (read failures, blocked deletes) are shown in an alert.
+    var draftErrorMessage: String?
     /// Notes with a pin request in flight (duplicate toggles are disabled).
     private(set) var pinningNoteIDs: Set<String> = []
 
@@ -28,6 +30,7 @@ final class NotesListViewModel {
     // MARK: - Private
 
     private var manager: NotesManager?
+    private var drafts: NoteDraftStore?
     private let logger = Logger(subsystem: "com.openui", category: "NotesListVM")
 
     /// Accumulated server search results across loaded pages.
@@ -95,8 +98,32 @@ final class NotesListViewModel {
 
     // MARK: - Configuration
 
-    func configure(with manager: NotesManager) {
+    func configure(with manager: NotesManager, drafts: NoteDraftStore? = nil) {
+        if self.drafts?.identity != drafts?.identity {
+            clearSearch()
+            notes = []
+        }
         self.manager = manager
+        self.drafts = drafts
+    }
+
+    private func withDrafts(_ notes: [Note], matching query: String? = nil) -> [Note] {
+        do {
+            var byID = Dictionary(notes.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+            for draft in try drafts?.pendingNotes() ?? [] {
+                if let query, !draft.title.localizedCaseInsensitiveContains(query),
+                   !draft.content.localizedCaseInsensitiveContains(query) { continue }
+                var merged = byID[draft.id] ?? draft
+                merged.title = draft.title
+                merged.content = draft.content
+                merged.updatedAt = max(merged.updatedAt, draft.updatedAt)
+                byID[draft.id] = merged
+            }
+            return byID.values.sorted { $0.updatedAt > $1.updatedAt }
+        } catch {
+            draftErrorMessage = "Couldn’t read saved note drafts. They have not been deleted."
+            return notes
+        }
     }
 
     // MARK: - Operations
@@ -112,7 +139,10 @@ final class NotesListViewModel {
             isLoading = false
             return
         }
-        notes = await manager.fetchNotes()
+        let identity = drafts?.identity
+        let result = await manager.fetchNotes()
+        guard !Task.isCancelled, identity == drafts?.identity else { return }
+        notes = withDrafts(result)
         isFeatureEnabled = manager.isServerEnabled
         isLoading = false
         if !searchText.isEmpty { triggerSearch() }
@@ -121,7 +151,10 @@ final class NotesListViewModel {
     /// Refreshes the notes list from the server.
     func refreshNotes() async {
         guard let manager else { return }
-        notes = await manager.fetchNotes()
+        let identity = drafts?.identity
+        let result = await manager.fetchNotes()
+        guard !Task.isCancelled, identity == drafts?.identity else { return }
+        notes = withDrafts(result)
         isFeatureEnabled = manager.isServerEnabled
         if !searchText.isEmpty { triggerSearch() }
     }
@@ -146,6 +179,15 @@ final class NotesListViewModel {
     /// Matches the Flutter `NoteDeleter.deleteNote()`.
     func deleteNote(_ note: Note) async {
         guard let manager else { return }
+        do {
+            guard try drafts?.load(note.id) == nil else {
+                draftErrorMessage = "This note has unsynced changes. Open it and retry saving or discard the local changes before deleting."
+                return
+            }
+        } catch {
+            draftErrorMessage = "Couldn’t check saved note drafts. The note has not been deleted."
+            return
+        }
         await manager.deleteNote(id: note.id)
         await refreshNotes()
     }
@@ -194,10 +236,15 @@ final class NotesListViewModel {
         errorMessage = nil
         defer { if searchGeneration == generation { isSearching = false } }
         do {
+            let identity = drafts?.identity
             let result = try await manager.searchNotes(query: query, page: page)
-            guard !Task.isCancelled, searchGeneration == generation else { return }
+            guard !Task.isCancelled, searchGeneration == generation, identity == drafts?.identity else { return }
             let existing = Set(searchResults.map(\.id))
-            searchResults += result.notes.filter { !existing.contains($0.id) }
+            // Show unsynced local edits instead of the older server text.
+            let pageNotes = page == 1 ? withDrafts(result.notes, matching: query) : withDrafts(result.notes).filter { note in
+                result.notes.contains { $0.id == note.id }
+            }
+            searchResults += pageNotes.filter { !existing.contains($0.id) }
             searchPage = page
             hasMoreSearchResults = !result.notes.isEmpty && searchResults.count < result.total
         } catch {
