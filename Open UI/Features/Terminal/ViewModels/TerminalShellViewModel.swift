@@ -66,6 +66,23 @@ final class TerminalShellViewModel {
     @ObservationIgnored private var pendingOutput: [UInt8] = []
     @ObservationIgnored private var cols = 80
     @ObservationIgnored private var rows = 24
+    /// Keys waiting to be sent (held while offline, coalesced while typing).
+    @ObservationIgnored private var outbox: [UInt8] = []
+    @ObservationIgnored private var flushScheduled = false
+    private static let outboxLimit = 64 * 1024
+    /// Local line editor (see `TerminalLineEditor`).
+    @ObservationIgnored let lineEditor = TerminalLineEditor()
+    /// Bytes typed while not connected (drives the "queued" status).
+    private(set) var queuedCount = 0
+    /// True when the terminal is showing a full-screen app or password prompt.
+    private(set) var liveModeDetected = false
+    /// User preference: edit lines locally and send on Return.
+    var lineModeEnabled: Bool = UserDefaults.standard.object(forKey: "terminal.lineMode") as? Bool ?? true {
+        didSet {
+            UserDefaults.standard.set(lineModeEnabled, forKey: "terminal.lineMode")
+            if !lineModeEnabled { transmit(lineEditor.flush(terminalView)) }
+        }
+    }
     /// Set when the server rejected us (bad token / no access) — never auto-retry.
     @ObservationIgnored private var authFailed = false
 
@@ -98,6 +115,9 @@ final class TerminalShellViewModel {
         hasStarted = false
         isVisible = false
         pendingOutput.removeAll()
+        outbox.removeAll()
+        queuedCount = 0
+        lineEditor.discard()
         terminalView = nil
     }
 
@@ -123,6 +143,9 @@ final class TerminalShellViewModel {
         }
         terminalView?.getTerminal().resetToInitialState()
         pendingOutput.removeAll()
+        outbox.removeAll()
+        queuedCount = 0
+        lineEditor.discard()
         hasStarted = true
         isVisible = true
         reconnectAttempt = 0
@@ -258,6 +281,8 @@ final class TerminalShellViewModel {
         startPing()
         // Re-send the size — the server applies it once the PTY is attached.
         sendJSON(["type": "resize", "cols": cols, "rows": rows])
+        // Deliver anything typed while offline / reconnecting.
+        scheduleFlush()
     }
 
     private func socketDidClose(generation gen: Int, code: Int, reason: String?) {
@@ -375,25 +400,89 @@ final class TerminalShellViewModel {
 
     // MARK: - IO
 
-    /// Sends keystrokes from the emulator.
-    func send(_ bytes: ArraySlice<UInt8>) {
-        guard state == .connected || state.isBusy, let socket else { return }
-        let log = logger
-        socket.send(.data(Data(bytes))) { error in
-            if let error { log.error("send: \(error.localizedDescription, privacy: .public)") }
+    /// Keystrokes from the emulator. In line mode printable keys stay local
+    /// until Return; in live mode (or for keys the shell needs now) they are
+    /// sent immediately.
+    func handleKeyboard(_ bytes: ArraySlice<UInt8>) {
+        guard let view = terminalView else { return }
+        if isLineModeActive {
+            let out = lineEditor.handle(bytes, view: view)
+            if !out.isEmpty { transmit(out) }
+        } else {
+            transmit(Array(bytes))
         }
     }
 
-    func send(text: String) { send(ArraySlice(Array(text.utf8))) }
+    /// Raw send that bypasses line editing (key bar keys use `handleKeyboard`).
+    func send(_ bytes: ArraySlice<UInt8>) { transmit(Array(bytes)) }
+
+    func send(text: String) { transmit(Array(text.utf8)) }
 
     /// Pastes text, honouring bracketed-paste mode when the shell requested it.
     func paste(_ text: String) {
         guard !text.isEmpty else { return }
+        if isLineModeActive, let view = terminalView, lineEditor.paste(text, view: view) { return }
+        let pending = lineEditor.flush(terminalView)
         let normalized = text.replacingOccurrences(of: "\r\n", with: "\r").replacingOccurrences(of: "\n", with: "\r")
-        if terminalView?.getTerminal().bracketedPasteMode == true {
-            send(text: "\u{1B}[200~" + normalized + "\u{1B}[201~")
-        } else {
-            send(text: normalized)
+        let body = terminalView?.getTerminal().bracketedPasteMode == true
+            ? "\u{1B}[200~" + normalized + "\u{1B}[201~" : normalized
+        transmit(pending + Array(body.utf8))
+    }
+
+    /// Updates the Line/Live indicator after output (e.g. vim opened or a
+    /// password prompt appeared) without needing a keypress.
+    private func refreshInputMode() {
+        guard lineModeEnabled, let terminal = terminalView?.getTerminal() else {
+            if liveModeDetected { liveModeDetected = false }
+            return
+        }
+        let live = TerminalLineEditor.needsLiveMode(terminal)
+        if liveModeDetected != live { liveModeDetected = live }
+    }
+
+    /// Whether keys are currently edited locally.
+    var isLineModeActive: Bool {
+        guard lineModeEnabled, let terminal = terminalView?.getTerminal() else { return false }
+        let live = TerminalLineEditor.needsLiveMode(terminal)
+        if live, !lineEditor.isEmpty {
+            // Switched to a full-screen app / password prompt mid-line: hand the text over.
+            let pending = lineEditor.flush(terminalView)
+            if !pending.isEmpty { transmit(pending) }
+        }
+        if liveModeDetected != live { liveModeDetected = live }
+        return !live
+    }
+
+    /// Queues bytes and sends them in one frame per run-loop turn. While the
+    /// socket isn't open (connecting, reconnecting, offline) bytes are held
+    /// and delivered in order once connected.
+    private func transmit(_ bytes: [UInt8]) {
+        guard !bytes.isEmpty else { return }
+        outbox.append(contentsOf: bytes)
+        if outbox.count > Self.outboxLimit { outbox.removeFirst(outbox.count - Self.outboxLimit) }
+        queuedCount = state == .connected ? 0 : outbox.count
+        scheduleFlush()
+    }
+
+    private func scheduleFlush() {
+        guard state == .connected, !flushScheduled else { return }
+        flushScheduled = true
+        // Coalesce keys typed within ~8 ms (fast typing, key repeat, paste).
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 8_000_000)
+            self?.flushOutbox()
+        }
+    }
+
+    private func flushOutbox() {
+        flushScheduled = false
+        guard state == .connected, let socket, !outbox.isEmpty else { return }
+        let data = Data(outbox)
+        outbox.removeAll(keepingCapacity: true)
+        queuedCount = 0
+        let log = logger
+        socket.send(.data(data)) { error in
+            if let error { log.error("send: \(error.localizedDescription, privacy: .public)") }
         }
     }
 
@@ -409,6 +498,7 @@ final class TerminalShellViewModel {
     /// Clears the local screen and scrollback (the shell keeps its state).
     func clearScreen() {
         guard let terminal = terminalView?.getTerminal() else { return }
+        lineEditor.discard()
         terminal.resetToInitialState()
         // Ask the shell to redraw its prompt.
         send(text: "\u{0C}")
@@ -434,7 +524,11 @@ final class TerminalShellViewModel {
 
     private func write(_ bytes: ArraySlice<UInt8>) {
         if let terminalView {
+            // Keep the unsent local line after the shell's output.
+            lineEditor.hideEcho(terminalView)
             terminalView.feed(byteArray: bytes)
+            lineEditor.showEcho(terminalView)
+            refreshInputMode()
         } else {
             pendingOutput.append(contentsOf: bytes)
             if pendingOutput.count > Self.pendingLimit {

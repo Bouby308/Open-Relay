@@ -53,6 +53,9 @@ struct TerminalDockView: View {
                 }
                 .padding(.horizontal, 8)
             }
+            if processes.activeTab == TerminalProcessesViewModel.shellTab && viewModel.shellAvailable {
+                inputModeChip
+            }
             actionsMenu
             Button(action: onToggleFullscreen) {
                 Image(systemName: isFullscreen ? "arrow.down.right.and.arrow.up.left" : "arrow.up.left.and.arrow.down.right")
@@ -133,6 +136,25 @@ struct TerminalDockView: View {
         .accessibilityAddTraits(selected ? [.isButton, .isSelected] : .isButton)
     }
 
+    /// Shows whether typing is edited locally (Line) or sent per key (Live).
+    private var inputModeChip: some View {
+        let line = shell.lineModeEnabled && !shell.liveModeDetected
+        return Button {
+            shell.lineModeEnabled.toggle()
+            Haptics.selection()
+        } label: {
+            Text(line ? "Line" : "Live")
+                .scaledFont(size: 10, weight: .semibold)
+                .foregroundStyle(line ? theme.brandPrimary : theme.textSecondary)
+                .padding(.horizontal, 7).padding(.vertical, 3)
+                .background((line ? theme.brandPrimary : theme.textTertiary).opacity(0.14), in: Capsule())
+                .contentTransition(.opacity)
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(line ? "Line editing: typing stays local until Return" : "Live typing: each key is sent")
+        .accessibilityHint("Double-tap to switch")
+    }
+
     // MARK: Menu
 
     private var actionsMenu: some View {
@@ -142,6 +164,9 @@ struct TerminalDockView: View {
                 Button { copyAll() } label: { Label("Copy All Output", systemImage: "doc.on.doc") }
                 Button { shell.clearScreen(); Haptics.play(.light) } label: { Label("Clear Screen", systemImage: "eraser") }
                 Button { shell.restart(); Haptics.play(.medium) } label: { Label("Restart Shell", systemImage: "arrow.clockwise") }
+                Toggle(isOn: Binding(get: { shell.lineModeEnabled }, set: { shell.lineModeEnabled = $0 })) {
+                    Label("Local Line Editing", systemImage: "text.cursor")
+                }
                 Divider()
             }
             Menu {
@@ -206,7 +231,8 @@ struct TerminalDockView: View {
         case .idle, .connecting:
             statusCapsule(text: "Connecting…", showSpinner: true)
         case .reconnecting(let attempt):
-            statusCapsule(text: "Reconnecting… (\(attempt))", showSpinner: true)
+            statusCapsule(text: shell.queuedCount > 0 ? "Offline — input queued" : "Reconnecting… (\(attempt))",
+                          showSpinner: true)
         case .failed(let message):
             placeholder(icon: "exclamationmark.triangle", title: "Terminal unavailable", message: message,
                         action: ("Try Again", { shell.restart() }))

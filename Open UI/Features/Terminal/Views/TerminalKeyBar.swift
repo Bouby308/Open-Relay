@@ -13,7 +13,7 @@ final class TerminalKeyBar: UIInputView, UIInputViewAudioFeedback {
     weak var terminalView: TerminalView?
     var onPaste: (() -> Void)?
 
-    private let scrollView = UIScrollView()
+    private let scrollView = KeyBarScrollView()
     private let stack = UIStackView()
     private var ctrlButton: UIButton?
     private var altButton: UIButton?
@@ -82,7 +82,11 @@ final class TerminalKeyBar: UIInputView, UIInputViewAudioFeedback {
         scrollView.showsHorizontalScrollIndicator = false
         scrollView.alwaysBounceHorizontal = true
         scrollView.translatesAutoresizingMaskIntoConstraints = false
+        // Keys respond instantly, but a horizontal drag that starts on a key
+        // still scrolls the bar (see KeyBarScrollView).
         scrollView.delaysContentTouches = false
+        scrollView.canCancelContentTouches = true
+        scrollView.onBeginScroll = { [weak self] in self?.endRepeat() }
         addSubview(scrollView)
 
         stack.axis = .horizontal
@@ -260,5 +264,46 @@ final class TerminalKeyBar: UIInputView, UIInputViewAudioFeedback {
             _ = terminalView.resignFirstResponder()
         }
         updateModifierButtons()
+    }
+}
+
+/// Horizontal scroller for the key bar. `UIScrollView` refuses to cancel
+/// touches on `UIControl`s by default, so once the bar is full of buttons a
+/// swipe that starts on a key never scrolls. Allowing cancellation for
+/// controls makes every drag scroll while taps stay instant.
+final class KeyBarScrollView: UIScrollView, UIScrollViewDelegate {
+    var onBeginScroll: (() -> Void)?
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        delegate = self
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    private let fade = CAGradientLayer()
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        // Soft fade at whichever edge has more keys to scroll to.
+        let canLeft = contentOffset.x > 1
+        let canRight = contentOffset.x + bounds.width < contentSize.width - 1
+        let edge = min(0.08, 16 / max(bounds.width, 1))
+        fade.frame = bounds
+        fade.startPoint = CGPoint(x: 0, y: 0.5)
+        fade.endPoint = CGPoint(x: 1, y: 0.5)
+        fade.colors = [UIColor.black.withAlphaComponent(canLeft ? 0 : 1).cgColor, UIColor.black.cgColor,
+                       UIColor.black.cgColor, UIColor.black.withAlphaComponent(canRight ? 0 : 1).cgColor]
+        fade.locations = [0, NSNumber(value: Double(edge)), NSNumber(value: Double(1 - edge)), 1]
+        if layer.mask !== fade { layer.mask = fade }
+    }
+
+    override func touchesShouldCancel(in view: UIView) -> Bool {
+        if view is UIControl { return true }
+        return super.touchesShouldCancel(in: view)
+    }
+
+    func scrollViewWillBeginDragging(_ scrollView: UIScrollView) {
+        onBeginScroll?()
     }
 }

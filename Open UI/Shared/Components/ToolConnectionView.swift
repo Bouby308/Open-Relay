@@ -99,3 +99,21 @@ struct ToolConnectionView: View {
         }
     }
 }
+
+/// Presents `ToolConnectionView` for a tool. A separate modifier keeps the
+/// (already very large) composer body type small.
+struct ToolConnectionSheetModifier: ViewModifier {
+    @Binding var tool: ToolItem?
+    let apiClient: APIClient?
+    let onRefresh: (() async -> Void)?
+    @Binding var selectedToolIds: Set<String>
+
+    func body(content: Content) -> some View {
+        content.sheet(item: $tool) { tool in
+            if let apiClient {
+                ToolConnectionView(tool: tool, apiClient: apiClient, onRefresh: onRefresh,
+                                   onDisable: { selectedToolIds.remove(tool.id) }).themed()
+            }
+        }
+    }
+}

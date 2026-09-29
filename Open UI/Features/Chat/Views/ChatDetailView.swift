@@ -704,12 +704,11 @@ struct ChatDetailView: View {
             }
         }
         // Sheets & alerts
-        .sheet(item: Binding(get: { viewModel.toolConnectionRequested }, set: { viewModel.toolConnectionRequested = $0 })) { tool in
-            if let api = dependencies.apiClient {
-                ToolConnectionView(tool: tool, apiClient: api, onRefresh: { await viewModel.loadTools() },
-                    onDisable: { viewModel.selectedToolIds.remove(tool.id) }).themed()
-            }
-        }
+        .modifier(ToolConnectionSheetModifier(
+            tool: Binding(get: { viewModel.toolConnectionRequested }, set: { viewModel.toolConnectionRequested = $0 }),
+            apiClient: dependencies.apiClient,
+            onRefresh: { await viewModel.loadTools() },
+            selectedToolIds: Binding(get: { viewModel.selectedToolIds }, set: { viewModel.selectedToolIds = $0 })))
         .sheet(isPresented: $showFilePicker) {
             DocumentPickerView { urls in
                 Task {
@@ -1229,6 +1228,60 @@ struct ChatDetailView: View {
         }
         // ── Normal mode: full input field ────────────────────────────────────
         return AnyView(VStack(spacing: 0) {
+            inputPickersArea(vm: vm)
+            inputBannersArea(vm: vm)
+            inputFieldControl(vm: vm)
+        }
+        .background(Color.clear)
+        .animation(.easeOut(duration: 0.2), value: vm.isShowingKnowledgePicker)
+        .animation(.easeOut(duration: 0.15), value: vm.selectedKnowledgeItems.count)
+        .animation(.easeOut(duration: 0.15), value: vm.selectedReferenceChats.count)
+        .animation(.easeOut(duration: 0.25), value: vm.tasks.count)
+        .sheet(isPresented: $showReferenceChatPicker) {
+            ReferenceChatPickerView(
+                isPresented: $showReferenceChatPicker,
+                conversationManager: dependencies.conversationManager
+            ) { item in
+                viewModel.selectReferenceChat(item)
+            }
+        }
+        .sheet(isPresented: $showServerFilesPicker) {
+            ServerFilesPickerSheet(
+                isPresented: $showServerFilesPicker,
+                apiClient: dependencies.apiClient
+            ) { selectedAttachments in
+                withAnimation { viewModel.attachments.append(contentsOf: selectedAttachments) }
+            }
+        }
+        .sheet(isPresented: $showNotesPicker) {
+            NotesPickerSheet(
+                isPresented: $showNotesPicker,
+                notesManager: dependencies.notesManager
+            ) { note in
+                viewModel.selectedNotes.append(note)
+            }
+        }
+        .sheet(isPresented: $showKnowledgeFromMenuPicker) {
+            KnowledgeMenuPickerSheet(
+                isPresented: $showKnowledgeFromMenuPicker,
+                selectedItems: $viewModel.selectedKnowledgeItems,
+                apiClient: dependencies.apiClient
+            )
+        }
+        // Sync mentionedModel → viewModel.mentionedModelId when user taps × on chip
+        .onChange(of: mentionedModel) { _, newModel in
+            viewModel.mentionedModelId = newModel?.id
+        }
+        ) // end AnyView(VStack)
+    }
+
+    /// Inline pickers (URL pill, #knowledge, /prompts, $skills, @models) above the composer.
+    /// Split out and type-erased so no single `some View` type gets deep enough to
+    /// overflow the main-thread stack when SwiftUI resolves its generic metadata.
+    @inline(never)
+    private func inputPickersArea(vm: ChatViewModel) -> AnyView {
+        @Bindable var vm = vm
+        return AnyView(Group {
             // Picker overlays — rendered above the input field so input stays visible
             if let url = detectedWebURL {
                 webURLSuggestionPill(url: url)
@@ -1326,6 +1379,16 @@ struct ChatDetailView: View {
                 ))
             }
 
+        })
+    }
+
+    /// Model-switch, task list, ask-user and tool-approval banners above the composer.
+    /// Split out and type-erased so no single `some View` type gets deep enough to
+    /// overflow the main-thread stack when SwiftUI resolves its generic metadata.
+    @inline(never)
+    private func inputBannersArea(vm: ChatViewModel) -> AnyView {
+        @Bindable var vm = vm
+        return AnyView(Group {
             // ── Model-Switch Banner (above input field, issue #79) ──
             if let switchStatus = vm.modelSwitchStatus, switchStatus.isSwitching {
                 ModelSwitchBannerView(status: switchStatus)
@@ -1381,6 +1444,14 @@ struct ChatDetailView: View {
                 )
             }
 
+        })
+    }
+
+    /// The composer itself.
+    @inline(never)
+    private func inputFieldControl(vm: ChatViewModel) -> AnyView {
+        @Bindable var vm = vm
+        return AnyView(
             ChatInputField(
                 text: $vm.inputText,
                 attachments: $vm.attachments,
@@ -1549,48 +1620,7 @@ struct ChatDetailView: View {
                 }
             )
             .disabled(vm.isCreatingConversation)
-        }
-        .background(Color.clear)
-        .animation(.easeOut(duration: 0.2), value: vm.isShowingKnowledgePicker)
-        .animation(.easeOut(duration: 0.15), value: vm.selectedKnowledgeItems.count)
-        .animation(.easeOut(duration: 0.15), value: vm.selectedReferenceChats.count)
-        .animation(.easeOut(duration: 0.25), value: vm.tasks.count)
-        .sheet(isPresented: $showReferenceChatPicker) {
-            ReferenceChatPickerView(
-                isPresented: $showReferenceChatPicker,
-                conversationManager: dependencies.conversationManager
-            ) { item in
-                viewModel.selectReferenceChat(item)
-            }
-        }
-        .sheet(isPresented: $showServerFilesPicker) {
-            ServerFilesPickerSheet(
-                isPresented: $showServerFilesPicker,
-                apiClient: dependencies.apiClient
-            ) { selectedAttachments in
-                withAnimation { viewModel.attachments.append(contentsOf: selectedAttachments) }
-            }
-        }
-        .sheet(isPresented: $showNotesPicker) {
-            NotesPickerSheet(
-                isPresented: $showNotesPicker,
-                notesManager: dependencies.notesManager
-            ) { note in
-                viewModel.selectedNotes.append(note)
-            }
-        }
-        .sheet(isPresented: $showKnowledgeFromMenuPicker) {
-            KnowledgeMenuPickerSheet(
-                isPresented: $showKnowledgeFromMenuPicker,
-                selectedItems: $viewModel.selectedKnowledgeItems,
-                apiClient: dependencies.apiClient
-            )
-        }
-        // Sync mentionedModel → viewModel.mentionedModelId when user taps × on chip
-        .onChange(of: mentionedModel) { _, newModel in
-            viewModel.mentionedModelId = newModel?.id
-        }
-        ) // end AnyView(VStack)
+        )
     }
 
     private var photoPickerLabel: some View {

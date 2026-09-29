@@ -352,12 +352,8 @@ struct ChatInputField: View {
         .onChange(of: showToolsSheet) { _, isPresented in
             if isPresented { onToolsSheetPresented?() }
         }
-        .sheet(item: $connectingTool) { tool in
-            if let apiClient {
-                ToolConnectionView(tool: tool, apiClient: apiClient, onRefresh: onRefreshTools,
-                    onDisable: { selectedToolIds.remove(tool.id) }).themed()
-            }
-        }
+        .modifier(ToolConnectionSheetModifier(tool: $connectingTool, apiClient: apiClient,
+                                              onRefresh: onRefreshTools, selectedToolIds: $selectedToolIds))
         // When tools finish loading, prune any starred IDs that no longer exist.
         // This permanently removes orphaned favorites caused by deleted/removed tools
         // so they never reappear in the quick-pills row.

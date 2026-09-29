@@ -110,7 +110,7 @@ struct TerminalEmulatorView: UIViewRepresentable {
 
         func send(source: TerminalView, data: ArraySlice<UInt8>) {
             guard case .shell = parent.source else { return }
-            parent.shell.send(data)
+            parent.shell.handleKeyboard(data)
         }
 
         func sizeChanged(source: TerminalView, newCols: Int, newRows: Int) {
