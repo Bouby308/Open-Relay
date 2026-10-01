@@ -268,6 +268,11 @@ final class PasteInterceptingTextView: UITextView {
     var revealSelectionAfterLayout = false
 
     override func layoutSubviews() {
+        // Re-measure at the final width before revealing the caret so a
+        // programmatic insertion (e.g. dictation) doesn't keep a stale height.
+        if revealSelectionAfterLayout, bounds.width > 0 {
+            PasteableTextView.recalculateHeight(self)
+        }
         super.layoutSubviews()
         if revealSelectionAfterLayout, bounds.width > 0, bounds.height > 0 {
             revealSelectionAfterLayout = false

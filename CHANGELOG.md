@@ -1,5 +1,14 @@
 # Changelog
 
+## v6.1.1 — October 1, 2026
+
+### Improvements
+- The chat top bar now hides and reappears smoothly in step with your scrolling.
+
+### Bug Fixes
+- Fixed chats jumping around when scrolling quickly, and short conversations shifting as soon as you scroll.
+- Fixed extra blank space below dictated text in the message box.
+
 ## v6.1 — September 29, 2026
 
 ### What's New
